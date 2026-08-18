@@ -1,6 +1,6 @@
 .{
     .name = .r4os_r4basic,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .fingerprint = 0xfc94a6eae091b814,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -17,6 +17,7 @@
         "README.md",
         "DOCUMENTATION.de.txt",
         "COMPATIBILITY.md",
+        "VM-CONTRACT.md",
         "THIRD_PARTY_NOTICES.md",
         "PROVENANCE.txt",
         "Build.bat",

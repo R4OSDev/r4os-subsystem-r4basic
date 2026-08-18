@@ -4,15 +4,20 @@ R4BASIC is the QBasic-compatible subsystem host for R4OS. It is a normal GUI
 R4X module with the subsystem identity `r4os.basic` and the guest format
 `basic.qbasic-source`.
 
-The current frontend release defines and validates the R4BASIC v1 source
-contract. It tokenizes and parses the required module, declaration,
-procedure, control-flow, expression, text, graphics, audio, error, and
-sequential-file syntax without executing guest code yet.
+The current core release keeps the versioned R4BASIC v1 source contract and
+adds a one-time compiler, typed bytecode program, and cooperative virtual
+machine for its first executable subset. Expressions, scalar values,
+control flow, procedures, functions, and the required math and byte-string
+built-ins now execute without reparsing loop bodies.
+
+The installed R4X does not load a guest file or open its final BASIC window
+yet. Arrays, records, data statements, text I/O, time, random numbers, files,
+graphics, and audio remain separate later layers.
 
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `0.1.0`
+- Module version: `0.2.0`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -47,11 +52,12 @@ checkout.
 
 ## Compatibility contract
 
-`COMPATIBILITY.md` is the versioned R4BASIC v1 language-surface contract. It
-states exactly what the source frontend accepts, what the public fixtures
-cover, and what remains outside v1. Runtime semantics, bytecode execution,
-graphics, input, time, files, and audio are implemented in later subsystem
-layers and do not become promises merely because their syntax parses.
+`COMPATIBILITY.md` is the versioned R4BASIC v1 source-language contract. It
+states exactly what the frontend accepts and what remains outside that
+surface. `VM-CONTRACT.md` separately freezes the subset that is already
+bound and executed, including value semantics, bytecode, diagnostics,
+instruction budgets, and instance isolation. A construct does not become an
+execution promise merely because its syntax parses.
 
 Detailed German technical documentation is in `DOCUMENTATION.de.txt`.
 Reference and implementation provenance is recorded in `PROVENANCE.txt`.

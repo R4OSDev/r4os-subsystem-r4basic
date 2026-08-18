@@ -8,9 +8,11 @@ for real compatibility work, not a Tiny BASIC dialect and not a claim of full
 QuickBASIC implementation.
 
 Parsing a construct means that its syntax, source span, nesting, and argument
-shape are recognized. It does not claim executable semantics. Binding,
-values, bytecode execution, display, input, time, files, and audio are added
-by later subsystem layers against this same contract.
+shape are recognized. It does not by itself claim executable semantics. The
+separate `VM-CONTRACT.md` freezes the scalar, expression, control-flow, and
+procedure subset that is already bound and executed. Display, input, time,
+files, graphics, and audio are added by later subsystem layers against this
+same source contract.
 
 ## Authority and source identity
 
@@ -142,17 +144,18 @@ the typed-program phase.
 ## Explicit v1 non-goals
 
 - Full QuickBASIC 4.5, BASICA/GW-BASIC line-number compatibility, QBX
-  extensions, a compiler, IDE, debugger, or source editor.
+  extensions, a native-code compiler, IDE, debugger, or source editor.
 - `COMMON`, `CHAIN`, `RUN`, `SHELL`, `SYSTEM`, printer/COM/device I/O,
   random/binary file records, directory mutation, and unrestricted hardware
   access.
 - Hexadecimal/octal literals, fixed-length strings, `MID$` assignment,
   `PRINT USING`, `DRAW`, `PCOPY`, `BLOAD`, `BSAVE`, and general memory or port
   access.
-- Runtime correctness merely from parse success. Type conversion, rounding,
-  errors, scheduling, graphics pixels, file behavior, timing, and audio each
-  require their later dedicated acceptance layers.
+- Runtime correctness merely from parse success. Only the subset in
+  `VM-CONTRACT.md` has executable semantics; graphics pixels, file behavior,
+  timing, input, and audio still require their dedicated acceptance layers.
 
-Changing a promise in this document requires a contract-version decision,
-an original positive fixture, an original negative fixture, and an update to
-the repository test inventory.
+Changing a promise in this document or `VM-CONTRACT.md` requires a
+contract-version decision, an original positive fixture, an original
+negative or runtime-error fixture, and an update to the repository test
+inventory.

@@ -6,15 +6,21 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.66.5
+Stand 0.66.6
 ------------
 
-Diese Ausbaustufe besitzt das produktive Modulprojekt und das versionierte
-Quellfrontend. Der Lexer und Parser fuehren noch keinen BASIC-Code aus. Sie
-pruefen den eingefrorenen v1-Syntaxvertrag, erhalten exakte Quellspannen und
-erzeugen begrenzte, deterministische Diagnosen mit Dateiname, Zeile und
-Spalte. Die spaetere Bindung und Bytecode-VM arbeiten auf diesem Vertrag auf,
-ohne den Quelltext in jeder Schleife erneut einzulesen.
+Diese Ausbaustufe besitzt das produktive Modulprojekt, das versionierte
+Quellfrontend und den ersten ausfuehrbaren BASIC-Kern. Der Compiler
+tokenisiert einen Quelltext genau einmal, bindet skalare Symbole und erzeugt
+eine unveraenderliche Instruktionsdarstellung mit festen Sprungzielen. Die
+typisierte VM fuehrt danach ausschliesslich diese vorbereiteten Instruktionen
+aus. Schleifen lesen oder parsen den Quelltext nicht erneut.
+
+Der Lexer und der allgemeine Parser pruefen weiterhin den groesseren
+eingefrorenen v1-Syntaxvertrag. Syntaxakzeptanz ist deshalb nicht automatisch
+Ausfuehrbarkeit. `COMPATIBILITY.md` beschreibt die Quelloberflaeche;
+`VM-CONTRACT.md` beschreibt getrennt den bereits gebundenen und ausgefuehrten
+Teil.
 
 Die vollstaendige zugesagte und ausgeschlossene Sprachoberflaeche steht in
 `COMPATIBILITY.md`. Diese Datei ist die versionierte Projektwahrheit fuer den
@@ -51,6 +57,43 @@ koennen mehrere unabhaengige Fehler gemeldet werden, ohne beliebig weit in
 eine beschaedigte Zeile hinein zu raten. Offene und unpassende Bloecke werden
 getrennt diagnostiziert.
 
+Compiler und VM
+---------------
+
+`src/compiler.zig` fuehrt Parser, Binder und Emitter in einem kontrollierten
+Durchlauf ueber den einmal erzeugten Tokenstrom. Das Ergebnis besitzt eigene
+Kopien von Dateiname und Quellbytes sowie Tabellen fuer Konstanten, globale
+Variablen, Prozeduren und Instruktionen. Jede Instruktion verweist auf ihren
+stabilen Quellspan. Labels werden pro Modul- oder Prozedurscope auf feste
+Instruktionsindizes aufgeloest; unbekannte Ziele sind Compile-Diagnosen.
+
+Der ausfuehrbare Kern umfasst INTEGER, LONG, SINGLE, DOUBLE und dynamische
+Byte-Strings, DEFINT und Typsuffixe, skalare DIM-/DIM-SHARED-Variablen,
+Konstanten, Ausdruecke und Vergleiche. IF/ELSEIF/ELSE, SELECT CASE,
+FOR/NEXT, WHILE/WEND, alle vor- und nachgeprueften DO/LOOP-Formen,
+GOTO sowie GOSUB/RETURN besitzen gebundene Spruenge.
+
+DECLARE, SUB, FUNCTION, explizite und implizite Aufrufe, skalare ByRef- und
+ByVal-Parameter sowie einzeilige DEF-FN-Funktionen verwenden getrennte
+Aufrufrahmen. ByRef-Zellen sind echte Aliase; DEF FN erhaelt eigene
+ByVal-Parameter und sieht entsprechend der vereinbarten BASIC-Semantik die
+Modulvariablen. Rekursive Funktionen behalten lokale Werte und Rueckgaben je
+Rahmen getrennt.
+
+Die VM besitzt keine globalen Laufzeitvariablen. Jede Instanz haelt eigene
+Werte, Auswertungs- und Aufrufstapel, GOSUB-Stapel, Instruktionszeiger,
+Abbruchmarke, Diagnose und Exitcode. Arithmetik, Konvertierung, Rundung,
+Stringgrenze und QBasic-Fehlernummern sind im VM-Vertrag festgelegt.
+Mathematische Hostfunktionen und Abbruchabfrage werden injiziert.
+
+`src/runtime_adapter.zig` bildet die VM auf `r4os.subsystem_runtime` ab. Pro
+Hostzyklus wird genau eine BASIC-Scheibe mit dem vom Runtime-Host gelieferten
+Instruktionsbudget ausgefuehrt. Fenster- und Close-Ereignisse werden davor
+verarbeitet. Reset erzeugt einen frischen Variablensatz und leert alle
+Stapel; ein Fehler oder Abschluss wird in den gemeinsamen
+Subsystem-Lebenszyklus ueberfuehrt. Audio liefert in dieser Stufe noch keine
+Gastdaten.
+
 Tests
 -----
 
@@ -58,12 +101,13 @@ Der normale, vollstaendig oeffentliche Testlauf lautet:
 
     Build.bat test
 
-Er baut und inspiziert das GUI-R4X und fuehrt die Component-Tests aus. Vier
-positive BAS-Fixtures decken Quellvertrag, Deklarationen, Kontrollfluss sowie
-I/O/Grafik/Audio-Syntax ab. Vier negative BAS-Fixtures pruefen Lexergrenzen,
-Strukturfehler, nicht zugesagte Statements und Funktionsaritaeten. Zusaetzlich
-werden Zeilenenden, 8-Bit-Stringbytes, exakte Dateipositionen, deterministische
-Wiederholung und zu kleine Aufruferspeicher direkt getestet.
+Er baut und inspiziert das GUI-R4X und fuehrt 20 Host-Component-Tests aus.
+Vier positive und vier negative Frontend-Fixtures pruefen weiterhin den
+Quellvertrag. Sechs ausfuehrbare BAS-Fixtures pruefen Werte, Kontrollfluss,
+Prozeduren, Built-ins, endlose Ausfuehrung und getrennte Fehlerzustaende.
+Zusaetzlich werden exakte Laufzeitpositionen und Fehlernummern, Rekursion,
+verschachteltes ByRef, Hostfehler, Reset, Nullbudget-Abbruch und ein echter
+`subsystem_runtime`-Close vor der naechsten Gastscheibe direkt getestet.
 
 Die optionale lokale Realprogrammabnahme lautet:
 
@@ -94,10 +138,9 @@ Weitergaberechte getrennt geklaert sein.
 Noch nicht Bestandteil dieses Stands
 ------------------------------------
 
-- Symbolbindung, Typpruefung und Bytecode
-- Ausfuehrung, Scheduling und Laufzeitfehler
-- virtueller Text- und Grafikbildschirm
-- Tastatur, Gastzeit, Zufall und Dateilaufzeit
+- Arrays, benutzerdefinierte Typen, DATA/READ/RESTORE und BASIC-Fehlerfluss
+- Textausgabe, Tastatur, Eingabe, Gastzeit, Zufall und Dateilaufzeit
+- virtueller Grafikbildschirm und Grafikbefehle
 - Audio und Music Macro Language
 - produktives Laden und Anzeigen einer BAS-Datei im Fenster
 

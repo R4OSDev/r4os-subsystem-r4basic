@@ -20,6 +20,23 @@ pub fn build(b: *std.Build) void {
     const frontend_tests = b.addTest(.{ .root_module = frontend_tests_module });
     const run_frontend_tests = b.addRunArtifact(frontend_tests);
 
+    const core_module = b.createModule(.{
+        .root_source_file = b.path("src/core.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const host_r4os = sdk.createR4osModule(b.graph.host, .Debug);
+    core_module.addImport("r4os", host_r4os);
+    const compiler_tests_module = b.createModule(.{
+        .root_source_file = b.path("Tests/compiler_test.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    compiler_tests_module.addImport("core", core_module);
+    compiler_tests_module.addImport("r4os", host_r4os);
+    const compiler_tests = b.addTest(.{ .root_module = compiler_tests_module });
+    const run_compiler_tests = b.addRunArtifact(compiler_tests);
+
     const gorilla_module = b.createModule(.{
         .root_source_file = b.path("Tests/gorilla_acceptance.zig"),
         .target = b.graph.host,
@@ -29,9 +46,10 @@ pub fn build(b: *std.Build) void {
     const gorilla_tests = b.addTest(.{ .root_module = gorilla_module });
     const run_gorilla_tests = b.addRunArtifact(gorilla_tests);
 
-    const test_step = b.step("test", "Run R4BASIC frontend and fixture tests");
+    const test_step = b.step("test", "Run R4BASIC frontend, compiler, and VM fixture tests");
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_frontend_tests.step);
+    test_step.dependOn(&run_compiler_tests.step);
 
     const gorilla_step = b.step("gorilla-test", "Parse the local checksum-bound GORILLA.BAS acceptance source");
     gorilla_step.dependOn(&run_gorilla_tests.step);

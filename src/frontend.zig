@@ -241,6 +241,16 @@ pub const Result = struct {
     }
 };
 
+pub const LexResult = struct {
+    token_count: usize,
+    diagnostic_count: usize,
+    diagnostics_truncated: bool,
+
+    pub fn ok(self: LexResult) bool {
+        return self.diagnostic_count == 0 and !self.diagnostics_truncated;
+    }
+};
+
 const DiagnosticSink = struct {
     storage: []Diagnostic,
     file_name: []const u8,
@@ -262,6 +272,36 @@ pub fn analyze(source: []const u8, tokens: []Token, diagnostics: []Diagnostic) R
 }
 
 pub fn analyzeNamed(file_name: []const u8, source: []const u8, tokens: []Token, diagnostics: []Diagnostic) Result {
+    const lexed = tokenizeNamed(file_name, source, tokens, diagnostics);
+    var sink = DiagnosticSink{
+        .storage = diagnostics,
+        .file_name = file_name,
+        .count = lexed.diagnostic_count,
+        .truncated = lexed.diagnostics_truncated,
+    };
+    var summary: ProgramSummary = .{};
+    if (lexed.token_count != 0) {
+        var parser = Parser{
+            .source = source,
+            .tokens = tokens[0..lexed.token_count],
+            .diagnostics = &sink,
+        };
+        parser.run();
+        summary = parser.summary;
+    }
+    return .{
+        .token_count = lexed.token_count,
+        .diagnostic_count = sink.count,
+        .diagnostics_truncated = sink.truncated,
+        .summary = summary,
+    };
+}
+
+pub fn tokenize(source: []const u8, tokens: []Token, diagnostics: []Diagnostic) LexResult {
+    return tokenizeNamed("", source, tokens, diagnostics);
+}
+
+pub fn tokenizeNamed(file_name: []const u8, source: []const u8, tokens: []Token, diagnostics: []Diagnostic) LexResult {
     var sink = DiagnosticSink{ .storage = diagnostics, .file_name = file_name };
     if (source.len > maximum_source_bytes) {
         sink.add(.source_too_large, .{ .start = 0, .end = 0, .line = 1, .column = 1 });
@@ -269,7 +309,6 @@ pub fn analyzeNamed(file_name: []const u8, source: []const u8, tokens: []Token, 
             .token_count = 0,
             .diagnostic_count = sink.count,
             .diagnostics_truncated = sink.truncated,
-            .summary = .{},
         };
     }
 
@@ -279,21 +318,10 @@ pub fn analyzeNamed(file_name: []const u8, source: []const u8, tokens: []Token, 
         .diagnostics = &sink,
     };
     lexer.run();
-    var summary: ProgramSummary = .{};
-    if (lexer.count != 0) {
-        var parser = Parser{
-            .source = source,
-            .tokens = tokens[0..lexer.count],
-            .diagnostics = &sink,
-        };
-        parser.run();
-        summary = parser.summary;
-    }
     return .{
         .token_count = lexer.count,
         .diagnostic_count = sink.count,
         .diagnostics_truncated = sink.truncated,
-        .summary = summary,
     };
 }
 
