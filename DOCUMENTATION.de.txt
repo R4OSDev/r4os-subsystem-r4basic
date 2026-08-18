@@ -6,17 +6,17 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.66.8
+Stand 0.66.9
 ------------
 
 Diese Ausbaustufe besitzt das produktive Modulprojekt, das versionierte
 Quellfrontend und den ausfuehrbaren BASIC-Datenkern samt Textbildschirm,
-Eingabe, Gastzeit, Zufall und sequentiellen Dateien. Der Compiler
-tokenisiert einen Quelltext genau einmal, bindet skalare und zusammengesetzte
-Symbole und erzeugt
-eine unveraenderliche Instruktionsdarstellung mit festen Sprungzielen. Die
-typisierte VM fuehrt danach ausschliesslich diese vorbereiteten Instruktionen
-aus. Schleifen lesen oder parsen den Quelltext nicht erneut.
+Eingabe, Gastzeit, Zufall, sequentiellen Dateien und instanzlokaler
+Indexed8-Grafik. Der Compiler tokenisiert einen Quelltext genau einmal,
+bindet skalare und zusammengesetzte Symbole und erzeugt eine unveraenderliche
+Instruktionsdarstellung mit festen Sprungzielen. Die typisierte VM fuehrt
+danach ausschliesslich diese vorbereiteten Instruktionen aus. Schleifen lesen
+oder parsen den Quelltext nicht erneut.
 
 Der Lexer und der allgemeine Parser pruefen weiterhin den groesseren
 eingefrorenen v1-Syntaxvertrag. Syntaxakzeptanz ist deshalb nicht automatisch
@@ -127,12 +127,12 @@ ihres BASIC-Statements. RESUME baut deshalb auch bei mehreren
 Operandeninstruktionen das ganze fehlerhafte Statement neu auf; RESUME NEXT
 springt exakt dahinter. Ein unbehandelter Fehler beendet nur seine VM.
 
-Die SCREEN-Modusabfrage ist als injizierbarer Hostaufruf
-vorhanden, damit der Modusfallback bereits vor der Grafikschicht echt durch
-den BASIC-Fehlerpfad getestet wird. Spaetere Grafik- und Audioanweisungen
-besitzen sichtbare Deferred-Guards und werden niemals als erfolgreiche
-Leeroperation ausgegeben. Ein Host muss die Annahme einer solchen Anweisung
-ausdruecklich injizieren; der Standard bleibt ein sichtbarer Fehler.
+Die SCREEN-Modusabfrage ist als injizierbarer Hostaufruf vorhanden. Ein nicht
+verfuegbarer Modus erzeugt BASIC-Fehler 5, ohne den bisherigen Bildschirm zu
+ersetzen; der normale ON-ERROR-Fallback von SCREEN 9 auf SCREEN 1 bleibt
+dadurch echt. Nur die noch ausstehenden Audioanweisungen besitzen sichtbare
+Deferred-Guards. Ein Host muss ihre Annahme ausdruecklich injizieren; der
+Standard bleibt ein sichtbarer Fehler.
 
 DEF SEG = 0 schaltet ausschliesslich ein privates Byte an Offset 1047 frei.
 PEEK und POKE koennen damit das von GORILLA.BAS verwendete NumLock-Bit lesen
@@ -143,12 +143,14 @@ sind strukturell unerreichbar.
 Textbildschirm und Tastatur
 ---------------------------
 
-Jede VM besitzt einen eigenen 80x25-Zellbildschirm. Eine Zelle speichert ein
-Byte sowie Vorder- und Hintergrundattribut. Cursorposition, Sichtbarkeit,
-Form, VIEW-PRINT-Bereich und Revisionsstand gehoeren ebenfalls zur Instanz.
-SCREEN 0, WIDTH 80,25, COLOR, CLS, LOCATE und VIEW PRINT arbeiten nur auf
-diesem Zustand. Fehlerhafte mehrteilige COLOR- oder LOCATE-Werte veraendern
-keinen Teilzustand.
+Jede VM besitzt einen eigenen Zellbildschirm mit 25 Zeilen und 80 aktiven
+Spalten in SCREEN 0 und 9 beziehungsweise 40 Spalten in SCREEN 1. Eine Zelle
+speichert ein Byte sowie Vorder- und Hintergrundattribut. Cursorposition,
+Sichtbarkeit, Form, VIEW-PRINT-Bereich und Revisionsstand gehoeren ebenfalls
+zur Instanz. SCREEN, WIDTH, COLOR, CLS, LOCATE und VIEW PRINT arbeiten nur auf
+diesem Zustand. In Grafikmodi werden Textzellen mit einer lokalen ASCII-
+Bitmapfont in denselben Gastpixelpuffer gerastert. Fehlerhafte mehrteilige
+COLOR- oder LOCATE-Werte veraendern keinen Teilzustand.
 
 PRINT bildet Semikolon, 14-spaltige Kommazonen, TAB und die Leerzeichen um
 Zahlen ab. SPACE$ kommt aus dem normalen Stringpfad. Der aktive Druckbereich
@@ -163,6 +165,38 @@ Puffer sofort mit einer leeren Zeichenkette zurueck. INPUT und LINE INPUT
 geben dagegen kooperativ ab, bearbeiten und spiegeln eine maximal 255 Byte
 lange Zeile und weisen erst dann alle Ziele atomar zu. Ein ungueltiger Wert
 meldet `Redo from start`, ohne bereits gueltige Ziele vorzeitig zu aendern.
+
+Indexed8-Grafik
+---------------
+
+SCREEN 1 erzeugt einen instanzlokalen 320x200-Pixelpuffer mit vier
+Attributfarben, SCREEN 9 einen 640x350-Pixelpuffer mit 16 Attributfarben.
+Die Pixel bleiben indizierte Bytes; eine getrennte 256-Eintrag-XRGB-Palette
+bildet Attribute auf Hostfarben ab. PALETTE kann deshalb bereits gezeichnete
+Pixel ohne Neuzeichnen umfaerben. Ein Moduswechsel setzt Palette,
+Grafikkoordinate, Textgeometrie und Damagezustand gemeinsam zurueck.
+
+PSET, POINT, LINE mit B und BF, CIRCLE mit Winkelbereich und Aspect sowie
+PAINT arbeiten ausschliesslich im Gastpuffer. BASIC-Zahlen werden vor dem
+Clipping nach der festgelegten QBasic-Regel gerundet. Der aktuelle Grafikpunkt
+traegt STEP-Koordinaten; POINT liefert ausserhalb der Flaeche -1. PAINT nutzt
+einen begrenzten Flood-Fill und veraendert weder Host- noch Fremdinstanzdaten.
+
+GET schreibt den vier Byte grossen QuickBASIC-Header und die gepackten
+Bilddaten direkt in die Rohbytes eines numerischen Arrays. SCREEN 1 verwendet
+zwei Bit je Pixel, SCREEN 9 vier getrennte Ein-Bit-Ebenen je Scanline. PUT
+liest dasselbe Format mit PSET oder attributweisem XOR. Dadurch bleiben auch
+negative LONG-Werte aus DATA bitgenau und eine per XOR bewegte Banane kann
+ohne Sonderfallcode gezeichnet und wieder entfernt werden.
+
+Pixel-, Palette- und Textaenderungen vereinigen sich in einem Damage-Rechteck.
+`src/runtime_adapter.zig` uebergibt die fertige Indexed8-Oberflaeche an
+`r4os.subsystem_host`; kein BASIC-Primitiv ruft R4DRAW punktweise auf. Ein
+voller 640x350-Frame wird in 15 Bloecke von hoechstens 128x128 Pixeln
+zerlegt. Damageframes bleiben kleiner, ein unveraendertes Gastbild erzeugt
+keinen neuen Frame. Modusrevisionen bleiben auch ueber einen VM-Reset hinweg
+eindeutig, damit ein Presenter vor dem naechsten Frame stets den neuen
+Pixelpuffer bindet.
 
 Gastzeit, Zufall und Pacing
 --------------------------
@@ -205,33 +239,37 @@ geschrieben. Fehlende Dateien, falsche Modi, EOF-Ueberlauf und Pfadfehler
 behalten getrennte QBasic-Fehlernummern. RANDOM/BINARY, Drucker, COM-Ports,
 Loeschen und Verzeichnisveraenderungen sind nicht Bestandteil dieses Stands.
 
-`src/runtime_adapter.zig` bildet die VM auf `r4os.subsystem_runtime` ab. Pro
-Hostzyklus wird hoechstens eine gepacte BASIC-Scheibe ausgefuehrt. Fenster-
-und Close-Ereignisse werden davor verarbeitet. Reset erzeugt einen frischen
-Variablensatz und leert Stapel, Text, Eingabe, Wartezustand, Zufall und offene
-Dateien; ein Fehler oder Abschluss wird in den gemeinsamen
-Subsystem-Lebenszyklus ueberfuehrt. Audio liefert in dieser Stufe noch keine
-Gastdaten.
+`src/runtime_adapter.zig` bildet die VM auf `r4os.subsystem_runtime` und ihre
+Grafikausgabe auf `r4os.subsystem_host` ab. Pro Hostzyklus wird hoechstens
+eine gepacte BASIC-Scheibe ausgefuehrt. Fenster- und Close-Ereignisse werden
+davor verarbeitet. Reset erzeugt einen frischen Variablensatz und leert
+Stapel, Text, Grafik, Eingabe, Wartezustand, Zufall und offene Dateien; ein
+Fehler oder Abschluss wird in den gemeinsamen Subsystem-Lebenszyklus
+ueberfuehrt. Audio liefert in dieser Stufe noch keine Gastdaten.
 
 Tests
 -----
 
-Der normale, vollstaendig oeffentliche Testlauf lautet:
+Der normale Testlauf lautet:
 
     Build.bat test
 
-Er baut und inspiziert das GUI-R4X und fuehrt 34 Host-Component-Tests aus.
+Er baut und inspiziert das GUI-R4X und fuehrt die Host-Component-Tests aus.
 Vier positive und vier negative Frontend-Fixtures pruefen weiterhin den
-Quellvertrag. Dreizehn ausfuehrbare BAS-Fixtures pruefen Werte, Kontrollfluss,
+Quellvertrag. Die ausfuehrbaren BAS-Fixtures pruefen Werte, Kontrollfluss,
 Prozeduren, Built-ins, Aggregate, DATA, Fehlerfortsetzung, das private
 Speicherbyte, Text und Eingabe, Zeit und Zufall, CalcDelay-Pacing,
-sequentielle Dateien, endlose Ausfuehrung und getrennte Fehlerzustaende.
+sequentielle Dateien, Grafik und gepackte Bilder, endlose Ausfuehrung und
+getrennte Fehlerzustaende.
 Zusaetzlich werden exakte Laufzeitpositionen und Fehlernummern, Rekursion,
 verschachteltes ByRef, Hostfehler, Reset, Nullbudget-Abbruch, Fokus- und
 Instanztrennung, pausierte Wartezeit, Fensterereignisse waehrend SLEEP,
-absolute und relative Dateipfade sowie Storage-Fehler direkt getestet.
+absolute und relative Dateipfade sowie Storage-Fehler direkt getestet. Der
+Grafikhosttest prueft die 15 Bloecke eines Vollframes, Damageframes,
+Unterdrueckung unveraenderter Frames, mindestens 20 Bilder pro Sekunde sowie
+Resize und Letterboxing.
 
-Die optionale lokale Realprogrammabnahme lautet:
+Die lokale Realprogrammabnahme lautet:
 
     Build.bat gorilla-test
 
@@ -242,29 +280,30 @@ Sie liest ausschliesslich
 uebergibt danach die unveraenderten Bytes an dasselbe Frontend und den
 produktiven Binder. Ein zweiter Test fuehrt das Original durch Intro, zwei
 editierte Spielernamen, ungueltige und gueltige Spiel-/Schwerkraftwerte sowie
-Winkel und Geschwindigkeit. Nur ein ausdruecklicher Testhost nimmt die noch
-ausstehenden Grafik- und Audioanweisungen an; der Lauf muss am spaeteren
-POINT-Grafikguard enden. Der normale Build benoetigt diese lokale Datei nicht.
+Winkel und Geschwindigkeit. Danach durchlaeuft es Stadtaufbau, Gorillabilder,
+gepackte Bananendaten, XOR-Bewegung und Kollisionsabfragen bis zum Abschluss
+eines deterministischen grafischen Zugs. Rasterhash und Palette sind fest
+abgenommen. Nur die noch ausstehenden Audioanweisungen werden von einem
+ausdruecklichen Testhost angenommen. Der normale Build benoetigt diese lokale
+Datei nicht.
 
-Referenzen und Rechte
----------------------
+Referenzen und lokale Abnahme
+-----------------------------
 
 Die lokale Arbeitsreferenz liegt unter
 `D:\R4OS\ExFiles\Reference\Basic\`. Dort sind Herkunft, Revisionen,
 Pruefsummen und Rang der Microsoft-QuickBASIC-Handbuecher sowie der nur zum
 Architekturvergleich beschafften offenen Implementierung dokumentiert.
 
-Weder die Microsoft-Handbuecher noch fremder Interpretercode oder die lokale
-GORILLA.BAS werden in dieses Repository kopiert. `PROVENANCE.txt` beschreibt
-die eigenstaendige Entstehung des Zig-Codes; `THIRD_PARTY_NOTICES.md`
-beschreibt die nicht redistributierten Referenzen. Vor einer spaeteren
-Aufnahme von GORILLA.BAS in ein oeffentliches Image muessen die
-Weitergaberechte getrennt geklaert sein.
+`PROVENANCE.txt` beschreibt die eigenstaendige Entstehung des Zig-Codes und
+die ausgewerteten Referenzabschnitte. GORILLA.BAS wird direkt aus dem lokalen,
+vom Git-Push ausgeschlossenen `Artifacts/Distribution/Injection`-Baum fuer
+Entwicklung und Abnahme gelesen. Ein Upload eines neuen `Release.zip` ist
+nicht Teil der 0.66.X-Roadmap.
 
 Noch nicht Bestandteil dieses Stands
 ------------------------------------
 
-- virtueller Grafikbildschirm und Grafikbefehle
 - Audio und Music Macro Language
 - produktives Laden und Anzeigen einer BAS-Datei im Fenster
 

@@ -263,6 +263,12 @@ const Builder = struct {
             .print => self.parsePrintStatement(),
             .input => self.parseInputStatement(false),
             .line => self.parseLineStatement(),
+            .palette => self.parseGraphicsPalette(),
+            .pset => self.parseGraphicsPset(),
+            .circle => self.parseGraphicsCircle(),
+            .paint => self.parseGraphicsPaint(),
+            .get => self.parseGraphicsGet(),
+            .put => self.parseGraphicsPut(),
             .randomize => self.parseRandomize(),
             .sleep => self.parseSleep(),
             .open => self.parseOpen(),
@@ -1046,8 +1052,153 @@ const Builder = struct {
     fn parseLineStatement(self: *Builder) !bool {
         const statement = self.advance();
         if (self.consumeKeyword(.input)) return self.parseInputBody(statement, true);
-        while (!self.atBoundary() and !self.atKeyword(.else_)) _ = self.advance();
-        _ = try self.emit(.deferred_statement, @intFromEnum(frontend.Keyword.line), 0, statement.span);
+
+        const first_relative = (try self.parseGraphicsPoint(statement.span)) orelse return false;
+        if (!try self.expect(.minus)) return false;
+        const second_relative = (try self.parseGraphicsPoint(statement.span)) orelse return false;
+        var flags: u32 = if (first_relative) bytecode.graphics_point_relative else 0;
+        if (second_relative) flags |= bytecode.graphics_second_point_relative;
+        var box_mode: bytecode.GraphicsBoxMode = .line;
+        if (self.consume(.comma)) {
+            if (!self.at(.comma) and !self.atBoundary() and !self.atKeyword(.else_)) {
+                const color_type = (try self.parseExpression()) orelse return false;
+                if (!color_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+                flags |= bytecode.graphics_color_present;
+            }
+            if (self.consume(.comma)) {
+                const mode = (try self.expectIdentifier()) orelse return false;
+                const text = self.tokenText(mode);
+                if (std.ascii.eqlIgnoreCase(text, "B")) {
+                    box_mode = .box;
+                } else if (std.ascii.eqlIgnoreCase(text, "BF")) {
+                    box_mode = .filled_box;
+                } else {
+                    try self.addDiagnostic(.unexpected_token, mode.span);
+                    return false;
+                }
+            }
+        }
+        flags |= @as(u32, @intFromEnum(box_mode)) << bytecode.graphics_box_shift;
+        _ = try self.emit(.graphics_line, flags, 0, statement.span);
+        return true;
+    }
+
+    fn parseGraphicsPalette(self: *Builder) !bool {
+        const statement = self.advance();
+        const attribute_type = (try self.parseExpression()) orelse return false;
+        if (!attribute_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        if (!try self.expect(.comma)) return false;
+        const color_type = (try self.parseExpression()) orelse return false;
+        if (!color_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        _ = try self.emit(.graphics_palette, 0, 0, statement.span);
+        return true;
+    }
+
+    fn parseGraphicsPset(self: *Builder) !bool {
+        const statement = self.advance();
+        const relative = (try self.parseGraphicsPoint(statement.span)) orelse return false;
+        var flags: u32 = if (relative) bytecode.graphics_point_relative else 0;
+        if (self.consume(.comma)) {
+            const color_type = (try self.parseExpression()) orelse return false;
+            if (!color_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            flags |= bytecode.graphics_color_present;
+        }
+        _ = try self.emit(.graphics_pset, flags, 0, statement.span);
+        return true;
+    }
+
+    fn parseGraphicsCircle(self: *Builder) !bool {
+        const statement = self.advance();
+        const relative = (try self.parseGraphicsPoint(statement.span)) orelse return false;
+        if (!try self.expect(.comma)) return false;
+        const radius_type = (try self.parseExpression()) orelse return false;
+        if (!radius_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        const optional = try self.parseGraphicsOptionalNumbers(4, statement.span);
+        const flags: u32 = if (relative) bytecode.graphics_point_relative else 0;
+        const encoded = optional.mask | (optional.count << bytecode.graphics_optional_count_shift);
+        _ = try self.emit(.graphics_circle, flags, encoded, statement.span);
+        return true;
+    }
+
+    fn parseGraphicsPaint(self: *Builder) !bool {
+        const statement = self.advance();
+        const relative = (try self.parseGraphicsPoint(statement.span)) orelse return false;
+        const optional = try self.parseGraphicsOptionalNumbers(2, statement.span);
+        const flags: u32 = if (relative) bytecode.graphics_point_relative else 0;
+        const encoded = optional.mask | (optional.count << bytecode.graphics_optional_count_shift);
+        _ = try self.emit(.graphics_paint, flags, encoded, statement.span);
+        return true;
+    }
+
+    fn parseGraphicsGet(self: *Builder) !bool {
+        const statement = self.advance();
+        const first_relative = (try self.parseGraphicsPoint(statement.span)) orelse return false;
+        if (!try self.expect(.minus)) return false;
+        const second_relative = (try self.parseGraphicsPoint(statement.span)) orelse return false;
+        if (!try self.expect(.comma)) return false;
+        if (!try self.parseGraphicsArrayReference(statement.span)) return false;
+        var flags: u32 = if (first_relative) bytecode.graphics_point_relative else 0;
+        if (second_relative) flags |= bytecode.graphics_second_point_relative;
+        _ = try self.emit(.graphics_get, flags, 0, statement.span);
+        return true;
+    }
+
+    fn parseGraphicsPut(self: *Builder) !bool {
+        const statement = self.advance();
+        const relative = (try self.parseGraphicsPoint(statement.span)) orelse return false;
+        if (!try self.expect(.comma)) return false;
+        if (!try self.parseGraphicsArrayReference(statement.span)) return false;
+        if (!try self.expect(.comma)) return false;
+        const action: bytecode.GraphicsPutAction = if (self.consumeKeyword(.pset))
+            .pset
+        else if (self.consumeKeyword(.xor))
+            .xor
+        else
+            return self.fail(.expected_token);
+        const flags: u32 = if (relative) bytecode.graphics_point_relative else 0;
+        _ = try self.emit(.graphics_put, flags, @intFromEnum(action), statement.span);
+        return true;
+    }
+
+    const GraphicsOptionalNumbers = struct {
+        mask: u32 = 0,
+        count: u32 = 0,
+    };
+
+    fn parseGraphicsOptionalNumbers(self: *Builder, maximum: u32, span: frontend.Span) !GraphicsOptionalNumbers {
+        var result: GraphicsOptionalNumbers = .{};
+        var position: u32 = 0;
+        while (position < maximum and self.consume(.comma)) : (position += 1) {
+            if (self.at(.comma) or self.atBoundary() or self.atKeyword(.else_)) continue;
+            const value_type = (try self.parseExpression()) orelse return result;
+            if (!value_type.isNumeric()) try self.addDiagnostic(.type_mismatch, span);
+            result.mask |= @as(u32, 1) << @intCast(position);
+            result.count += 1;
+        }
+        return result;
+    }
+
+    fn parseGraphicsPoint(self: *Builder, span: frontend.Span) !?bool {
+        const relative = self.consumeKeyword(.step);
+        if (!try self.expect(.left_paren)) return null;
+        const x_type = (try self.parseExpression()) orelse return null;
+        if (!x_type.isNumeric()) try self.addDiagnostic(.type_mismatch, span);
+        if (!try self.expect(.comma)) return null;
+        const y_type = (try self.parseExpression()) orelse return null;
+        if (!y_type.isNumeric()) try self.addDiagnostic(.type_mismatch, span);
+        if (!try self.expect(.right_paren)) return null;
+        return relative;
+    }
+
+    fn parseGraphicsArrayReference(self: *Builder, span: frontend.Span) !bool {
+        const name = (try self.expectIdentifier()) orelse return false;
+        const target = (try self.parseLvalueReference(name, true)) orelse return false;
+        if (!target.is_whole_array or target.dimensions == 0 or !target.value_type.isNumeric() or
+            target.record_type != bytecode.invalid_index)
+        {
+            try self.addDiagnostic(.invalid_array_argument, span);
+            return false;
+        }
         return true;
     }
 
@@ -1814,7 +1965,6 @@ const Builder = struct {
         const result_type = try self.validateBuiltin(builtin, argument_types[0..argument_count], function_token.span) orelse return null;
         switch (builtin) {
             .peek => _ = try self.emit(.peek, 0, 0, function_token.span),
-            .point => _ = try self.emit(.deferred_builtin, @intFromEnum(builtin), @intCast(argument_count), function_token.span),
             else => _ = try self.emit(.call_builtin, @intFromEnum(builtin), @intCast(argument_count), function_token.span),
         }
         return result_type;

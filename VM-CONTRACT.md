@@ -1,6 +1,6 @@
 ﻿# R4BASIC v1 core VM contract
 
-Contract version: `1.2.0`
+Contract version: `1.3.0`
 
 This document freezes the executable R4BASIC language layers. The broader
 source syntax accepted by the frontend remains defined in
@@ -102,13 +102,15 @@ The VM executes:
   `VIEW PRINT` on the private text screen;
 - screen and sequential-file `PRINT`, console and file `INPUT`, and
   `LINE INPUT`;
+- `SCREEN 1`, `SCREEN 9`, `PALETTE`, `PSET`, coordinate `POINT`, `LINE`
+  including `B` and `BF`, `CIRCLE`, `PAINT`, and packed `GET`/`PUT` with
+  `PSET` and `XOR`;
 - `RANDOMIZE`, `SLEEP`, and sequential `OPEN`/`CLOSE`;
 - `END`.
 
-Statements owned by later graphics and audio layers bind to explicit deferred
-host guards. A host may accept a named deferred statement explicitly;
-otherwise reaching it is a deterministic host-failure diagnostic, never a
-silent no-op.
+Audio statements owned by the later audio layer bind to explicit deferred
+host guards. A host may accept one explicitly; otherwise reaching it is a
+deterministic host-failure diagnostic, never a silent no-op.
 
 ## Procedures and functions
 
@@ -134,13 +136,13 @@ silent no-op.
 ## Built-in functions and host services
 
 The executable built-ins are `ABS`, `ATN`, `CHR$`, `CINT`, `COS`, `EOF`,
-`INKEY$`, `INSTR`, `INT`, `LEFT$`, `LEN`, `LTRIM$`, `MID$`, `RND`, `SIN`,
-`SPACE$`, `STR$`, `TIMER`, `UCASE$`, and `VAL` with the arities and type
-categories defined by the source contract.
+`INKEY$`, `INSTR`, `INT`, `LEFT$`, `LEN`, `LTRIM$`, `MID$`, coordinate
+`POINT`, `RND`, `SIN`, `SPACE$`, `STR$`, `TIMER`, `UCASE$`, and `VAL` with
+the arities and type categories defined by the source contract.
 
 `ATN`, `COS`, `SIN`, and power call an injected math service. Cancellation
-polling, the provisional SCREEN-mode availability probe, sequential file I/O,
-and acceptance of a still-deferred statement are injected separately. A
+polling, the SCREEN-mode availability probe, sequential file I/O, and
+acceptance of a still-deferred audio statement are injected separately. A
 missing or failing required host result becomes a deterministic VM error;
 tests do not depend on hidden process-global hooks.
 
@@ -151,14 +153,17 @@ guest address can become an R4OS or host pointer.
 
 ## Text screen and interactive input
 
-- Every VM owns one fixed 80 by 25 cell screen. A cell contains one byte,
+- Every VM owns one 25-row cell screen with 80 active columns in modes 0 and
+  9 and 40 active columns in mode 1. A cell contains one byte,
   foreground attribute 0 through 31, and background attribute 0 through 7.
   Cursor position, visibility, shape, print viewport, and revision are part
   of that same instance-local state.
-- `SCREEN 0` resets the text screen. `WIDTH` accepts only 80 columns and an
-  optional 25 rows. `CLS 0` and `CLS 1` clear the complete screen; `CLS 2`
-  clears the active `VIEW PRINT` viewport. Invalid multi-argument `COLOR` or
-  `LOCATE` updates are atomic.
+- `SCREEN 0` resets the text screen. `WIDTH` accepts the active mode width
+  and an optional 25 rows. In graphics modes text cells are rasterized into
+  the same guest pixel buffer using a subsystem-local 8 by 8 ASCII font;
+  mode 9 maps it deterministically onto 8 by 14 cells. `CLS 2` clears only
+  the active text viewport. Invalid multi-argument `COLOR` or `LOCATE`
+  updates are atomic.
 - BASIC rows and columns are one-based. `VIEW PRINT top TO bottom` selects an
   inclusive scrolling region; bare `VIEW PRINT` restores rows 1 through 25.
   Output outside that region can be positioned with `LOCATE`, while newline
@@ -177,6 +182,35 @@ guest address can become an R4OS or host pointer.
   target values are parsed before any assignment; invalid or overflowing
   input prints `Redo from start` and leaves every target unchanged.
 
+## Indexed graphics screen
+
+- Each VM owns either no graphics surface, a 320 by 200 `SCREEN 1` surface
+  with four attributes, or a 640 by 350 `SCREEN 9` surface with sixteen
+  attributes. Pixels are indexed bytes and the mutable 256-entry XRGB
+  palette is separate, so `PALETTE` recolors existing pixels immediately.
+- Mode changes allocate a fresh surface atomically, reset the default
+  CGA/EGA palette, current graphics point, and text geometry, and mark one
+  full damage rectangle. An injected unavailable mode raises catchable BASIC
+  error 5 without replacing the previous surface, which permits the normal
+  `ON ERROR` fallback from mode 9 to mode 1.
+- Coordinates apply BASIC numeric rounding before clipping. `PSET` clips
+  silently, `POINT` returns the stored attribute or `-1` outside the screen,
+  and `LINE` uses the current point for `STEP`. Boxes, filled boxes, arcs,
+  aspect-scaled circles, and bounded flood fill modify only guest pixels.
+- `GET` writes the four-byte QuickBASIC header followed by mode-appropriate
+  packed data into the raw bytes of any numeric array. Mode 1 packs two bits
+  per pixel; mode 9 stores four one-bit planes per scan line. `PUT` decodes
+  the same representation with exact `PSET` or attribute-wise `XOR` and
+  rejects an image extending outside the guest surface. LONG DATA therefore
+  remains bit-exact and needs no program-specific conversion.
+- Pixel changes, palette changes, and text-cell rasterization merge into one
+  damage rectangle. The runtime adapter hands an Indexed8 surface to
+  `r4os.subsystem_host`; it never calls R4DRAW for individual primitives.
+  A 640 by 350 full frame becomes fifteen bounded raster blocks, later
+  changes use damage frames, and an unchanged guest image publishes no frame.
+  Mode revisions remain distinct across VM reset so a presenter always binds
+  the replacement pixel allocation before publishing it.
+
 ## Guest time, pacing, and random state
 
 - `TIMER` is a SINGLE number of guest seconds modulo 86,400. Its source is
@@ -188,7 +222,7 @@ guest address can become an R4OS or host pointer.
   continue to be polled while the VM waits.
 - The runtime adapter caps a scheduled BASIC slice at 26 instructions and
   schedules a yielded continuation at least 2 guest milliseconds later.
-  This fixed pacing is part of VM contract 1.2: it bounds host use and makes
+  This fixed pacing remains part of the VM contract: it bounds host use and makes
   the historical `CalcDelay`/`Rest` calibration independent of modern host
   loop speed.
 - Every VM owns a 24-bit random state and last result. An injected initial
@@ -256,15 +290,17 @@ guest address can become an R4OS or host pointer.
   private segment and byte, text screen, keyboard and input line, guest-time
   waits, random state, sequential files, instruction count, cancellation, and
   exit state.
-- Guest frames and audio samples remain later layers. Scheduling, paused time,
-  and host event polling stay in the shared subsystem runtime rather than
-  moving into the interpreter.
+- Audio samples remain a later layer. Video presentation is a separate
+  adapter over the VM-owned surface; scheduling, paused time, and host event
+  polling stay in the shared subsystem runtime rather than moving into the
+  interpreter or video host.
 
 ## Instance and ownership contract
 
 An immutable compiled program may be shared by multiple VMs. Each VM owns
 its globals, strings, array bounds and elements, record fields, aliases, DATA
-cursor, error handlers, compatibility byte, text cells and cursor, keyboard
+cursor, error handlers, compatibility byte, text cells and cursor, graphics
+mode, current point, palette, pixels and damage, keyboard
 and pending input, guest time and sleep deadline, random generator, open
 files, evaluation stack, frames, GOSUB stack, instruction pointer,
 instruction count, status, diagnostic, cancellation flag, and exit code.
@@ -304,7 +340,7 @@ instruction.
 
 ## Permanent acceptance set
 
-The original, redistributable fixtures below are part of this contract:
+The permanent general fixtures below are part of this contract:
 
 - `vm_expressions.bas`: all five value types, constants, suffix/default
   types, promotion, conversion, rounding, truth, comparison, division,
@@ -333,11 +369,20 @@ The original, redistributable fixtures below are part of this contract:
   instruction pacing.
 - `vm_sequential_files.bas`: relative and absolute sequential input, output,
   append, quoted fields, whole lines, and EOF.
+- `vm_graphics.bas`: modes, palette, text-compatible drawing, clipping,
+  circle, flood fill, GET/PUT, POINT, STEP, XOR reversibility, and
+  two-instance pixel/palette isolation.
+- `vm_packed_images.bas`: original synthetic LONG arrays in the mode 1 and
+  mode 9 packed formats, including reversible PUT XOR.
 
 `Tests/compiler_test.zig` also fixes negative binding cases, exact runtime
 positions, QBasic error numbers, string overflow, host failure, and
 `subsystem_runtime` lifecycle behavior. It additionally covers focus and
 two-instance keyboard isolation, interactive RANDOMIZE retry, paused time,
 host polling while asleep, storage-facade error classification, unsupported
-file modes and device names, and atomic text-state errors. None of these
-fixtures contains code from the local GORILLA.BAS acceptance source.
+file modes and device names, and atomic text-state errors.
+`Tests/graphics_host_test.zig` fixes 128 by 128 raster bounds, the fifteen
+blocks of a 640 by 350 full frame, real damage frames, unchanged-frame
+suppression, a sustained 30-frame animation above 20 frames per second, and
+resize letterboxing. The local GORILLA.BAS acceptance exercises the same
+public compiler, VM, packed-image, and presentation paths.

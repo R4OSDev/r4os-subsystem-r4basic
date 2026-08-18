@@ -1,10 +1,11 @@
 const std = @import("std");
 const bytecode = @import("bytecode.zig");
 const frontend = @import("frontend.zig");
+const graphics_screen = @import("graphics_screen.zig");
 const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "1.2.0";
+pub const contract_version = "1.3.0";
 pub const default_instruction_budget: u32 = 26;
 pub const execution_slice_interval_ns: u64 = 2 * std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
@@ -312,6 +313,7 @@ pub const Vm = struct {
     compatibility_segment_zero: bool = false,
     virtual_bios_byte: u8 = 0,
     text: text_screen.Screen = .{},
+    graphics: graphics_screen.Screen = .{},
     screen_mode: i32 = 0,
     keyboard: std.ArrayList(u8) = .empty,
     keyboard_head: usize = 0,
@@ -361,6 +363,7 @@ pub const Vm = struct {
         self.keyboard.deinit(self.allocator);
         self.input_line.deinit(self.allocator);
         self.discardFiles();
+        self.graphics.deinit(self.allocator);
         deinitGlobals(self.allocator, self.globals);
         self.* = undefined;
     }
@@ -406,6 +409,21 @@ pub const Vm = struct {
         return &self.text;
     }
 
+    pub fn graphicsView(self: *Vm) ?graphics_screen.View {
+        self.syncTextToGraphics();
+        return self.graphics.view();
+    }
+
+    pub fn takeGraphicsDamage(self: *Vm) ?graphics_screen.Rect {
+        self.syncTextToGraphics();
+        return self.graphics.takeDamage();
+    }
+
+    pub fn graphicsPoint(self: *const Vm, x: i32, y: i32) ?i32 {
+        if (self.screen_mode == 0) return null;
+        return self.graphics.point(.{ .x = x, .y = y }) catch null;
+    }
+
     pub fn reset(self: *Vm) InitError!void {
         const replacement = try allocateGlobals(self.allocator, self.program);
         errdefer deinitGlobals(self.allocator, replacement);
@@ -431,6 +449,7 @@ pub const Vm = struct {
         self.compatibility_segment_zero = false;
         self.virtual_bios_byte = 0;
         self.text.reset();
+        self.graphics.reset(self.allocator);
         self.screen_mode = 0;
         self.keyboard.clearRetainingCapacity();
         self.keyboard_head = 0;
@@ -510,6 +529,7 @@ pub const Vm = struct {
                 }
                 return .{ .status = self.status, .instructions = executed };
             };
+            self.syncTextToGraphics();
             executed += 1;
             self.total_instructions += 1;
             if (self.status == .halted) return .{ .status = .halted, .instructions = executed };
@@ -639,6 +659,13 @@ pub const Vm = struct {
             .peek => try self.peek(),
             .poke => try self.poke(),
             .screen_mode_probe => try self.screenModeProbe(),
+            .graphics_palette => try self.graphicsPalette(),
+            .graphics_pset => try self.graphicsPset(instruction.a),
+            .graphics_line => try self.graphicsLine(instruction.a),
+            .graphics_circle => try self.graphicsCircle(instruction.a, instruction.b),
+            .graphics_paint => try self.graphicsPaint(instruction.a, instruction.b),
+            .graphics_get => try self.graphicsGet(instruction.a),
+            .graphics_put => try self.graphicsPut(instruction.a, instruction.b),
             .text_width => try self.textWidth(instruction.a),
             .text_color => try self.textColor(instruction.a, instruction.b),
             .text_cls => try self.textCls(instruction.a),
@@ -974,8 +1001,131 @@ pub const Vm = struct {
         const mode = try values.asLong(mode_value);
         if (mode != 0 and mode != 1 and mode != 9) return error.IllegalFunctionCall;
         self.host.screen_mode(self.host.context, mode) catch return error.IllegalFunctionCall;
+        self.graphics.setMode(self.allocator, mode) catch |fault| return switch (fault) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.IllegalFunctionCall => error.IllegalFunctionCall,
+        };
+        self.text.configure(if (mode == 1) 40 else 80) catch return error.IllegalFunctionCall;
         self.screen_mode = mode;
-        if (mode == 0) self.text.reset();
+    }
+
+    fn graphicsPalette(self: *Vm) ExecutionError!void {
+        const display_color = try self.popLong();
+        const attribute = try self.popLong();
+        self.graphics.setPalette(attribute, display_color) catch return error.IllegalFunctionCall;
+    }
+
+    fn graphicsPset(self: *Vm, flags: u32) ExecutionError!void {
+        if ((flags & ~(bytecode.graphics_point_relative | bytecode.graphics_color_present)) != 0) return error.InvalidInstruction;
+        const color = if ((flags & bytecode.graphics_color_present) != 0) try self.popLong() else self.text.foreground;
+        const raw = try self.popGraphicsPoint();
+        const target = self.graphics.resolvePoint(raw.x, raw.y, (flags & bytecode.graphics_point_relative) != 0);
+        self.graphics.pset(target, color) catch return error.IllegalFunctionCall;
+    }
+
+    fn graphicsLine(self: *Vm, flags: u32) ExecutionError!void {
+        const allowed = bytecode.graphics_point_relative | bytecode.graphics_second_point_relative |
+            bytecode.graphics_color_present | (@as(u32, 3) << bytecode.graphics_box_shift);
+        if ((flags & ~allowed) != 0) return error.InvalidInstruction;
+        const encoded_box = (flags >> bytecode.graphics_box_shift) & 3;
+        if (encoded_box > @intFromEnum(bytecode.GraphicsBoxMode.filled_box)) return error.InvalidInstruction;
+        const color = if ((flags & bytecode.graphics_color_present) != 0) try self.popLong() else self.text.foreground;
+        const raw_second = try self.popGraphicsPoint();
+        const raw_first = try self.popGraphicsPoint();
+        const first = self.graphics.resolvePoint(raw_first.x, raw_first.y, (flags & bytecode.graphics_point_relative) != 0);
+        const second = if ((flags & bytecode.graphics_second_point_relative) != 0)
+            graphics_screen.Point{ .x = saturatingCoordinateAdd(first.x, raw_second.x), .y = saturatingCoordinateAdd(first.y, raw_second.y) }
+        else
+            raw_second;
+        self.graphics.line(first, second, color, @enumFromInt(@as(u8, @intCast(encoded_box)))) catch return error.IllegalFunctionCall;
+    }
+
+    fn graphicsCircle(self: *Vm, flags: u32, optional: u32) ExecutionError!void {
+        if ((flags & ~bytecode.graphics_point_relative) != 0) return error.InvalidInstruction;
+        const mask = optional & 0x0f;
+        const count = optional >> bytecode.graphics_optional_count_shift;
+        if (@popCount(mask) != count or count > 4) return error.InvalidInstruction;
+        var aspect: ?f64 = null;
+        var end: ?f64 = null;
+        var start: ?f64 = null;
+        var color: i32 = self.text.foreground;
+        if ((mask & 8) != 0) aspect = try self.popDouble();
+        if ((mask & 4) != 0) end = try self.popDouble();
+        if ((mask & 2) != 0) start = try self.popDouble();
+        if ((mask & 1) != 0) color = try self.popLong();
+        const radius = try self.popDouble();
+        const raw_center = try self.popGraphicsPoint();
+        const center = self.graphics.resolvePoint(raw_center.x, raw_center.y, (flags & bytecode.graphics_point_relative) != 0);
+        self.graphics.circle(center, radius, color, start, end, aspect) catch |fault| return switch (fault) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.IllegalFunctionCall => error.IllegalFunctionCall,
+        };
+    }
+
+    fn graphicsPaint(self: *Vm, flags: u32, optional: u32) ExecutionError!void {
+        if ((flags & ~bytecode.graphics_point_relative) != 0) return error.InvalidInstruction;
+        const mask = optional & 0x03;
+        const count = optional >> bytecode.graphics_optional_count_shift;
+        if (@popCount(mask) != count or count > 2) return error.InvalidInstruction;
+        var border: ?i32 = null;
+        var fill: i32 = self.text.foreground;
+        if ((mask & 2) != 0) border = try self.popLong();
+        if ((mask & 1) != 0) fill = try self.popLong();
+        const raw = try self.popGraphicsPoint();
+        const target = self.graphics.resolvePoint(raw.x, raw.y, (flags & bytecode.graphics_point_relative) != 0);
+        self.graphics.paint(self.allocator, target, fill, border orelse fill) catch |fault| return switch (fault) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.IllegalFunctionCall => error.IllegalFunctionCall,
+        };
+    }
+
+    fn graphicsGet(self: *Vm, flags: u32) ExecutionError!void {
+        if ((flags & ~(bytecode.graphics_point_relative | bytecode.graphics_second_point_relative)) != 0) return error.InvalidInstruction;
+        const array = try self.popArrayReference();
+        const raw_second = try self.popGraphicsPoint();
+        const raw_first = try self.popGraphicsPoint();
+        const first = self.graphics.resolvePoint(raw_first.x, raw_first.y, (flags & bytecode.graphics_point_relative) != 0);
+        const second = if ((flags & bytecode.graphics_second_point_relative) != 0)
+            graphics_screen.Point{ .x = saturatingCoordinateAdd(first.x, raw_second.x), .y = saturatingCoordinateAdd(first.y, raw_second.y) }
+        else
+            raw_second;
+        const bytes = self.graphics.capture(self.allocator, first, second) catch |fault| return switch (fault) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.IllegalFunctionCall => error.IllegalFunctionCall,
+        };
+        defer self.allocator.free(bytes);
+        try writeArrayRawPrefix(array, bytes);
+    }
+
+    fn graphicsPut(self: *Vm, flags: u32, encoded_action: u32) ExecutionError!void {
+        if ((flags & ~bytecode.graphics_point_relative) != 0 or encoded_action > @intFromEnum(bytecode.GraphicsPutAction.xor)) {
+            return error.InvalidInstruction;
+        }
+        const array = try self.popArrayReference();
+        const raw = try self.popGraphicsPoint();
+        const target = self.graphics.resolvePoint(raw.x, raw.y, (flags & bytecode.graphics_point_relative) != 0);
+        const bytes = try readArrayRaw(self.allocator, array);
+        defer self.allocator.free(bytes);
+        self.graphics.put(target, bytes, @enumFromInt(@as(u8, @intCast(encoded_action)))) catch return error.IllegalFunctionCall;
+    }
+
+    fn popGraphicsPoint(self: *Vm) ExecutionError!graphics_screen.Point {
+        const y = try self.popLong();
+        const x = try self.popLong();
+        return .{ .x = x, .y = y };
+    }
+
+    fn popArrayReference(self: *Vm) ExecutionError!*ArrayValue {
+        const root = resolveCell(try self.popReference()) orelse return error.InvalidInstruction;
+        return switch (root.owned) {
+            .array => |*array| if (array.record_type == bytecode.invalid_index and array.value_type.isNumeric()) array else error.TypeMismatch,
+            else => error.TypeMismatch,
+        };
+    }
+
+    fn syncTextToGraphics(self: *Vm) void {
+        if (self.screen_mode == 0) return;
+        if (self.text.takeDirty()) |dirty| self.graphics.renderText(&self.text, dirty);
     }
 
     fn textWidth(self: *Vm, argument_count: u32) ExecutionError!void {
@@ -994,7 +1144,18 @@ pub const Vm = struct {
     fn textCls(self: *Vm, argument_count: u32) ExecutionError!void {
         if (argument_count > 1) return error.InvalidInstruction;
         const mode = if (argument_count == 1) try self.popLong() else null;
-        self.text.clear(mode) catch return error.IllegalFunctionCall;
+        if (self.screen_mode == 0) {
+            self.text.clear(mode) catch return error.IllegalFunctionCall;
+            return;
+        }
+        const graphics_mode = mode orelse 0;
+        if (graphics_mode < 0 or graphics_mode > 2) return error.IllegalFunctionCall;
+        if (graphics_mode == 0 or graphics_mode == 1) {
+            self.graphics.clear(@as(i32, self.text.background & self.graphics.maximumAttribute())) catch return error.IllegalFunctionCall;
+        }
+        if (graphics_mode == 0 or graphics_mode == 2) {
+            self.text.clear(if (graphics_mode == 2) 2 else 0) catch return error.IllegalFunctionCall;
+        }
     }
 
     fn textLocate(self: *Vm, mask: u32, argument_count: u32) ExecutionError!void {
@@ -1026,6 +1187,12 @@ pub const Vm = struct {
         var value = try self.popValue();
         defer value.deinit(self.allocator);
         return values.asLong(value);
+    }
+
+    fn popDouble(self: *Vm) ExecutionError!f64 {
+        var value = try self.popValue();
+        defer value.deinit(self.allocator);
+        return values.asDouble(value);
     }
 
     fn printBeginFile(self: *Vm) ExecutionError!void {
@@ -1698,7 +1865,11 @@ pub const Vm = struct {
             .inkey_string => self.inkeyString(),
             .rnd => self.randomNumber(arguments),
             .timer => .{ .single = self.timerSeconds() },
-            .point => error.HostFailure,
+            .point => blk: {
+                const x = try values.asLong(arguments[0]);
+                const y = try values.asLong(arguments[1]);
+                break :blk .{ .integer = @intCast(try self.graphics.point(.{ .x = x, .y = y })) };
+            },
         };
     }
 
@@ -2082,6 +2253,72 @@ fn integerFloor(input: values.Value) ExecutionError!values.Value {
         .single => |number| .{ .single = @floor(number) },
         .double => |number| .{ .double = @floor(number) },
         .string => error.TypeMismatch,
+    };
+}
+
+fn saturatingCoordinateAdd(first: i32, second: i32) i32 {
+    const result = @as(i64, first) + second;
+    return @intCast(std.math.clamp(result, std.math.minInt(i32), std.math.maxInt(i32)));
+}
+
+fn arrayElementWidth(value_type: bytecode.ValueType) ExecutionError!usize {
+    return switch (value_type) {
+        .integer => 2,
+        .long, .single => 4,
+        .double => 8,
+        .string => error.TypeMismatch,
+    };
+}
+
+fn readArrayRaw(allocator: std.mem.Allocator, array: *const ArrayValue) ExecutionError![]u8 {
+    if (array.record_type != bytecode.invalid_index or !array.value_type.isNumeric()) return error.TypeMismatch;
+    const width = try arrayElementWidth(array.value_type);
+    const byte_count = std.math.mul(usize, array.elements.len, width) catch return error.OutOfMemory;
+    const result = try allocator.alloc(u8, byte_count);
+    errdefer allocator.free(result);
+    for (array.elements, 0..) |*element, index| {
+        try encodeArrayElement(element, array.value_type, result[index * width ..][0..width]);
+    }
+    return result;
+}
+
+fn writeArrayRawPrefix(array: *ArrayValue, bytes: []const u8) ExecutionError!void {
+    if (array.record_type != bytecode.invalid_index or !array.value_type.isNumeric()) return error.TypeMismatch;
+    const width = try arrayElementWidth(array.value_type);
+    const byte_count = std.math.mul(usize, array.elements.len, width) catch return error.OutOfMemory;
+    if (bytes.len > byte_count) return error.IllegalFunctionCall;
+    var raw: [8]u8 = [_]u8{0} ** 8;
+    for (array.elements, 0..) |*element, index| {
+        const offset = index * width;
+        if (offset >= bytes.len) break;
+        try encodeArrayElement(element, array.value_type, raw[0..width]);
+        const amount = @min(width, bytes.len - offset);
+        @memcpy(raw[0..amount], bytes[offset .. offset + amount]);
+        try decodeArrayElement(element, array.value_type, raw[0..width]);
+    }
+}
+
+fn encodeArrayElement(cell: *const Cell, value_type: bytecode.ValueType, out: []u8) ExecutionError!void {
+    const scalar = try scalarAt(cell);
+    if (scalar.valueType() != value_type or out.len != try arrayElementWidth(value_type)) return error.TypeMismatch;
+    switch (scalar.*) {
+        .integer => |number| std.mem.writeInt(u16, out[0..2], @bitCast(number), .little),
+        .long => |number| std.mem.writeInt(u32, out[0..4], @bitCast(number), .little),
+        .single => |number| std.mem.writeInt(u32, out[0..4], @bitCast(number), .little),
+        .double => |number| std.mem.writeInt(u64, out[0..8], @bitCast(number), .little),
+        .string => return error.TypeMismatch,
+    }
+}
+
+fn decodeArrayElement(cell: *Cell, value_type: bytecode.ValueType, bytes: []const u8) ExecutionError!void {
+    const scalar = try scalarAtMutable(cell);
+    if (scalar.valueType() != value_type or bytes.len != try arrayElementWidth(value_type)) return error.TypeMismatch;
+    scalar.* = switch (value_type) {
+        .integer => .{ .integer = @bitCast(std.mem.readInt(u16, bytes[0..2], .little)) },
+        .long => .{ .long = @bitCast(std.mem.readInt(u32, bytes[0..4], .little)) },
+        .single => .{ .single = @bitCast(std.mem.readInt(u32, bytes[0..4], .little)) },
+        .double => .{ .double = @bitCast(std.mem.readInt(u64, bytes[0..8], .little)) },
+        .string => return error.TypeMismatch,
     };
 }
 

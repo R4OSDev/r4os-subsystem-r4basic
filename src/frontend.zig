@@ -1269,6 +1269,7 @@ const Parser = struct {
     }
 
     fn parsePoint(self: *Parser) bool {
+        _ = self.consumeKeyword(.step);
         if (!self.expect(.left_paren) or !self.parseExpression() or !self.expect(.comma)) return false;
         return self.parseExpression() and self.expect(.right_paren);
     }

@@ -1,7 +1,7 @@
 const std = @import("std");
 const frontend = @import("frontend.zig");
 
-pub const contract_version = "1.2.0";
+pub const contract_version = "1.3.0";
 pub const invalid_index: u32 = std.math.maxInt(u32);
 pub const unknown_dimensions: u8 = std.math.maxInt(u8);
 
@@ -90,6 +90,23 @@ pub const FileMode = enum(u8) {
     append,
 };
 
+pub const GraphicsBoxMode = enum(u8) {
+    line,
+    box,
+    filled_box,
+};
+
+pub const GraphicsPutAction = enum(u8) {
+    pset,
+    xor,
+};
+
+pub const graphics_point_relative: u32 = 1 << 0;
+pub const graphics_second_point_relative: u32 = 1 << 1;
+pub const graphics_color_present: u32 = 1 << 2;
+pub const graphics_box_shift: u5 = 8;
+pub const graphics_optional_count_shift: u5 = 8;
+
 pub const Procedure = struct {
     name: frontend.Span,
     kind: ProcedureKind,
@@ -133,6 +150,13 @@ pub const OpCode = enum(u8) {
     peek,
     poke,
     screen_mode_probe,
+    graphics_palette,
+    graphics_pset,
+    graphics_line,
+    graphics_circle,
+    graphics_paint,
+    graphics_get,
+    graphics_put,
     text_width,
     text_color,
     text_cls,

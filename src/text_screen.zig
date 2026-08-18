@@ -6,6 +6,13 @@ pub const print_zone_columns: usize = 14;
 
 pub const Error = error{IllegalFunctionCall};
 
+pub const CellRect = struct {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+};
+
 pub const Cell = struct {
     character: u8 = ' ',
     foreground: u8 = 7,
@@ -14,6 +21,7 @@ pub const Cell = struct {
 
 pub const Screen = struct {
     cells: [columns * rows]Cell = [_]Cell{.{}} ** (columns * rows),
+    active_columns: usize = columns,
     cursor_row: usize = 0,
     cursor_column: usize = 0,
     cursor_visible: bool = true,
@@ -24,14 +32,19 @@ pub const Screen = struct {
     view_top: usize = 0,
     view_bottom: usize = rows - 1,
     revision: u64 = 1,
+    dirty: ?CellRect = .{ .x = 0, .y = 0, .w = columns, .h = rows },
 
     pub fn reset(self: *Screen) void {
         self.* = .{};
     }
 
+    pub fn configure(self: *Screen, requested_columns: usize) Error!void {
+        if (requested_columns != 40 and requested_columns != columns) return error.IllegalFunctionCall;
+        self.* = .{ .active_columns = requested_columns, .dirty = .{ .x = 0, .y = 0, .w = requested_columns, .h = rows } };
+    }
+
     pub fn setWidth(self: *Screen, requested_columns: i32, requested_rows: ?i32) Error!void {
-        _ = self;
-        if (requested_columns != columns) return error.IllegalFunctionCall;
+        if (requested_columns != self.active_columns) return error.IllegalFunctionCall;
         if (requested_rows) |value| if (value != rows) return error.IllegalFunctionCall;
     }
 
@@ -50,6 +63,7 @@ pub const Screen = struct {
         const last = if (mode == 2) self.view_bottom else rows - 1;
         var row = first;
         while (row <= last) : (row += 1) self.clearRow(row);
+        self.markDirty(.{ .x = 0, .y = first, .w = self.active_columns, .h = last - first + 1 });
         self.cursor_row = first;
         self.cursor_column = 0;
         self.revision +%= 1;
@@ -64,7 +78,7 @@ pub const Screen = struct {
         requested_stop: ?i32,
     ) Error!void {
         if (requested_row) |value| if (value < 1 or value > rows) return error.IllegalFunctionCall;
-        if (requested_column) |value| if (value < 1 or value > columns) return error.IllegalFunctionCall;
+        if (requested_column) |value| if (value < 1 or value > self.active_columns) return error.IllegalFunctionCall;
         if (requested_cursor) |value| if (value != 0 and value != 1) return error.IllegalFunctionCall;
         if (requested_stop != null and requested_start == null) return error.IllegalFunctionCall;
         if (requested_start) |value| if (value < 0 or value > 31) return error.IllegalFunctionCall;
@@ -114,13 +128,14 @@ pub const Screen = struct {
             8 => self.erasePrevious(),
             0...7, 9, 11, 12, 14...31, 127 => {},
             else => {
-                if (self.cursor_column >= columns) self.newLine();
+                if (self.cursor_column >= self.active_columns) self.newLine();
                 const index = self.cursor_row * columns + self.cursor_column;
                 self.cells[index] = .{
                     .character = byte,
                     .foreground = self.foreground,
                     .background = self.background,
                 };
+                self.markDirty(.{ .x = self.cursor_column, .y = self.cursor_row, .w = 1, .h = 1 });
                 self.cursor_column += 1;
                 self.revision +%= 1;
             },
@@ -144,7 +159,7 @@ pub const Screen = struct {
 
     pub fn printComma(self: *Screen) void {
         const next = (self.cursor_column / print_zone_columns + 1) * print_zone_columns;
-        if (next >= columns) {
+        if (next >= self.active_columns) {
             self.newLine();
         } else {
             self.cursor_column = next;
@@ -154,7 +169,7 @@ pub const Screen = struct {
 
     pub fn printTab(self: *Screen, requested_column: i32) Error!void {
         if (requested_column < 1 or requested_column > 255) return error.IllegalFunctionCall;
-        const target: usize = @intCast(@mod(requested_column - 1, @as(i32, columns)));
+        const target: usize = @intCast(@mod(requested_column - 1, @as(i32, @intCast(self.active_columns))));
         if (target < self.cursor_column) self.newLine();
         self.cursor_column = target;
         self.revision +%= 1;
@@ -169,7 +184,14 @@ pub const Screen = struct {
             .foreground = self.foreground,
             .background = self.background,
         };
+        self.markDirty(.{ .x = self.cursor_column, .y = self.cursor_row, .w = 1, .h = 1 });
         self.revision +%= 1;
+    }
+
+    pub fn takeDirty(self: *Screen) ?CellRect {
+        const result = self.dirty;
+        self.dirty = null;
+        return result;
     }
 
     pub fn cell(self: *const Screen, row: usize, column: usize) ?Cell {
@@ -185,7 +207,7 @@ pub const Screen = struct {
 
     fn clearRow(self: *Screen, row: usize) void {
         const first = row * columns;
-        for (self.cells[first .. first + columns]) |*cell_value| {
+        for (self.cells[first .. first + self.active_columns]) |*cell_value| {
             cell_value.* = .{
                 .character = ' ',
                 .foreground = self.foreground,
@@ -200,12 +222,26 @@ pub const Screen = struct {
             while (row < self.view_bottom) : (row += 1) {
                 const target = row * columns;
                 const source = (row + 1) * columns;
-                std.mem.copyForwards(Cell, self.cells[target .. target + columns], self.cells[source .. source + columns]);
+                std.mem.copyForwards(Cell, self.cells[target .. target + self.active_columns], self.cells[source .. source + self.active_columns]);
             }
         }
         self.clearRow(self.view_bottom);
+        self.markDirty(.{ .x = 0, .y = self.view_top, .w = self.active_columns, .h = self.view_bottom - self.view_top + 1 });
         self.cursor_row = self.view_bottom;
         self.revision +%= 1;
+    }
+
+    fn markDirty(self: *Screen, value: CellRect) void {
+        if (value.w == 0 or value.h == 0) return;
+        if (self.dirty) |current| {
+            const x = @min(current.x, value.x);
+            const y = @min(current.y, value.y);
+            const right = @max(current.x + current.w, value.x + value.w);
+            const bottom = @max(current.y + current.h, value.y + value.h);
+            self.dirty = .{ .x = x, .y = y, .w = right - x, .h = bottom - y };
+        } else {
+            self.dirty = value;
+        }
     }
 };
 
@@ -236,4 +272,20 @@ test "invalid color and cursor updates are atomic" {
     try std.testing.expectEqual(@as(usize, 0), screen.cursor_column);
     try std.testing.expect(screen.cursor_visible);
     try std.testing.expectEqual(original_revision, screen.revision);
+}
+
+test "40-column graphics text mode reports bounded dirty cells" {
+    var screen = Screen{};
+    _ = screen.takeDirty();
+    try screen.configure(40);
+    const configured = screen.takeDirty() orelse return error.MissingConfiguredDamage;
+    try std.testing.expectEqual(CellRect{ .x = 0, .y = 0, .w = 40, .h = rows }, configured);
+    try screen.setWidth(40, rows);
+    try std.testing.expectError(error.IllegalFunctionCall, screen.setWidth(80, rows));
+
+    try screen.locate(1, 40, null, null, null);
+    screen.write("X");
+    const changed = screen.takeDirty() orelse return error.MissingCellDamage;
+    try std.testing.expectEqual(CellRect{ .x = 39, .y = 0, .w = 1, .h = 1 }, changed);
+    try std.testing.expectEqual(@as(u8, 'X'), screen.cell(0, 39).?.character);
 }

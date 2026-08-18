@@ -18,6 +18,9 @@ Primaere Sprachreferenz:
   LOCATE, VIEW PRINT, PRINT/PRINT#, INPUT/INPUT#, LINE INPUT/LINE INPUT#,
   INKEY$, TIMER, SLEEP, RANDOMIZE, RND, OPEN, CLOSE und EOF unmittelbar aus
   derselben lokalen Language-Reference-Arbeitskopie ausgewertet.
+- Fuer VM-Vertrag 1.3 wurden die Abschnitte zu SCREEN 1 und 9, PALETTE,
+  PSET, POINT, LINE, CIRCLE, PAINT sowie dem gepackten GET/PUT-Format
+  unmittelbar aus denselben lokalen Arbeitskopien ausgewertet.
 - Daraus uebernommen wurden ausschliesslich Sprachsemantik und Grenzen;
   Parser-, Speicher-, Alias-, Bytecode- und Fehlerflusscode sind eine neue
   eigenstaendige R4OS-Implementierung.
@@ -26,8 +29,8 @@ Reale lokale Abnahmequelle:
 - Pfad: D:\R4OS\Artifacts\Distribution\Injection\Temp\gorilla.bas
 - Groesse: 29.434 Byte
 - SHA-256: 9926FC1F50C4B489EC4C1B0DA5BD2C497EBF4282B3259C28A835A743E24699F7
-- Die Datei wird nicht in diesem Repository oder einem oeffentlichen Image
-  mitgefuehrt.
+- Die Datei wird direkt aus dem vom Git-Push ausgeschlossenen lokalen
+  Artifacts-Injection-Baum fuer Entwicklungs- und Abnahmelaeufe gelesen.
 
 Sekundaerer Architekturvergleich:
 - rusty-basic von Nikolaos Georgiou, Revision
@@ -38,6 +41,4 @@ Sekundaerer Architekturvergleich:
 Permanenter Testbestand:
 - Alle Dateien unter Tests/Fixtures sind neue, originale R4OS-Testprogramme,
   einschliesslich der Aggregate-, Fehlerfluss-, Speichergrenz-, Text-,
-  Eingabe-, Zeit-, Zufalls-, Pacing- und Dateifixtures.
-- Sie enthalten weder Quellzeilen noch Datenbloecke der lokalen
-  Realprogrammabnahme.
+  Eingabe-, Zeit-, Zufalls-, Pacing-, Datei- und Grafikfixtures.

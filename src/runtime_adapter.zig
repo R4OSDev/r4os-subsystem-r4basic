@@ -8,9 +8,27 @@ pub const reset_error_out_of_memory: i32 = -9801;
 
 pub const Adapter = struct {
     machine: *vm.Vm,
+    presented_mode_revision: u64 = 0,
 
     pub fn init(machine: *vm.Vm) Adapter {
         return .{ .machine = machine };
+    }
+
+    pub fn syncVideo(self: *Adapter, presenter: *host.Presenter) host.Error!bool {
+        const view = self.machine.graphicsView() orelse {
+            self.presented_mode_revision = 0;
+            return false;
+        };
+        if (self.presented_mode_revision != view.mode_revision) {
+            const surface = try host.Surface.initIndexed8(view.pixels, view.palette, view.width, view.height);
+            try presenter.setSurface(surface);
+            self.presented_mode_revision = view.mode_revision;
+            _ = self.machine.takeGraphicsDamage();
+            return true;
+        }
+        const damage = self.machine.takeGraphicsDamage() orelse return false;
+        presenter.invalidate(.{ .x = damage.x, .y = damage.y, .w = damage.w, .h = damage.h });
+        return true;
     }
 
     pub fn driver(self: *Adapter) runtime.GuestDriver {
@@ -57,6 +75,7 @@ fn step(context: *anyopaque, budget: u32, guest_now_ns: u64) runtime.StepResult 
 fn reset(context: *anyopaque) i32 {
     const self: *Adapter = @ptrCast(@alignCast(context));
     self.machine.reset() catch return reset_error_out_of_memory;
+    self.presented_mode_revision = 0;
     return 0;
 }
 

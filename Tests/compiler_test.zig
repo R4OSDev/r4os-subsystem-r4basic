@@ -15,6 +15,8 @@ const fixture_paths = struct {
     const time_random = "Tests/Fixtures/vm_time_random.bas";
     const pacing = "Tests/Fixtures/vm_pacing.bas";
     const sequential_files = "Tests/Fixtures/vm_sequential_files.bas";
+    const graphics = "Tests/Fixtures/vm_graphics.bas";
+    const packed_images = "Tests/Fixtures/vm_packed_images.bas";
 };
 
 test "core compiler emits a bound instruction program" {
@@ -320,6 +322,9 @@ test "ON ERROR retries or skips whole statements and unhandled faults stay local
     try expectInteger(&handled, "AfterNext", 1);
     try std.testing.expect(handled.runtime_diagnostic == null);
     try std.testing.expectEqual(core.vm.RuntimeCode.illegal_function_call, handled.trapped_diagnostic.?.code);
+    const fallback_graphics = handled.graphicsView() orelse return error.MissingGraphicsView;
+    try std.testing.expectEqual(@as(u32, 320), fallback_graphics.width);
+    try std.testing.expectEqual(@as(u32, 200), fallback_graphics.height);
 
     var unhandled_program = try core.compiler.compile(std.testing.allocator, "unhandled.bas", "DEFINT A-Z\nSCREEN 9\nEND\n");
     defer unhandled_program.deinit();
@@ -347,6 +352,64 @@ test "ON ERROR retries or skips whole statements and unhandled faults stay local
     try std.testing.expectEqual(core.vm.Status.runtime_error, handler_fault.runToCompletion(32, 8));
     try std.testing.expectEqual(core.vm.RuntimeCode.division_by_zero, handler_fault.runtime_diagnostic.?.code);
     try std.testing.expectEqual(@as(i32, 11), handler_fault.exit_code);
+}
+
+test "QBasic graphics execute on isolated indexed guest screens" {
+    var program = try compileFixture(fixture_paths.graphics);
+    defer program.deinit();
+    try expectProgramOk(&program);
+
+    var first = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer first.deinit();
+    var second = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer second.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, first.runToCompletion(128, 32));
+    try std.testing.expect(second.graphicsView() == null);
+    try expectInteger(&first, "Captured", 9);
+    try expectInteger(&first, "Placed", 9);
+    try expectInteger(&first, "Xored", 0);
+    try expectInteger(&first, "Restored", 9);
+    try expectInteger(&first, "Painted", 3);
+    try expectInteger(&first, "StepColor", 3);
+    try expectInteger(&first, "Outside", -1);
+
+    const first_view = first.graphicsView() orelse return error.MissingGraphicsView;
+    try std.testing.expectEqual(@as(u32, 640), first_view.width);
+    try std.testing.expectEqual(@as(u32, 350), first_view.height);
+    try std.testing.expectEqual(@as(u32, 0x00ffaa55), first_view.palette[1]);
+
+    try std.testing.expectEqual(core.vm.Status.halted, second.runToCompletion(128, 32));
+    const second_view = second.graphicsView() orelse return error.MissingGraphicsView;
+    try std.testing.expect(first_view.pixels.ptr != second_view.pixels.ptr);
+    try std.testing.expect(first_view.palette.ptr != second_view.palette.ptr);
+    try std.testing.expectEqualSlices(u8, first_view.pixels, second_view.pixels);
+}
+
+test "packed LONG arrays decode as mode 1 and mode 9 images without source special cases" {
+    var program = try compileFixture(fixture_paths.packed_images);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 64));
+
+    const ega_solid = (machine.global("EgaSolid") orelse return error.MissingGlobal).integer;
+    const ega_erased = (machine.global("EgaErased") orelse return error.MissingGlobal).integer;
+    const ega_restored = (machine.global("EgaRestored") orelse return error.MissingGlobal).integer;
+    try std.testing.expect(ega_solid > 0);
+    try std.testing.expectEqual(@as(i16, 0), ega_erased);
+    try std.testing.expectEqual(ega_solid, ega_restored);
+
+    const cga_solid = (machine.global("CgaSolid") orelse return error.MissingGlobal).integer;
+    const cga_erased = (machine.global("CgaErased") orelse return error.MissingGlobal).integer;
+    const cga_restored = (machine.global("CgaRestored") orelse return error.MissingGlobal).integer;
+    try std.testing.expect(cga_solid > 0);
+    try std.testing.expectEqual(@as(i16, 0), cga_erased);
+    try std.testing.expectEqual(cga_solid, cga_restored);
+
+    const graphics = machine.graphicsView() orelse return error.MissingGraphicsView;
+    try std.testing.expectEqual(@as(u32, 320), graphics.width);
+    try std.testing.expectEqual(@as(u32, 200), graphics.height);
 }
 
 test "DEF SEG PEEK and POKE expose only the private NumLock byte" {

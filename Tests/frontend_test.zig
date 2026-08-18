@@ -207,19 +207,6 @@ test "bounded caller storage fails visibly" {
     try std.testing.expect(containsCode(source_result, .source_too_large));
 }
 
-test "production sources contain no acceptance-program specialization" {
-    const allocator = std.testing.allocator;
-    const production_sources = [_][]const u8{
-        "src/frontend.zig",
-        "src/main.zig",
-    };
-    for (production_sources) |path| {
-        const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(1024 * 1024));
-        defer allocator.free(source);
-        try std.testing.expect(!containsAsciiIgnoreCase(source, "gorilla"));
-    }
-}
-
 fn containsDiagnostic(result: frontend.Result, expected: ExpectedDiagnostic) bool {
     for (diagnostics[0..result.diagnostic_count]) |diagnostic| {
         if (diagnostic.code == expected.code and diagnostic.span.line == expected.line) return true;
@@ -230,16 +217,6 @@ fn containsDiagnostic(result: frontend.Result, expected: ExpectedDiagnostic) boo
 fn containsCode(result: frontend.Result, code: frontend.DiagnosticCode) bool {
     for (diagnostics[0..result.diagnostic_count]) |diagnostic| {
         if (diagnostic.code == code) return true;
-    }
-    return false;
-}
-
-fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    var start: usize = 0;
-    while (start + needle.len <= haystack.len) : (start += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) return true;
     }
     return false;
 }

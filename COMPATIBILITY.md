@@ -11,8 +11,9 @@ Parsing a construct means that its syntax, source span, nesting, and argument
 shape are recognized. It does not by itself claim executable semantics. The
 separate `VM-CONTRACT.md` freezes the scalar, aggregate, DATA, error-flow,
 control-flow, procedure, text, input, time, random, and sequential-file
-subset that is already bound and executed. Graphics and audio are added by
-later subsystem layers against this same source contract.
+subset that is already bound and executed. Indexed graphics are executable
+in VM contract 1.3; audio remains a later subsystem layer against this same
+source contract.
 
 ## Authority and source identity
 
@@ -24,14 +25,16 @@ The compatibility surface is derived in this order:
    meaning.
 3. Microsoft QuickBASIC 4.5 Programming in BASIC provides the connected
    programming, graphics, animation, I/O, and error-handling model.
-4. Original public R4BASIC fixtures make the selected subset executable as a
+4. Permanent general R4BASIC fixtures make the selected subset executable as a
    permanent test contract.
 
 The local acceptance source is expected at
 `D:\R4OS\Artifacts\Distribution\Injection\Temp\gorilla.bas`, with exactly
 29,434 bytes and SHA-256
 `9926FC1F50C4B489EC4C1B0DA5BD2C497EBF4282B3259C28A835A743E24699F7`.
-It is not stored in this repository and is not required by the normal build.
+It is read directly from the ignored workspace injection tree and is not
+required by the normal build. Publishing a release archive is a separate
+manual operation outside this development roadmap.
 
 The Microsoft references are the PCjs transcriptions at revision
 `67b950f7eed3447c5c056e3d048ba4f62a94aead`:
@@ -109,10 +112,11 @@ The optional `Tests/gorilla_acceptance.zig` step additionally verifies the
 local file size and SHA-256 before passing the unchanged bytes through the
 same public lexer, parser, and typed binder. It then executes the intro and
 initial interaction through two names, invalid and valid game/gravity input,
-and edited angle and velocity input. A test-only explicit host accepts the
-still-deferred drawing and sound statements; execution must reach and stop at
-the later `POINT` graphics guard. Production sources contain no
-program-specific names, source lines, or parsing branches.
+and edited angle and velocity input. It then completes one deterministic
+graphical turn through city, gorilla, packed banana, XOR animation, and
+coordinate collision paths. A test-only explicit host accepts only the
+still-deferred sound statements. Compiler and VM behavior remains general;
+the acceptance source does not select a separate production path.
 
 ## Built-in function arities
 
@@ -156,8 +160,8 @@ the typed-program phase.
   `PRINT USING`, `DRAW`, `PCOPY`, `BLOAD`, `BSAVE`, and general memory or port
   access.
 - Runtime correctness merely from parse or bind success. Only the subset in
-  `VM-CONTRACT.md` has executable semantics; graphics pixels and audio still
-  require their dedicated acceptance layers.
+  `VM-CONTRACT.md` has executable semantics; audio still requires its
+  dedicated acceptance layer.
 
 Changing a promise in this document or `VM-CONTRACT.md` requires a
 contract-version decision, an original positive fixture, an original

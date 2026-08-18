@@ -63,7 +63,7 @@ const DeferredProbe = struct {
     fn accept(context: ?*anyopaque, keyword: frontend.Keyword) core.vm.DeferredStatementError!void {
         const self: *DeferredProbe = @ptrCast(@alignCast(context.?));
         switch (keyword) {
-            .beep, .circle, .get, .line, .paint, .palette, .play, .pset, .put => {},
+            .beep, .play => {},
             else => return error.Unsupported,
         }
         self.calls += 1;
@@ -71,7 +71,7 @@ const DeferredProbe = struct {
     }
 };
 
-test "canonical local GORILLA.BAS reaches names gravity angle and velocity input unchanged" {
+test "canonical local GORILLA.BAS completes a deterministic graphical turn" {
     const allocator = std.testing.allocator;
     const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, canonical_path, allocator, .limited(frontend.maximum_source_bytes));
     defer allocator.free(source);
@@ -103,26 +103,19 @@ test "canonical local GORILLA.BAS reaches names gravity angle and velocity input
         angle_key,
         velocity,
         velocity_key,
-        graphics_guard,
+        round_animation,
     };
     var stage: Stage = .intro;
     var delay_slices: u8 = 0;
     var guest_ns: u64 = 0;
-    var reached_graphics_guard = false;
+    var completed_graphics_round = false;
 
-    for (0..80_000) |_| {
+    run_loop: for (0..80_000) |_| {
         machine.setGuestTime(guest_ns);
         const slice = machine.runSlice(256);
         guest_ns +|= 10 * std.time.ns_per_ms;
 
         if (slice.status == .runtime_error) {
-            if (stage == .graphics_guard) {
-                const diagnostic = machine.runtime_diagnostic.?;
-                try std.testing.expectEqual(core.vm.RuntimeCode.host_failure, diagnostic.code);
-                try std.testing.expectEqual(@as(u32, 977), diagnostic.span.line);
-                reached_graphics_guard = true;
-                break;
-            }
             std.debug.print("unexpected GORILLA VM error in {s}: {s}:{d}:{d} {s}\n", .{
                 @tagName(stage),
                 machine.runtime_diagnostic.?.file_name,
@@ -196,18 +189,37 @@ test "canonical local GORILLA.BAS reaches names gravity angle and velocity input
                 delay_slices -= 1;
             } else {
                 try feedInput(&machine, "9Q0\r");
-                stage = .graphics_guard;
+                stage = .round_animation;
             },
-            .graphics_guard => {},
+            .round_animation => if (screenContains(&machine, "Angle:") and !screenContains(&machine, "Velocity:")) {
+                completed_graphics_round = true;
+                break :run_loop;
+            },
         }
     }
 
-    try std.testing.expect(reached_graphics_guard);
+    if (!completed_graphics_round) {
+        std.debug.print("GORILLA guard end: status={s} instructions={d} probe_calls={d}\n", .{ @tagName(machine.status), machine.total_instructions, probe.calls });
+        var debug_row: [core.text_screen.columns]u8 = undefined;
+        for (0..core.text_screen.rows) |row| {
+            if (machine.textScreen().copyRow(row, &debug_row)) std.debug.print("{d:0>2}: {s}\n", .{ row + 1, std.mem.trimEnd(u8, &debug_row, " ") });
+        }
+    }
+    try std.testing.expect(completed_graphics_round);
     try expectString(&machine, "Name1$", "Alice");
     try expectString(&machine, "Name2$", "Bob");
     try expectInteger(&machine, "NumGames", 3);
     try expectDouble(&machine, "gravity#", 9.8);
-    try std.testing.expect(probe.calls > 100);
+    const graphics = machine.graphicsView() orelse return error.MissingGorillaGraphics;
+    try std.testing.expectEqual(@as(u32, 640), graphics.width);
+    try std.testing.expectEqual(@as(u32, 350), graphics.height);
+    try std.testing.expectEqual(@as(u64, 0x9022e6b6962c1eb9), std.hash.Wyhash.hash(0, graphics.pixels));
+    try std.testing.expectEqual(@as(u32, 0x000000aa), graphics.palette[0]);
+    try std.testing.expectEqual(@as(u32, 0x00ffaa55), graphics.palette[1]);
+    try std.testing.expectEqual(@as(u32, 0x00ff0055), graphics.palette[2]);
+    try std.testing.expectEqual(@as(u32, 0x00ffff00), graphics.palette[3]);
+    try std.testing.expectEqual(@as(u32, 0x00ffffff), graphics.palette[9]);
+    try std.testing.expectEqual(@as(u32, 4), probe.calls);
     try std.testing.expectEqual(@as(u32, 2), probe.beeps);
 }
 
