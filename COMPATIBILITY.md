@@ -10,9 +10,9 @@ QuickBASIC implementation.
 Parsing a construct means that its syntax, source span, nesting, and argument
 shape are recognized. It does not by itself claim executable semantics. The
 separate `VM-CONTRACT.md` freezes the scalar, aggregate, DATA, error-flow,
-control-flow, and procedure subset that is already bound and executed.
-Display, input, time, files, graphics, and audio are added by later subsystem
-layers against this same source contract.
+control-flow, procedure, text, input, time, random, and sequential-file
+subset that is already bound and executed. Graphics and audio are added by
+later subsystem layers against this same source contract.
 
 ## Authority and source identity
 
@@ -107,9 +107,11 @@ the same grammar family. All fixture paths are below `Tests/Fixtures/`.
 
 The optional `Tests/gorilla_acceptance.zig` step additionally verifies the
 local file size and SHA-256 before passing the unchanged bytes through the
-same public lexer, parser, and typed binder. The result contains executable
-instructions for the complete source; operations owned by later host layers
-remain explicit runtime guards. Production sources contain no
+same public lexer, parser, and typed binder. It then executes the intro and
+initial interaction through two names, invalid and valid game/gravity input,
+and edited angle and velocity input. A test-only explicit host accepts the
+still-deferred drawing and sound statements; execution must reach and stop at
+the later `POINT` graphics guard. Production sources contain no
 program-specific names, source lines, or parsing branches.
 
 ## Built-in function arities
@@ -154,8 +156,8 @@ the typed-program phase.
   `PRINT USING`, `DRAW`, `PCOPY`, `BLOAD`, `BSAVE`, and general memory or port
   access.
 - Runtime correctness merely from parse or bind success. Only the subset in
-  `VM-CONTRACT.md` has executable semantics; graphics pixels, file behavior,
-  timing, input, and audio still require their dedicated acceptance layers.
+  `VM-CONTRACT.md` has executable semantics; graphics pixels and audio still
+  require their dedicated acceptance layers.
 
 Changing a promise in this document or `VM-CONTRACT.md` requires a
 contract-version decision, an original positive fixture, an original

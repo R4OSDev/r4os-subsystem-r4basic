@@ -1,6 +1,6 @@
 ﻿# R4BASIC v1 core VM contract
 
-Contract version: `1.1.0`
+Contract version: `1.2.0`
 
 This document freezes the executable R4BASIC language layers. The broader
 source syntax accepted by the frontend remains defined in
@@ -98,11 +98,17 @@ The VM executes:
 - named `GOTO`, `GOSUB`, plain `RETURN`, and `RETURN` to a named label;
 - `ON ERROR GOTO`, `ON ERROR GOTO 0`, `RESUME`, and `RESUME NEXT`;
 - the restricted `DEF SEG`, `PEEK`, and `POKE` compatibility device;
+- `SCREEN 0`, 80-column `WIDTH`, `COLOR`, `CLS`, `LOCATE`, and
+  `VIEW PRINT` on the private text screen;
+- screen and sequential-file `PRINT`, console and file `INPUT`, and
+  `LINE INPUT`;
+- `RANDOMIZE`, `SLEEP`, and sequential `OPEN`/`CLOSE`;
 - `END`.
 
-Statements owned by later text, timing, file, graphics, and audio layers bind
-to explicit deferred host guards. Reaching such a guard before its layer is
-installed is a deterministic host-failure diagnostic, never a silent no-op.
+Statements owned by later graphics and audio layers bind to explicit deferred
+host guards. A host may accept a named deferred statement explicitly;
+otherwise reaching it is a deterministic host-failure diagnostic, never a
+silent no-op.
 
 ## Procedures and functions
 
@@ -127,20 +133,97 @@ installed is a deterministic host-failure diagnostic, never a silent no-op.
 
 ## Built-in functions and host services
 
-The executable built-ins are `ABS`, `ATN`, `CHR$`, `CINT`, `COS`, `INSTR`,
-`INT`, `LEFT$`, `LEN`, `LTRIM$`, `MID$`, `SIN`, `SPACE$`, `STR$`, `UCASE$`,
-and `VAL` with the arities and type categories defined by the source
-contract.
+The executable built-ins are `ABS`, `ATN`, `CHR$`, `CINT`, `COS`, `EOF`,
+`INKEY$`, `INSTR`, `INT`, `LEFT$`, `LEN`, `LTRIM$`, `MID$`, `RND`, `SIN`,
+`SPACE$`, `STR$`, `TIMER`, `UCASE$`, and `VAL` with the arities and type
+categories defined by the source contract.
 
 `ATN`, `COS`, `SIN`, and power call an injected math service. Cancellation
-polling and the provisional SCREEN-mode availability probe are injected
-separately. A missing or failing host result becomes a deterministic VM
-error; tests do not depend on hidden process-global hooks.
+polling, the provisional SCREEN-mode availability probe, sequential file I/O,
+and acceptance of a still-deferred statement are injected separately. A
+missing or failing required host result becomes a deterministic VM error;
+tests do not depend on hidden process-global hooks.
 
 `DEF SEG = 0` selects a private compatibility byte at offset 1047. `PEEK` and
 `POKE` can read or replace that byte, including its NumLock bit. Omitting the
 segment resets access. Every other segment or offset is a runtime error; no
 guest address can become an R4OS or host pointer.
+
+## Text screen and interactive input
+
+- Every VM owns one fixed 80 by 25 cell screen. A cell contains one byte,
+  foreground attribute 0 through 31, and background attribute 0 through 7.
+  Cursor position, visibility, shape, print viewport, and revision are part
+  of that same instance-local state.
+- `SCREEN 0` resets the text screen. `WIDTH` accepts only 80 columns and an
+  optional 25 rows. `CLS 0` and `CLS 1` clear the complete screen; `CLS 2`
+  clears the active `VIEW PRINT` viewport. Invalid multi-argument `COLOR` or
+  `LOCATE` updates are atomic.
+- BASIC rows and columns are one-based. `VIEW PRINT top TO bottom` selects an
+  inclusive scrolling region; bare `VIEW PRINT` restores rows 1 through 25.
+  Output outside that region can be positioned with `LOCATE`, while newline
+  scrolling remains confined to the region.
+- `PRINT` preserves a trailing semicolon, advances commas through 14-column
+  zones, applies one-based `TAB`, and emits a newline only without a trailing
+  separator. Positive numbers carry leading and trailing spaces; negative
+  numbers carry the sign and trailing space.
+- Each VM owns a focused keyboard byte queue of at most 4,096 bytes.
+  Printable text, Enter, and Backspace are accepted only while focused.
+  `INKEY$` consumes at most one byte and returns an allocated empty string
+  immediately when the queue is empty.
+- Console `INPUT` and `LINE INPUT` retry the same instruction without
+  blocking the host. Editing echoes printable bytes, erases one byte on
+  Backspace, and completes on Enter. A line is limited to 255 bytes. All
+  target values are parsed before any assignment; invalid or overflowing
+  input prints `Redo from start` and leaves every target unchanged.
+
+## Guest time, pacing, and random state
+
+- `TIMER` is a SINGLE number of guest seconds modulo 86,400. Its source is
+  the monotonic guest clock supplied by `r4os.subsystem_runtime`, not a host
+  wall clock. Paused host time therefore cannot advance it.
+- `SLEEP` records a guest-time deadline and returns `waiting`; it never spins
+  inside one slice. No argument or zero waits for a newly arriving key.
+  Positive values also wake for a new key. Host input and lifecycle commands
+  continue to be polled while the VM waits.
+- The runtime adapter caps a scheduled BASIC slice at 26 instructions and
+  schedules a yielded continuation at least 2 guest milliseconds later.
+  This fixed pacing is part of VM contract 1.2: it bounds host use and makes
+  the historical `CalcDelay`/`Rest` calibration independent of modern host
+  loop speed.
+- Every VM owns a 24-bit random state and last result. An injected initial
+  seed makes tests byte-for-byte reproducible. `RND` with a positive or
+  omitted argument advances, zero repeats the last result, and a negative
+  argument reseeds reproducibly before returning a value. This contract
+  promises QuickBASIC invocation semantics, not the exact Microsoft number
+  sequence.
+- `RANDOMIZE expression` reseeds from the converted SINGLE bit pattern.
+  Bare `RANDOMIZE` requests a seed in the range -32768 through 32767 through
+  the same editable, retrying console-input path.
+
+## Sequential files
+
+- File numbers 1 through 255 address VM-owned slots. `OPEN` supports only
+  `INPUT`, `OUTPUT`, and `APPEND`; `CLOSE` accepts selected numbers or all
+  slots. `PRINT #`, `INPUT #`, `LINE INPUT #`, and `EOF` require a compatible
+  open mode.
+- A relative path is resolved against the explicit guest directory or,
+  when absent, the directory of the absolute BAS file name. An absolute
+  drive path remains absolute. Empty paths, invalid path bytes, drive-relative
+  forms, and DOS device names such as `CON`, `COM1`, and `LPT1` are rejected.
+- Host reads and writes occur only through injected callbacks. The production
+  adapter implements those callbacks with `r4os.Files` and typed
+  `AbsoluteFilePath`; the VM has no direct R4SYS or kernel file path.
+- Sequential input is read into a bounded private buffer of at most 4 MiB.
+  Quoted and unquoted comma fields, CR/LF line endings, whole-line input, and
+  end-of-file state are deterministic. Output and append data are buffered
+  per slot and committed through the host callback at `CLOSE` or normal
+  `END`.
+- Bad numbers, missing files, wrong modes, duplicate slots, input past end,
+  bad names, permission failures, and path/I/O failures remain distinct VM
+  codes with the BASIC numbers listed below. Random-access and binary records,
+  devices, printer and COM I/O, file deletion, and directory mutation are
+  outside v1.
 
 ## Error flow
 
@@ -157,29 +240,36 @@ guest address can become an R4OS or host pointer.
 
 ## Cooperative execution and lifecycle
 
-- `runSlice` executes no more than its instruction budget and returns
-  `yielded` when work remains. The default budget is 4,096 instructions.
+- `runSlice` executes no more than its caller-provided instruction budget and
+  returns `yielded` when work remains. Scheduled execution through the runtime
+  adapter applies the stricter 26-instruction, 2-millisecond pacing contract
+  above even when the shared runtime offers a larger budget.
 - Cancellation is checked before the first instruction and between every
   instruction, including for a zero budget. Cancellation exits with code
   130.
 - `runtime_adapter.Adapter` implements the SDK `subsystem_runtime.GuestDriver`.
   The shared runtime polls bounded host events before invoking exactly one VM
-  slice, so a Close command wins over the next guest instruction.
+  slice, so a Close command wins over the next guest instruction. A waiting
+  VM supplies its next guest-time wake deadline instead of busy-polling.
 - Reset constructs a fresh global-value and aggregate set before discarding
   the old state, then clears stacks, DATA cursor, handlers, trapped error,
-  private segment and byte, instruction count, cancellation, and exit state.
-- This layer does not invent waits, frames, guest time, or audio samples.
-  Later text, graphics, timing, and audio layers extend the adapter without
-  moving scheduling into the interpreter.
+  private segment and byte, text screen, keyboard and input line, guest-time
+  waits, random state, sequential files, instruction count, cancellation, and
+  exit state.
+- Guest frames and audio samples remain later layers. Scheduling, paused time,
+  and host event polling stay in the shared subsystem runtime rather than
+  moving into the interpreter.
 
 ## Instance and ownership contract
 
 An immutable compiled program may be shared by multiple VMs. Each VM owns
 its globals, strings, array bounds and elements, record fields, aliases, DATA
-cursor, error handlers, compatibility byte, evaluation stack, frames, GOSUB
-stack, instruction pointer, instruction count, status, diagnostic,
-cancellation flag, and exit code. Mutating, cancelling, resetting,
-completing, or faulting one instance cannot change another instance.
+cursor, error handlers, compatibility byte, text cells and cursor, keyboard
+and pending input, guest time and sleep deadline, random generator, open
+files, evaluation stack, frames, GOSUB stack, instruction pointer,
+instruction count, status, diagnostic, cancellation flag, and exit code.
+Mutating, cancelling, resetting, completing, or faulting one instance cannot
+change another instance.
 
 ## Runtime diagnostics
 
@@ -198,6 +288,14 @@ line, and column span. The stable v1 mappings are:
 | subscript out of range | 9 |
 | array already dimensioned | 10 |
 | RESUME without error | 20 |
+| bad file number | 52 |
+| file not found | 53 |
+| bad file mode | 54 |
+| file already open | 55 |
+| input past end of file | 62 |
+| bad file name | 64 |
+| permission denied | 70 |
+| path/file access failure | 75 |
 | VM stack, frame, instruction, GOSUB, or host failure | 70 |
 
 Normal completion exits with `0`; cooperative cancellation exits with `130`.
@@ -227,8 +325,19 @@ The original, redistributable fixtures below are part of this contract:
 - `vm_error_resume.bas`: whole-statement retry and next-statement continuation
   through an injected unavailable graphics mode.
 - `vm_private_memory.bas`: the private segment-zero byte and NumLock bit.
+- `vm_text_input.bas`: SCREEN 0 text state, viewport scrolling, PRINT zones,
+  TAB and SPACE$, editable prompts, atomic retry, and typed console input.
+- `vm_time_random.bas`: explicit random seeding, all three RND argument modes,
+  TIMER, and cooperative SLEEP deadlines.
+- `vm_pacing.bas`: the public `CalcDelay`/`Rest` pattern under fixed scheduled
+  instruction pacing.
+- `vm_sequential_files.bas`: relative and absolute sequential input, output,
+  append, quoted fields, whole lines, and EOF.
 
 `Tests/compiler_test.zig` also fixes negative binding cases, exact runtime
 positions, QBasic error numbers, string overflow, host failure, and
-`subsystem_runtime` lifecycle behavior. None of these fixtures contains code
-from the local GORILLA.BAS acceptance source.
+`subsystem_runtime` lifecycle behavior. It additionally covers focus and
+two-instance keyboard isolation, interactive RANDOMIZE retry, paused time,
+host polling while asleep, storage-facade error classification, unsupported
+file modes and device names, and atomic text-state errors. None of these
+fixtures contains code from the local GORILLA.BAS acceptance source.

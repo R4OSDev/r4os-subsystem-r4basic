@@ -1180,6 +1180,7 @@ const Parser = struct {
 
     fn parseInput(self: *Parser, line_input: bool) bool {
         if (!line_input) self.advance();
+        _ = self.consume(.semicolon);
         if (self.consume(.hash)) {
             if (!self.parseExpression() or !self.expect(.comma)) return false;
             return self.parseLvalueList();

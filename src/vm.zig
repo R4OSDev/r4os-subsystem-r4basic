@@ -1,14 +1,23 @@
 const std = @import("std");
 const bytecode = @import("bytecode.zig");
 const frontend = @import("frontend.zig");
+const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "1.1.0";
-pub const default_instruction_budget: u32 = 4096;
+pub const contract_version = "1.2.0";
+pub const default_instruction_budget: u32 = 26;
+pub const execution_slice_interval_ns: u64 = 2 * std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
 pub const maximum_call_depth: usize = 256;
 pub const maximum_gosub_depth: usize = 1024;
 pub const maximum_array_elements: usize = 16 * 1024 * 1024;
+pub const maximum_keyboard_bytes: usize = 4096;
+pub const maximum_input_line_bytes: usize = 255;
+pub const maximum_sequential_file_bytes: usize = 4 * 1024 * 1024;
+pub const maximum_file_number: usize = 255;
+pub const input_poll_interval_ns: u64 = std.time.ns_per_ms;
+pub const random_mask: u32 = 0x00FF_FFFF;
+pub const default_random_seed: u32 = 0x0050_0000;
 
 pub const MathOperation = enum(u8) {
     atn,
@@ -19,12 +28,39 @@ pub const MathOperation = enum(u8) {
 
 pub const HostMathError = error{MathFault};
 pub const ScreenModeError = error{ModeUnavailable};
+pub const DeferredStatementError = error{Unsupported};
+
+pub const FileHostError = enum(u8) {
+    unavailable,
+    not_found,
+    permission_denied,
+    path_error,
+    io_error,
+    too_large,
+};
+
+pub const FileReadResult = union(enum) {
+    bytes: u32,
+    end,
+    failure: FileHostError,
+};
+
+pub const FileWriteResult = union(enum) {
+    ok,
+    failure: FileHostError,
+};
 
 pub const HostServices = struct {
     context: ?*anyopaque = null,
     math: *const fn (?*anyopaque, MathOperation, f64, f64) HostMathError!f64 = defaultMath,
     screen_mode: *const fn (?*anyopaque, i32) ScreenModeError!void = acceptScreenMode,
+    deferred_statement: *const fn (?*anyopaque, frontend.Keyword) DeferredStatementError!void = rejectDeferredStatement,
     should_cancel: *const fn (?*anyopaque) bool = neverCancel,
+    file_context: ?*anyopaque = null,
+    file_read: *const fn (?*anyopaque, []const u8, u32, []u8) FileReadResult = unavailableFileRead,
+    file_write: *const fn (?*anyopaque, []const u8, []const u8, bool) FileWriteResult = unavailableFileWrite,
+    guest_directory: []const u8 = "",
+    initial_random_seed: u32 = default_random_seed,
 };
 
 pub const RuntimeCode = enum(u8) {
@@ -44,6 +80,14 @@ pub const RuntimeCode = enum(u8) {
     out_of_data,
     resume_without_error,
     restricted_memory,
+    bad_file_number,
+    file_not_found,
+    bad_file_mode,
+    file_already_open,
+    input_past_end,
+    bad_file_name,
+    permission_denied,
+    path_file_access,
 };
 
 pub const RuntimeDiagnostic = struct {
@@ -63,6 +107,14 @@ pub const RuntimeDiagnostic = struct {
             .array_already_dimensioned => 10,
             .out_of_data => 4,
             .resume_without_error => 20,
+            .bad_file_number => 52,
+            .file_not_found => 53,
+            .bad_file_mode => 54,
+            .file_already_open => 55,
+            .input_past_end => 62,
+            .bad_file_name => 64,
+            .permission_denied => 70,
+            .path_file_access => 75,
             .stack_overflow, .stack_underflow, .call_depth_exceeded, .gosub_without_return, .invalid_instruction, .host_failure => 70,
         };
     }
@@ -71,6 +123,7 @@ pub const RuntimeDiagnostic = struct {
 pub const Status = enum(u8) {
     ready,
     yielded,
+    waiting,
     halted,
     cancelled,
     runtime_error,
@@ -79,6 +132,7 @@ pub const Status = enum(u8) {
 pub const SliceResult = struct {
     status: Status,
     instructions: u32,
+    wake_guest_ns: u64 = 0,
 };
 
 pub const InitError = error{
@@ -99,6 +153,15 @@ const ExecutionError = values.Fault || error{
     ResumeWithoutError,
     RestrictedMemory,
     Rethrow,
+    WouldBlock,
+    BadFileNumber,
+    FileNotFound,
+    BadFileMode,
+    FileAlreadyOpen,
+    InputPastEnd,
+    BadFileName,
+    PermissionDenied,
+    PathFileAccess,
 };
 
 pub const Dimension = struct {
@@ -210,6 +273,22 @@ const ResumeMode = enum {
     label,
 };
 
+const SequentialFile = struct {
+    mode: bytecode.FileMode,
+    path: []u8,
+    input: []u8,
+    output: std.ArrayList(u8) = .empty,
+    offset: usize = 0,
+    print_column: usize = 0,
+
+    fn deinit(self: *SequentialFile, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.input);
+        self.output.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 const module_frame = bytecode.invalid_index;
 
 pub const Vm = struct {
@@ -232,6 +311,23 @@ pub const Vm = struct {
     data_pointer: usize = 0,
     compatibility_segment_zero: bool = false,
     virtual_bios_byte: u8 = 0,
+    text: text_screen.Screen = .{},
+    screen_mode: i32 = 0,
+    keyboard: std.ArrayList(u8) = .empty,
+    keyboard_head: usize = 0,
+    keyboard_generation: u64 = 0,
+    input_focused: bool = true,
+    input_line: std.ArrayList(u8) = .empty,
+    pending_input_instruction: u32 = bytecode.invalid_index,
+    guest_now_ns: u64 = 0,
+    wait_wake_ns: u64 = 0,
+    pending_sleep_instruction: u32 = bytecode.invalid_index,
+    sleep_deadline_ns: u64 = 0,
+    sleep_input_generation: u64 = 0,
+    random_state: u32 = default_random_seed,
+    random_last: f32 = 0,
+    files: [maximum_file_number + 1]?SequentialFile = [_]?SequentialFile{null} ** (maximum_file_number + 1),
+    active_print_file: ?u8 = null,
     statement_stack_base: usize = 0,
     current_statement_start: u32 = bytecode.invalid_index,
     cancel_requested: bool = false,
@@ -249,6 +345,7 @@ pub const Vm = struct {
             .host = host,
             .globals = globals,
             .instruction_pointer = program.module_entry,
+            .random_state = normalizeRandomSeed(host.initial_random_seed),
         };
     }
 
@@ -261,12 +358,52 @@ pub const Vm = struct {
         }
         self.frames.deinit(self.allocator);
         self.gosub_stack.deinit(self.allocator);
+        self.keyboard.deinit(self.allocator);
+        self.input_line.deinit(self.allocator);
+        self.discardFiles();
         deinitGlobals(self.allocator, self.globals);
         self.* = undefined;
     }
 
     pub fn requestCancel(self: *Vm) void {
         self.cancel_requested = true;
+    }
+
+    pub fn setGuestTime(self: *Vm, guest_now_ns: u64) void {
+        self.guest_now_ns = guest_now_ns;
+    }
+
+    pub fn setInputFocused(self: *Vm, focused: bool) void {
+        self.input_focused = focused;
+    }
+
+    pub fn enqueueTextCodepoint(self: *Vm, codepoint: u32) std.mem.Allocator.Error!bool {
+        if (!self.input_focused or codepoint < 0x20 or codepoint > 0xFF or codepoint == 0x7F) return false;
+        if (self.keyboard.items.len - self.keyboard_head >= maximum_keyboard_bytes) return false;
+        try self.keyboard.append(self.allocator, @intCast(codepoint));
+        self.keyboard_generation +%= 1;
+        return true;
+    }
+
+    pub fn enqueueKeyCode(self: *Vm, code: u32) std.mem.Allocator.Error!bool {
+        if (!self.input_focused) return false;
+        const byte: u8 = switch (code) {
+            8 => 8,
+            10, 13 => 13,
+            else => return false,
+        };
+        if (self.keyboard.items.len - self.keyboard_head >= maximum_keyboard_bytes) return false;
+        try self.keyboard.append(self.allocator, byte);
+        self.keyboard_generation +%= 1;
+        return true;
+    }
+
+    pub fn queuedInputBytes(self: *const Vm) usize {
+        return self.keyboard.items.len - self.keyboard_head;
+    }
+
+    pub fn textScreen(self: *const Vm) *const text_screen.Screen {
+        return &self.text;
     }
 
     pub fn reset(self: *Vm) InitError!void {
@@ -293,6 +430,23 @@ pub const Vm = struct {
         self.data_pointer = 0;
         self.compatibility_segment_zero = false;
         self.virtual_bios_byte = 0;
+        self.text.reset();
+        self.screen_mode = 0;
+        self.keyboard.clearRetainingCapacity();
+        self.keyboard_head = 0;
+        self.keyboard_generation = 0;
+        self.input_focused = true;
+        self.input_line.clearRetainingCapacity();
+        self.pending_input_instruction = bytecode.invalid_index;
+        self.guest_now_ns = 0;
+        self.wait_wake_ns = 0;
+        self.pending_sleep_instruction = bytecode.invalid_index;
+        self.sleep_deadline_ns = 0;
+        self.sleep_input_generation = 0;
+        self.random_state = normalizeRandomSeed(self.host.initial_random_seed);
+        self.random_last = 0;
+        self.discardFiles();
+        self.active_print_file = null;
         self.statement_stack_base = 0;
         self.current_statement_start = bytecode.invalid_index;
         self.cancel_requested = false;
@@ -308,6 +462,7 @@ pub const Vm = struct {
             return .{ .status = self.status, .instructions = 0 };
         }
         self.status = .ready;
+        self.wait_wake_ns = 0;
         var executed: u32 = 0;
         while (executed < instruction_budget) {
             if (self.cancel_requested or self.host.should_cancel(self.host.context)) {
@@ -326,9 +481,19 @@ pub const Vm = struct {
             if (self.current_statement_start != statement_start) {
                 self.current_statement_start = statement_start;
                 self.statement_stack_base = self.stack.items.len;
+                self.active_print_file = null;
             }
             self.instruction_pointer += 1;
-            self.execute(instruction) catch |fault| {
+            self.execute(instruction_index, instruction) catch |fault| {
+                if (fault == error.WouldBlock) {
+                    self.instruction_pointer = instruction_index;
+                    self.status = .waiting;
+                    return .{
+                        .status = .waiting,
+                        .instructions = executed,
+                        .wake_guest_ns = self.wait_wake_ns,
+                    };
+                }
                 const code = if (fault == error.Rethrow and self.active_error != null)
                     self.active_error.?.diagnostic.code
                 else
@@ -443,7 +608,7 @@ pub const Vm = struct {
         return self.gosub_stack.items.len;
     }
 
-    fn execute(self: *Vm, instruction: bytecode.Instruction) ExecutionError!void {
+    fn execute(self: *Vm, instruction_index: u32, instruction: bytecode.Instruction) ExecutionError!void {
         switch (instruction.op) {
             .push_constant => try self.pushValue(try values.fromConstant(
                 self.allocator,
@@ -474,7 +639,29 @@ pub const Vm = struct {
             .peek => try self.peek(),
             .poke => try self.poke(),
             .screen_mode_probe => try self.screenModeProbe(),
-            .deferred_statement => return error.HostFailure,
+            .text_width => try self.textWidth(instruction.a),
+            .text_color => try self.textColor(instruction.a, instruction.b),
+            .text_cls => try self.textCls(instruction.a),
+            .text_locate => try self.textLocate(instruction.a, instruction.b),
+            .text_view_print => try self.textViewPrint(instruction.a),
+            .print_begin_screen => self.active_print_file = null,
+            .print_begin_file => try self.printBeginFile(),
+            .print_value => try self.printValue(),
+            .print_tab => try self.printTab(),
+            .print_comma => try self.printComma(),
+            .print_question => try self.printBytes("? "),
+            .print_newline => try self.printNewline(),
+            .print_end => self.active_print_file = null,
+            .input_console => try self.consoleInput(instruction_index, instruction.a, instruction.b),
+            .input_file => try self.fileInput(instruction.a, instruction.b != 0),
+            .randomize => try self.randomize(instruction_index, instruction.a),
+            .sleep => try self.sleep(instruction_index, instruction.a),
+            .file_open => try self.openFile(@enumFromInt(@as(u8, @intCast(instruction.a)))),
+            .file_close => try self.closeFiles(instruction.a),
+            .deferred_statement => self.host.deferred_statement(
+                self.host.context,
+                @enumFromInt(@as(u8, @intCast(instruction.a))),
+            ) catch return error.HostFailure,
             .deferred_builtin => try self.deferredBuiltin(instruction.b),
             .convert => try self.convertTop(bytecode.decodeValueType(instruction.a)),
             .negate => try self.unaryNegate(bytecode.decodeValueType(instruction.a)),
@@ -512,6 +699,7 @@ pub const Vm = struct {
                 item.deinit(self.allocator);
             },
             .halt => {
+                try self.closeAllFiles();
                 self.status = .halted;
                 self.exit_code = 0;
             },
@@ -784,7 +972,529 @@ pub const Vm = struct {
         var mode_value = try self.popValue();
         defer mode_value.deinit(self.allocator);
         const mode = try values.asLong(mode_value);
+        if (mode != 0 and mode != 1 and mode != 9) return error.IllegalFunctionCall;
         self.host.screen_mode(self.host.context, mode) catch return error.IllegalFunctionCall;
+        self.screen_mode = mode;
+        if (mode == 0) self.text.reset();
+    }
+
+    fn textWidth(self: *Vm, argument_count: u32) ExecutionError!void {
+        if (argument_count < 1 or argument_count > 2) return error.InvalidInstruction;
+        const requested_rows = if (argument_count == 2) try self.popLong() else null;
+        const requested_columns = try self.popLong();
+        self.text.setWidth(requested_columns, requested_rows) catch return error.IllegalFunctionCall;
+    }
+
+    fn textColor(self: *Vm, mask: u32, argument_count: u32) ExecutionError!void {
+        var arguments = [_]?i32{null} ** 2;
+        try self.popOptionalLongs(mask, argument_count, &arguments);
+        self.text.setColor(arguments[0], arguments[1]) catch return error.IllegalFunctionCall;
+    }
+
+    fn textCls(self: *Vm, argument_count: u32) ExecutionError!void {
+        if (argument_count > 1) return error.InvalidInstruction;
+        const mode = if (argument_count == 1) try self.popLong() else null;
+        self.text.clear(mode) catch return error.IllegalFunctionCall;
+    }
+
+    fn textLocate(self: *Vm, mask: u32, argument_count: u32) ExecutionError!void {
+        var arguments = [_]?i32{null} ** 5;
+        try self.popOptionalLongs(mask, argument_count, &arguments);
+        self.text.locate(arguments[0], arguments[1], arguments[2], arguments[3], arguments[4]) catch
+            return error.IllegalFunctionCall;
+    }
+
+    fn textViewPrint(self: *Vm, argument_count: u32) ExecutionError!void {
+        if (argument_count != 0 and argument_count != 2) return error.InvalidInstruction;
+        const bottom = if (argument_count == 2) try self.popLong() else null;
+        const top = if (argument_count == 2) try self.popLong() else null;
+        self.text.setView(top, bottom) catch return error.IllegalFunctionCall;
+    }
+
+    fn popOptionalLongs(self: *Vm, mask: u32, argument_count: u32, out: []?i32) ExecutionError!void {
+        if (out.len > 31) return error.InvalidInstruction;
+        const valid_mask: u32 = (@as(u32, 1) << @intCast(out.len)) - 1;
+        if ((mask & ~valid_mask) != 0 or @popCount(mask) != argument_count) return error.InvalidInstruction;
+        var position = out.len;
+        while (position != 0) {
+            position -= 1;
+            if ((mask & (@as(u32, 1) << @intCast(position))) != 0) out[position] = try self.popLong();
+        }
+    }
+
+    fn popLong(self: *Vm) ExecutionError!i32 {
+        var value = try self.popValue();
+        defer value.deinit(self.allocator);
+        return values.asLong(value);
+    }
+
+    fn printBeginFile(self: *Vm) ExecutionError!void {
+        const file_number = try self.popFileNumber();
+        const file = try self.fileAt(file_number);
+        if (file.mode == .input) return error.BadFileMode;
+        self.active_print_file = @intCast(file_number);
+    }
+
+    fn printValue(self: *Vm) ExecutionError!void {
+        var value = try self.popValue();
+        defer value.deinit(self.allocator);
+        switch (value) {
+            .string => |bytes| try self.printBytes(bytes),
+            .integer => |number| try self.printNumber(number, number >= 0),
+            .long => |number| try self.printNumber(number, number >= 0),
+            .single => |number| try self.printNumber(number, number >= 0),
+            .double => |number| try self.printNumber(number, number >= 0),
+        }
+    }
+
+    fn printNumber(self: *Vm, number: anytype, positive: bool) ExecutionError!void {
+        const formatted = try std.fmt.allocPrint(self.allocator, "{d}", .{number});
+        defer self.allocator.free(formatted);
+        if (positive) try self.printBytes(" ");
+        try self.printBytes(formatted);
+        try self.printBytes(" ");
+    }
+
+    fn printBytes(self: *Vm, bytes: []const u8) ExecutionError!void {
+        if (self.active_print_file) |raw_number| {
+            const file = try self.fileAt(raw_number);
+            if (file.mode == .input) return error.BadFileMode;
+            if (bytes.len > maximum_sequential_file_bytes -| file.output.items.len) return error.OutOfMemory;
+            try file.output.appendSlice(self.allocator, bytes);
+            for (bytes) |byte| switch (byte) {
+                '\r', '\n' => file.print_column = 0,
+                else => file.print_column +|= 1,
+            };
+            return;
+        }
+        self.text.write(bytes);
+    }
+
+    fn printTab(self: *Vm) ExecutionError!void {
+        const requested = try self.popLong();
+        if (requested < 1 or requested > 255) return error.IllegalFunctionCall;
+        if (self.active_print_file) |raw_number| {
+            const file = try self.fileAt(raw_number);
+            const target: usize = @intCast(requested - 1);
+            if (target < file.print_column) try self.printNewline();
+            try self.printSpaces(target -| file.print_column);
+            return;
+        }
+        self.text.printTab(requested) catch return error.IllegalFunctionCall;
+    }
+
+    fn printComma(self: *Vm) ExecutionError!void {
+        if (self.active_print_file) |raw_number| {
+            const file = try self.fileAt(raw_number);
+            const next = (file.print_column / text_screen.print_zone_columns + 1) * text_screen.print_zone_columns;
+            try self.printSpaces(next - file.print_column);
+            return;
+        }
+        self.text.printComma();
+    }
+
+    fn printSpaces(self: *Vm, count: usize) ExecutionError!void {
+        const spaces = [_]u8{' '} ** text_screen.columns;
+        var remaining = count;
+        while (remaining != 0) {
+            const amount = @min(remaining, spaces.len);
+            try self.printBytes(spaces[0..amount]);
+            remaining -= amount;
+        }
+    }
+
+    fn printNewline(self: *Vm) ExecutionError!void {
+        if (self.active_print_file != null) {
+            try self.printBytes("\r\n");
+        } else {
+            self.text.newLine();
+        }
+    }
+
+    fn consoleInput(self: *Vm, instruction_index: u32, target_count: u32, flags: u32) ExecutionError!void {
+        if (target_count == 0 or target_count > self.stack.items.len or (flags & ~@as(u32, 3)) != 0) {
+            return error.InvalidInstruction;
+        }
+        const line_input = (flags & 1) != 0;
+        const keep_same_line = (flags & 2) != 0;
+        const target_base = self.stack.items.len - target_count;
+        try self.validateInputTargets(target_base, target_count);
+
+        if (!try self.acquireInputLine(instruction_index)) return error.WouldBlock;
+        if (!keep_same_line) self.text.newLine();
+
+        const parsed = self.decodeConsoleInput(target_base, target_count, line_input) catch |fault| switch (fault) {
+            error.TypeMismatch, error.Overflow, error.IllegalFunctionCall => {
+                self.text.write("Redo from start\r\n? ");
+                self.input_line.clearRetainingCapacity();
+                self.wait_wake_ns = self.guest_now_ns +| input_poll_interval_ns;
+                return error.WouldBlock;
+            },
+            else => return fault,
+        };
+        self.assignInputValues(target_base, parsed);
+        self.allocator.free(parsed);
+        self.discardStackFrom(target_base);
+        self.pending_input_instruction = bytecode.invalid_index;
+        self.input_line.clearRetainingCapacity();
+    }
+
+    fn acquireInputLine(self: *Vm, instruction_index: u32) ExecutionError!bool {
+        if (self.pending_input_instruction != instruction_index) {
+            self.pending_input_instruction = instruction_index;
+            self.input_line.clearRetainingCapacity();
+        }
+        while (self.popKeyboardByte()) |byte| {
+            switch (byte) {
+                13, 10 => return true,
+                8 => {
+                    if (self.input_line.items.len != 0) {
+                        _ = self.input_line.pop();
+                        self.text.erasePrevious();
+                    }
+                },
+                0x20...0xFF => if (self.input_line.items.len < maximum_input_line_bytes) {
+                    try self.input_line.append(self.allocator, byte);
+                    self.text.writeByte(byte);
+                },
+                else => {},
+            }
+        }
+        self.wait_wake_ns = self.guest_now_ns +| input_poll_interval_ns;
+        return false;
+    }
+
+    fn popKeyboardByte(self: *Vm) ?u8 {
+        if (self.keyboard_head >= self.keyboard.items.len) {
+            self.keyboard.clearRetainingCapacity();
+            self.keyboard_head = 0;
+            return null;
+        }
+        const result = self.keyboard.items[self.keyboard_head];
+        self.keyboard_head += 1;
+        if (self.keyboard_head >= 1024 and self.keyboard_head * 2 >= self.keyboard.items.len) {
+            const remaining = self.keyboard.items.len - self.keyboard_head;
+            std.mem.copyForwards(u8, self.keyboard.items[0..remaining], self.keyboard.items[self.keyboard_head..]);
+            self.keyboard.items.len = remaining;
+            self.keyboard_head = 0;
+        }
+        return result;
+    }
+
+    fn decodeConsoleInput(
+        self: *Vm,
+        target_base: usize,
+        target_count: u32,
+        line_input: bool,
+    ) ExecutionError![]values.Value {
+        const parsed = try self.allocator.alloc(values.Value, target_count);
+        var initialized: usize = 0;
+        errdefer {
+            for (parsed[0..initialized]) |*value| value.deinit(self.allocator);
+            self.allocator.free(parsed);
+        }
+
+        if (line_input) {
+            if (target_count != 1 or try self.inputTargetType(target_base) != .string) return error.TypeMismatch;
+            parsed[0] = .{ .string = try self.allocator.dupe(u8, self.input_line.items) };
+            return parsed;
+        }
+
+        var cursor: usize = 0;
+        var target: usize = 0;
+        while (target < target_count) : (target += 1) {
+            const field = nextInputField(self.input_line.items, &cursor) orelse return error.TypeMismatch;
+            parsed[target] = try self.decodeInputField(field, try self.inputTargetType(target_base + target));
+            initialized += 1;
+        }
+        skipInputSeparators(self.input_line.items, &cursor);
+        if (cursor != self.input_line.items.len) return error.TypeMismatch;
+        return parsed;
+    }
+
+    fn validateInputTargets(self: *Vm, base: usize, count: u32) ExecutionError!void {
+        if (base + count > self.stack.items.len) return error.StackUnderflow;
+        var index: usize = 0;
+        while (index < count) : (index += 1) _ = try self.inputTargetCell(base + index);
+    }
+
+    fn inputTargetCell(self: *Vm, stack_index: usize) ExecutionError!*Cell {
+        if (stack_index >= self.stack.items.len) return error.StackUnderflow;
+        const cell = switch (self.stack.items[stack_index]) {
+            .reference => |value| resolveCell(value) orelse return error.InvalidInstruction,
+            .value => return error.InvalidInstruction,
+        };
+        _ = try scalarAt(cell);
+        return cell;
+    }
+
+    fn inputTargetType(self: *Vm, stack_index: usize) ExecutionError!bytecode.ValueType {
+        return (try scalarAt(try self.inputTargetCell(stack_index))).valueType();
+    }
+
+    fn assignInputValues(self: *Vm, target_base: usize, parsed: []values.Value) void {
+        for (parsed, 0..) |value, index| {
+            const scalar = scalarAtMutable(self.inputTargetCell(target_base + index) catch unreachable) catch unreachable;
+            scalar.deinit(self.allocator);
+            scalar.* = value;
+        }
+    }
+
+    fn decodeInputField(self: *Vm, field: InputField, target: bytecode.ValueType) ExecutionError!values.Value {
+        if (target == .string) return .{ .string = try self.allocator.dupe(u8, field.bytes) };
+        const trimmed = std.mem.trim(u8, field.bytes, " \t");
+        if (trimmed.len == 0) return error.TypeMismatch;
+        const number = std.fmt.parseFloat(f64, trimmed) catch return error.TypeMismatch;
+        if (!std.math.isFinite(number)) return error.Overflow;
+        const source: values.Value = .{ .double = number };
+        return values.convert(self.allocator, source, target);
+    }
+
+    fn fileInput(self: *Vm, target_count: u32, line_input: bool) ExecutionError!void {
+        if (target_count == 0 or self.stack.items.len < target_count + 1) return error.StackUnderflow;
+        const statement_base = self.stack.items.len - target_count - 1;
+        const file_number = try self.fileNumberAt(statement_base);
+        const file = try self.fileAt(file_number);
+        if (file.mode != .input) return error.BadFileMode;
+        try self.validateInputTargets(statement_base + 1, target_count);
+
+        const parsed = try self.allocator.alloc(values.Value, target_count);
+        var initialized: usize = 0;
+        errdefer {
+            for (parsed[0..initialized]) |*value| value.deinit(self.allocator);
+            self.allocator.free(parsed);
+        }
+        var cursor = file.offset;
+        if (line_input) {
+            if (target_count != 1 or try self.inputTargetType(statement_base + 1) != .string) return error.TypeMismatch;
+            if (cursor >= file.input.len) return error.InputPastEnd;
+            const start = cursor;
+            while (cursor < file.input.len and file.input[cursor] != '\r' and file.input[cursor] != '\n') cursor += 1;
+            parsed[0] = .{ .string = try self.allocator.dupe(u8, file.input[start..cursor]) };
+            initialized = 1;
+            consumeLineEnding(file.input, &cursor);
+        } else {
+            var target: usize = 0;
+            while (target < target_count) : (target += 1) {
+                const field = nextSequentialField(file.input, &cursor) orelse return error.InputPastEnd;
+                parsed[target] = try self.decodeInputField(field, try self.inputTargetType(statement_base + 1 + target));
+                initialized += 1;
+            }
+        }
+        self.assignInputValues(statement_base + 1, parsed);
+        self.allocator.free(parsed);
+        file.offset = cursor;
+        self.discardStackFrom(statement_base);
+    }
+
+    fn randomize(self: *Vm, instruction_index: u32, argument_count: u32) ExecutionError!void {
+        if (argument_count > 1) return error.InvalidInstruction;
+        if (argument_count == 1) {
+            var seed_value = try self.popValue();
+            defer seed_value.deinit(self.allocator);
+            self.seedRandom(try values.asDouble(seed_value));
+            return;
+        }
+
+        const fresh = self.pending_input_instruction != instruction_index;
+        if (fresh) self.text.write("Random Number Seed (-32768 to 32767)? ");
+        if (!try self.acquireInputLine(instruction_index)) return error.WouldBlock;
+        self.text.newLine();
+        const trimmed = std.mem.trim(u8, self.input_line.items, " \t");
+        const seed = std.fmt.parseFloat(f64, trimmed) catch {
+            self.text.write("Redo from start\r\n? ");
+            self.input_line.clearRetainingCapacity();
+            self.wait_wake_ns = self.guest_now_ns +| input_poll_interval_ns;
+            return error.WouldBlock;
+        };
+        if (!std.math.isFinite(seed) or seed < -32768 or seed > 32767) {
+            self.text.write("Redo from start\r\n? ");
+            self.input_line.clearRetainingCapacity();
+            self.wait_wake_ns = self.guest_now_ns +| input_poll_interval_ns;
+            return error.WouldBlock;
+        }
+        self.seedRandom(seed);
+        self.pending_input_instruction = bytecode.invalid_index;
+        self.input_line.clearRetainingCapacity();
+    }
+
+    fn seedRandom(self: *Vm, seed: f64) void {
+        const single: f32 = @floatCast(seed);
+        const bits: u32 = @bitCast(single);
+        self.random_state = normalizeRandomSeed(bits ^ (bits >> 8) ^ 0x00A5_5A5A);
+        self.random_last = 0;
+    }
+
+    fn nextRandom(self: *Vm) f32 {
+        self.random_state = (self.random_state *% 0x00FD_43FD +% 0x00C3_9EC3) & random_mask;
+        self.random_last = @as(f32, @floatFromInt(self.random_state)) / 16_777_216.0;
+        return self.random_last;
+    }
+
+    fn sleep(self: *Vm, instruction_index: u32, argument_count: u32) ExecutionError!void {
+        if (argument_count > 1) return error.InvalidInstruction;
+        if (self.pending_sleep_instruction != instruction_index) {
+            var seconds: f64 = 0;
+            if (argument_count == 1) {
+                var duration = try self.popValue();
+                defer duration.deinit(self.allocator);
+                seconds = try values.asDouble(duration);
+                if (!std.math.isFinite(seconds) or seconds < 0) return error.IllegalFunctionCall;
+            }
+            self.pending_sleep_instruction = instruction_index;
+            self.sleep_input_generation = self.keyboard_generation;
+            self.sleep_deadline_ns = if (seconds == 0)
+                std.math.maxInt(u64)
+            else blk: {
+                const duration_ns = seconds * @as(f64, @floatFromInt(std.time.ns_per_s));
+                if (duration_ns >= @as(f64, @floatFromInt(std.math.maxInt(u64)))) break :blk std.math.maxInt(u64);
+                break :blk self.guest_now_ns +| @as(u64, @intFromFloat(@ceil(duration_ns)));
+            };
+        }
+        if (self.keyboard_generation != self.sleep_input_generation or self.guest_now_ns >= self.sleep_deadline_ns) {
+            self.pending_sleep_instruction = bytecode.invalid_index;
+            self.sleep_deadline_ns = 0;
+            return;
+        }
+        self.wait_wake_ns = @min(self.sleep_deadline_ns, self.guest_now_ns +| input_poll_interval_ns);
+        return error.WouldBlock;
+    }
+
+    fn openFile(self: *Vm, mode: bytecode.FileMode) ExecutionError!void {
+        const file_number = try self.popFileNumber();
+        var path_value = try self.popValue();
+        defer path_value.deinit(self.allocator);
+        const raw_path = switch (path_value) {
+            .string => |value| value,
+            else => return error.TypeMismatch,
+        };
+        if (self.files[file_number] != null) return error.FileAlreadyOpen;
+        const resolved_path = try self.resolveGuestPath(raw_path);
+        errdefer self.allocator.free(resolved_path);
+
+        var input = try self.allocator.alloc(u8, 0);
+        errdefer self.allocator.free(input);
+        switch (mode) {
+            .input => {
+                self.allocator.free(input);
+                input = try self.readWholeFile(resolved_path);
+            },
+            .output, .append => {
+                const result = self.host.file_write(self.fileHostContext(), resolved_path, "", mode == .append);
+                switch (result) {
+                    .ok => {},
+                    .failure => |failure| return fileHostFault(failure),
+                }
+            },
+        }
+        self.files[file_number] = .{
+            .mode = mode,
+            .path = resolved_path,
+            .input = input,
+        };
+    }
+
+    fn readWholeFile(self: *Vm, path: []const u8) ExecutionError![]u8 {
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(self.allocator);
+        var scratch: [4096]u8 = undefined;
+        var offset: u32 = 0;
+        while (true) {
+            switch (self.host.file_read(self.fileHostContext(), path, offset, &scratch)) {
+                .bytes => |raw_count| {
+                    const count: usize = @intCast(raw_count);
+                    if (count == 0 or count > scratch.len) return error.PathFileAccess;
+                    if (count > maximum_sequential_file_bytes -| result.items.len) return error.OutOfMemory;
+                    try result.appendSlice(self.allocator, scratch[0..count]);
+                    offset = std.math.add(u32, offset, raw_count) catch return error.PathFileAccess;
+                },
+                .end => return result.toOwnedSlice(self.allocator),
+                .failure => |failure| return fileHostFault(failure),
+            }
+        }
+    }
+
+    fn closeFiles(self: *Vm, argument_count: u32) ExecutionError!void {
+        if (argument_count == 0) return self.closeAllFiles();
+        if (argument_count > self.stack.items.len) return error.StackUnderflow;
+        var remaining = argument_count;
+        while (remaining != 0) : (remaining -= 1) {
+            const file_number = try self.popFileNumber();
+            try self.closeFile(file_number);
+        }
+    }
+
+    fn closeAllFiles(self: *Vm) ExecutionError!void {
+        var file_number: usize = 1;
+        while (file_number <= maximum_file_number) : (file_number += 1) {
+            if (self.files[file_number] != null) try self.closeFile(file_number);
+        }
+    }
+
+    fn closeFile(self: *Vm, file_number: usize) ExecutionError!void {
+        const file = try self.fileAt(file_number);
+        if (file.mode != .input) {
+            const result = self.host.file_write(self.fileHostContext(), file.path, file.output.items, file.mode == .append);
+            switch (result) {
+                .ok => {},
+                .failure => |failure| return fileHostFault(failure),
+            }
+        }
+        file.deinit(self.allocator);
+        self.files[file_number] = null;
+        if (self.active_print_file != null and self.active_print_file.? == @as(u8, @intCast(file_number))) self.active_print_file = null;
+    }
+
+    fn discardFiles(self: *Vm) void {
+        for (&self.files) |*slot| {
+            if (slot.*) |*file| file.deinit(self.allocator);
+            slot.* = null;
+        }
+    }
+
+    fn fileAt(self: *Vm, file_number: usize) ExecutionError!*SequentialFile {
+        if (file_number == 0 or file_number > maximum_file_number) return error.BadFileNumber;
+        if (self.files[file_number]) |*file| return file;
+        return error.BadFileNumber;
+    }
+
+    fn fileHostContext(self: *Vm) ?*anyopaque {
+        return self.host.file_context orelse self.host.context;
+    }
+
+    fn popFileNumber(self: *Vm) ExecutionError!usize {
+        var value = try self.popValue();
+        defer value.deinit(self.allocator);
+        const number = try values.asLong(value);
+        if (number < 1 or number > maximum_file_number) return error.BadFileNumber;
+        return @intCast(number);
+    }
+
+    fn fileNumberAt(self: *Vm, stack_index: usize) ExecutionError!usize {
+        if (stack_index >= self.stack.items.len) return error.StackUnderflow;
+        const item = switch (self.stack.items[stack_index]) {
+            .value => |value| value,
+            .reference => return error.InvalidInstruction,
+        };
+        const number = try values.asLong(item);
+        if (number < 1 or number > maximum_file_number) return error.BadFileNumber;
+        return @intCast(number);
+    }
+
+    fn resolveGuestPath(self: *Vm, raw_path: []const u8) ExecutionError![]u8 {
+        if (raw_path.len == 0 or containsInvalidPathByte(raw_path) or isReservedDevicePath(raw_path)) return error.BadFileName;
+        if (isAbsoluteGuestPath(raw_path)) return self.allocator.dupe(u8, raw_path);
+        if (std.mem.indexOfScalar(u8, raw_path, ':') != null) return error.BadFileName;
+
+        var base = self.host.guest_directory;
+        if (base.len == 0) {
+            const file_name = self.program.file_name;
+            if (!isAbsoluteGuestPath(file_name)) return error.BadFileName;
+            base = file_name[0 .. lastPathSeparator(file_name) orelse return error.BadFileName];
+        }
+        if (!isAbsoluteGuestPath(base)) return error.BadFileName;
+        const needs_separator = base.len != 0 and base[base.len - 1] != '\\' and base[base.len - 1] != '/';
+        return std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{ base, if (needs_separator) "\\" else "", raw_path });
     }
 
     fn deferredBuiltin(self: *Vm, argument_count: u32) ExecutionError!void {
@@ -984,8 +1694,46 @@ pub const Vm = struct {
             .str_string => self.numberString(arguments[0]),
             .ucase_string => self.upperString(arguments[0]),
             .val => self.val(arguments[0]),
-            .eof, .inkey_string, .point, .rnd, .timer => error.HostFailure,
+            .eof => self.endOfFile(arguments[0]),
+            .inkey_string => self.inkeyString(),
+            .rnd => self.randomNumber(arguments),
+            .timer => .{ .single = self.timerSeconds() },
+            .point => error.HostFailure,
         };
+    }
+
+    fn endOfFile(self: *Vm, file_number_value: values.Value) ExecutionError!values.Value {
+        const raw_number = try values.asLong(file_number_value);
+        if (raw_number < 1 or raw_number > maximum_file_number) return error.BadFileNumber;
+        const file = try self.fileAt(@intCast(raw_number));
+        if (file.mode != .input) return error.BadFileMode;
+        return .{ .integer = if (file.offset >= file.input.len) -1 else 0 };
+    }
+
+    fn inkeyString(self: *Vm) ExecutionError!values.Value {
+        const byte = self.popKeyboardByte() orelse return .{ .string = try self.allocator.alloc(u8, 0) };
+        const result = try self.allocator.alloc(u8, 1);
+        result[0] = byte;
+        return .{ .string = result };
+    }
+
+    fn randomNumber(self: *Vm, arguments: []const values.Value) ExecutionError!values.Value {
+        if (arguments.len > 1) return error.InvalidInstruction;
+        if (arguments.len == 0) return .{ .single = self.nextRandom() };
+        const argument = try values.asDouble(arguments[0]);
+        if (!std.math.isFinite(argument)) return error.IllegalFunctionCall;
+        if (argument < 0) {
+            self.seedRandom(argument);
+            return .{ .single = self.nextRandom() };
+        }
+        if (argument == 0) return .{ .single = self.random_last };
+        return .{ .single = self.nextRandom() };
+    }
+
+    fn timerSeconds(self: *const Vm) f32 {
+        const day_ns: u64 = 86_400 * std.time.ns_per_s;
+        const within_day = self.guest_now_ns % day_ns;
+        return @as(f32, @floatFromInt(within_day)) / @as(f32, @floatFromInt(std.time.ns_per_s));
     }
 
     fn hostMath(self: *Vm, operation: MathOperation, input: values.Value, unused: values.Value) ExecutionError!values.Value {
@@ -1183,6 +1931,140 @@ pub const Vm = struct {
     }
 };
 
+const InputField = struct {
+    bytes: []const u8,
+};
+
+fn nextInputField(bytes: []const u8, cursor: *usize) ?InputField {
+    while (cursor.* < bytes.len and (bytes[cursor.*] == ' ' or bytes[cursor.*] == '\t')) cursor.* += 1;
+    if (cursor.* >= bytes.len) return null;
+    if (bytes[cursor.*] == ',') {
+        cursor.* += 1;
+        return .{ .bytes = "" };
+    }
+    if (bytes[cursor.*] == '"') {
+        cursor.* += 1;
+        const start = cursor.*;
+        while (cursor.* < bytes.len and bytes[cursor.*] != '"') cursor.* += 1;
+        if (cursor.* >= bytes.len) return null;
+        const result = bytes[start..cursor.*];
+        cursor.* += 1;
+        while (cursor.* < bytes.len and (bytes[cursor.*] == ' ' or bytes[cursor.*] == '\t')) cursor.* += 1;
+        if (cursor.* < bytes.len) {
+            if (bytes[cursor.*] != ',') return null;
+            cursor.* += 1;
+        }
+        return .{ .bytes = result };
+    }
+    const start = cursor.*;
+    while (cursor.* < bytes.len and bytes[cursor.*] != ',') cursor.* += 1;
+    const result = std.mem.trim(u8, bytes[start..cursor.*], " \t");
+    if (cursor.* < bytes.len) cursor.* += 1;
+    return .{ .bytes = result };
+}
+
+fn skipInputSeparators(bytes: []const u8, cursor: *usize) void {
+    while (cursor.* < bytes.len and (bytes[cursor.*] == ' ' or bytes[cursor.*] == '\t')) cursor.* += 1;
+}
+
+fn nextSequentialField(bytes: []const u8, cursor: *usize) ?InputField {
+    while (cursor.* < bytes.len) {
+        const byte = bytes[cursor.*];
+        if (byte != ' ' and byte != '\t' and byte != ',' and byte != '\r' and byte != '\n') break;
+        cursor.* += 1;
+    }
+    if (cursor.* >= bytes.len) return null;
+    if (bytes[cursor.*] == '"') {
+        cursor.* += 1;
+        const start = cursor.*;
+        while (cursor.* < bytes.len and bytes[cursor.*] != '"') cursor.* += 1;
+        if (cursor.* >= bytes.len) return null;
+        const result = bytes[start..cursor.*];
+        cursor.* += 1;
+        while (cursor.* < bytes.len and bytes[cursor.*] != ',' and bytes[cursor.*] != '\r' and bytes[cursor.*] != '\n') cursor.* += 1;
+        if (cursor.* < bytes.len) {
+            if (bytes[cursor.*] == '\r' or bytes[cursor.*] == '\n') {
+                consumeLineEnding(bytes, cursor);
+            } else {
+                cursor.* += 1;
+            }
+        }
+        return .{ .bytes = result };
+    }
+    const start = cursor.*;
+    while (cursor.* < bytes.len and bytes[cursor.*] != ',' and bytes[cursor.*] != '\r' and bytes[cursor.*] != '\n') cursor.* += 1;
+    const result = std.mem.trim(u8, bytes[start..cursor.*], " \t");
+    if (cursor.* < bytes.len) {
+        if (bytes[cursor.*] == '\r' or bytes[cursor.*] == '\n') {
+            consumeLineEnding(bytes, cursor);
+        } else {
+            cursor.* += 1;
+        }
+    }
+    return .{ .bytes = result };
+}
+
+fn consumeLineEnding(bytes: []const u8, cursor: *usize) void {
+    if (cursor.* >= bytes.len) return;
+    const first = bytes[cursor.*];
+    if (first != '\r' and first != '\n') return;
+    cursor.* += 1;
+    if (cursor.* < bytes.len and ((first == '\r' and bytes[cursor.*] == '\n') or (first == '\n' and bytes[cursor.*] == '\r'))) {
+        cursor.* += 1;
+    }
+}
+
+fn normalizeRandomSeed(seed: u32) u32 {
+    const normalized = seed & random_mask;
+    return if (normalized == 0) 1 else normalized;
+}
+
+fn fileHostFault(failure: FileHostError) ExecutionError {
+    return switch (failure) {
+        .unavailable => error.HostFailure,
+        .not_found => error.FileNotFound,
+        .permission_denied => error.PermissionDenied,
+        .path_error => error.PathFileAccess,
+        .io_error => error.PathFileAccess,
+        .too_large => error.OutOfMemory,
+    };
+}
+
+fn containsInvalidPathByte(path: []const u8) bool {
+    for (path) |byte| if (byte < 0x20 or byte == 0x7F or byte == '"' or byte == '<' or byte == '>' or byte == '|' or byte == '?' or byte == '*') return true;
+    return false;
+}
+
+fn isAbsoluteGuestPath(path: []const u8) bool {
+    return path.len >= 3 and std.ascii.isAlphabetic(path[0]) and path[1] == ':' and (path[2] == '\\' or path[2] == '/');
+}
+
+fn lastPathSeparator(path: []const u8) ?usize {
+    var index = path.len;
+    while (index != 0) {
+        index -= 1;
+        if (path[index] == '\\' or path[index] == '/') return index;
+    }
+    return null;
+}
+
+fn isReservedDevicePath(path: []const u8) bool {
+    const separator = lastPathSeparator(path);
+    const component_start = if (separator) |index| index + 1 else 0;
+    const component = path[component_start..];
+    var end: usize = 0;
+    while (end < component.len and component[end] != '.' and component[end] != ':') : (end += 1) {}
+    const name = std.mem.trim(u8, component[0..end], " ");
+    if (std.ascii.eqlIgnoreCase(name, "CON") or std.ascii.eqlIgnoreCase(name, "PRN") or
+        std.ascii.eqlIgnoreCase(name, "AUX") or std.ascii.eqlIgnoreCase(name, "NUL") or
+        std.ascii.eqlIgnoreCase(name, "CLOCK$") or std.ascii.eqlIgnoreCase(name, "SCRN") or
+        std.ascii.eqlIgnoreCase(name, "KYBD") or std.ascii.eqlIgnoreCase(name, "CONS")) return true;
+    if (name.len == 4 and name[3] >= '1' and name[3] <= '9') {
+        if (std.ascii.eqlIgnoreCase(name[0..3], "COM") or std.ascii.eqlIgnoreCase(name[0..3], "LPT")) return true;
+    }
+    return false;
+}
+
 fn absolute(input: values.Value) ExecutionError!values.Value {
     return switch (input) {
         .integer => |number| if (number == std.math.minInt(i16)) error.Overflow else .{ .integer = @intCast(@abs(number)) },
@@ -1221,13 +2103,22 @@ fn runtimeCode(fault: ExecutionError) RuntimeCode {
         error.OutOfData => .out_of_data,
         error.ResumeWithoutError => .resume_without_error,
         error.RestrictedMemory => .restricted_memory,
+        error.BadFileNumber => .bad_file_number,
+        error.FileNotFound => .file_not_found,
+        error.BadFileMode => .bad_file_mode,
+        error.FileAlreadyOpen => .file_already_open,
+        error.InputPastEnd => .input_past_end,
+        error.BadFileName => .bad_file_name,
+        error.PermissionDenied => .permission_denied,
+        error.PathFileAccess => .path_file_access,
         error.Rethrow => .invalid_instruction,
+        error.WouldBlock => .invalid_instruction,
     };
 }
 
 fn isCatchable(code: RuntimeCode) bool {
     return switch (code) {
-        .overflow, .division_by_zero, .type_mismatch, .illegal_function_call, .out_of_memory, .subscript_out_of_range, .array_already_dimensioned, .out_of_data, .restricted_memory => true,
+        .overflow, .division_by_zero, .type_mismatch, .illegal_function_call, .out_of_memory, .subscript_out_of_range, .array_already_dimensioned, .out_of_data, .restricted_memory, .bad_file_number, .file_not_found, .bad_file_mode, .file_already_open, .input_past_end, .bad_file_name, .permission_denied, .path_file_access => true,
         .stack_overflow, .stack_underflow, .call_depth_exceeded, .gosub_without_return, .invalid_instruction, .host_failure, .resume_without_error => false,
     };
 }
@@ -1245,8 +2136,20 @@ fn defaultMath(_: ?*anyopaque, operation: MathOperation, first: f64, second: f64
 
 fn acceptScreenMode(_: ?*anyopaque, _: i32) ScreenModeError!void {}
 
+fn rejectDeferredStatement(_: ?*anyopaque, _: frontend.Keyword) DeferredStatementError!void {
+    return error.Unsupported;
+}
+
 fn neverCancel(_: ?*anyopaque) bool {
     return false;
+}
+
+fn unavailableFileRead(_: ?*anyopaque, _: []const u8, _: u32, _: []u8) FileReadResult {
+    return .{ .failure = .unavailable };
+}
+
+fn unavailableFileWrite(_: ?*anyopaque, _: []const u8, _: []const u8, _: bool) FileWriteResult {
+    return .{ .failure = .unavailable };
 }
 
 fn allocateGlobals(allocator: std.mem.Allocator, program: *const bytecode.Program) InitError![]Cell {

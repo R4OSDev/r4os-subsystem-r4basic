@@ -6,11 +6,12 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.66.7
+Stand 0.66.8
 ------------
 
 Diese Ausbaustufe besitzt das produktive Modulprojekt, das versionierte
-Quellfrontend und den ausfuehrbaren BASIC-Datenkern. Der Compiler
+Quellfrontend und den ausfuehrbaren BASIC-Datenkern samt Textbildschirm,
+Eingabe, Gastzeit, Zufall und sequentiellen Dateien. Der Compiler
 tokenisiert einen Quelltext genau einmal, bindet skalare und zusammengesetzte
 Symbole und erzeugt
 eine unveraenderliche Instruktionsdarstellung mit festen Sprungzielen. Die
@@ -126,11 +127,12 @@ ihres BASIC-Statements. RESUME baut deshalb auch bei mehreren
 Operandeninstruktionen das ganze fehlerhafte Statement neu auf; RESUME NEXT
 springt exakt dahinter. Ein unbehandelter Fehler beendet nur seine VM.
 
-Die vorlaeufige SCREEN-Modusabfrage ist als injizierbarer Hostaufruf
+Die SCREEN-Modusabfrage ist als injizierbarer Hostaufruf
 vorhanden, damit der Modusfallback bereits vor der Grafikschicht echt durch
-den BASIC-Fehlerpfad getestet wird. Spaetere Text-, Zeit-, Datei-, Grafik-
-und Audioanweisungen besitzen sichtbare Deferred-Guards und werden niemals
-als erfolgreiche Leeroperation ausgegeben.
+den BASIC-Fehlerpfad getestet wird. Spaetere Grafik- und Audioanweisungen
+besitzen sichtbare Deferred-Guards und werden niemals als erfolgreiche
+Leeroperation ausgegeben. Ein Host muss die Annahme einer solchen Anweisung
+ausdruecklich injizieren; der Standard bleibt ein sichtbarer Fehler.
 
 DEF SEG = 0 schaltet ausschliesslich ein privates Byte an Offset 1047 frei.
 PEEK und POKE koennen damit das von GORILLA.BAS verwendete NumLock-Bit lesen
@@ -138,11 +140,76 @@ und setzen. DEF SEG ohne Wert schliesst den Zugriff. Jeder andere Offset oder
 jedes andere Segment ist ein BASIC-Laufzeitfehler; R4OS- und Hostspeicher
 sind strukturell unerreichbar.
 
+Textbildschirm und Tastatur
+---------------------------
+
+Jede VM besitzt einen eigenen 80x25-Zellbildschirm. Eine Zelle speichert ein
+Byte sowie Vorder- und Hintergrundattribut. Cursorposition, Sichtbarkeit,
+Form, VIEW-PRINT-Bereich und Revisionsstand gehoeren ebenfalls zur Instanz.
+SCREEN 0, WIDTH 80,25, COLOR, CLS, LOCATE und VIEW PRINT arbeiten nur auf
+diesem Zustand. Fehlerhafte mehrteilige COLOR- oder LOCATE-Werte veraendern
+keinen Teilzustand.
+
+PRINT bildet Semikolon, 14-spaltige Kommazonen, TAB und die Leerzeichen um
+Zahlen ab. SPACE$ kommt aus dem normalen Stringpfad. Der aktive Druckbereich
+scrollt unabhaengig vom Rest des Bildschirms. Dieselbe Formatierung kann in
+einen sequentiellen Ausgabepuffer schreiben, ohne punktweise GUI-Aufrufe zu
+erzeugen.
+
+Pro VM existiert ein fokussierter Tastaturpuffer fuer hoechstens 4.096 Byte.
+Der gastneutrale Subsystemhost liefert druckbare Zeichen, Enter, Backspace
+und Fokuswechsel. INKEY$ entnimmt hoechstens ein Byte und kehrt bei leerem
+Puffer sofort mit einer leeren Zeichenkette zurueck. INPUT und LINE INPUT
+geben dagegen kooperativ ab, bearbeiten und spiegeln eine maximal 255 Byte
+lange Zeile und weisen erst dann alle Ziele atomar zu. Ein ungueltiger Wert
+meldet `Redo from start`, ohne bereits gueltige Ziele vorzeitig zu aendern.
+
+Gastzeit, Zufall und Pacing
+--------------------------
+
+TIMER liest die monotone, pausenbereinigte Gastzeit des gemeinsamen
+Subsystem-Runtimes und liefert Sekunden modulo eines Tages. SLEEP speichert
+nur eine Gastdeadline und gibt `waiting` zurueck; Eingabe, Fensteraktionen
+und Close werden waehrenddessen weiter gepollt. Eine neue Taste kann SLEEP
+vorzeitig beenden. Pausenzeit wird weder TIMER noch der Deadline zugerechnet.
+
+Der R4BASIC-Adapter begrenzt eine geplante Scheibe auf 26 Instruktionen und
+setzt die naechste Fortsetzung fruehestens zwei Gastmillisekunden spaeter an.
+Dieses feste Pacing haelt die CPU-Abgabe kurz und liefert fuer das historische
+CalcDelay-/Rest-Muster reproduzierbar ungefaehr den vorgesehenen Faktor eins,
+statt die Kalibrierung mit moderner Busy-Wait-Geschwindigkeit aufzublasen.
+
+RND besitzt einen privaten 24-Bit-Zustand und den letzten Wert. Positive oder
+fehlende Argumente ziehen weiter, null wiederholt und ein negatives Argument
+setzt reproduzierbar neu. Ein injizierbarer Startseed macht Tests exakt
+wiederholbar. RANDOMIZE mit Ausdruck setzt direkt; RANDOMIZE ohne Ausdruck
+verwendet denselben editierbaren Eingabe- und Wiederholungspfad. Zugesagt ist
+die QBasic-Aufrufsemantik, nicht Microsofts exakte historische Zahlenfolge.
+
+Sequentielle Dateien
+--------------------
+
+OPEN unterstuetzt INPUT, OUTPUT und APPEND an den Dateinummern 1 bis 255.
+CLOSE, PRINT #, INPUT #, LINE INPUT # und EOF pruefen Nummer und Modus.
+Relative Pfade werden gegen ein angegebenes Gastverzeichnis oder das
+Verzeichnis der absolut gestarteten BAS-Datei aufgeloest; absolute
+Laufwerkspfade bleiben unveraendert. Leere oder ungueltige Pfade,
+laufwerkrelative Formen und DOS-Geraetenamen wie CON, COM1 oder LPT1 werden
+sichtbar abgewiesen.
+
+Die VM erreicht keine R4SYS-Dateifunktion direkt. `src/storage_adapter.zig`
+uebersetzt ausschliesslich ueber `r4os.Files` und `AbsoluteFilePath` in die
+normalen Storage-Fassaden. Ein sequentieller Eingabepuffer ist auf vier MiB
+begrenzt; Ausgaben werden pro Slot gesammelt und bei CLOSE oder normalem END
+geschrieben. Fehlende Dateien, falsche Modi, EOF-Ueberlauf und Pfadfehler
+behalten getrennte QBasic-Fehlernummern. RANDOM/BINARY, Drucker, COM-Ports,
+Loeschen und Verzeichnisveraenderungen sind nicht Bestandteil dieses Stands.
+
 `src/runtime_adapter.zig` bildet die VM auf `r4os.subsystem_runtime` ab. Pro
-Hostzyklus wird genau eine BASIC-Scheibe mit dem vom Runtime-Host gelieferten
-Instruktionsbudget ausgefuehrt. Fenster- und Close-Ereignisse werden davor
-verarbeitet. Reset erzeugt einen frischen Variablensatz und leert alle
-Stapel; ein Fehler oder Abschluss wird in den gemeinsamen
+Hostzyklus wird hoechstens eine gepacte BASIC-Scheibe ausgefuehrt. Fenster-
+und Close-Ereignisse werden davor verarbeitet. Reset erzeugt einen frischen
+Variablensatz und leert Stapel, Text, Eingabe, Wartezustand, Zufall und offene
+Dateien; ein Fehler oder Abschluss wird in den gemeinsamen
 Subsystem-Lebenszyklus ueberfuehrt. Audio liefert in dieser Stufe noch keine
 Gastdaten.
 
@@ -153,14 +220,16 @@ Der normale, vollstaendig oeffentliche Testlauf lautet:
 
     Build.bat test
 
-Er baut und inspiziert das GUI-R4X und fuehrt 25 Host-Component-Tests aus.
+Er baut und inspiziert das GUI-R4X und fuehrt 34 Host-Component-Tests aus.
 Vier positive und vier negative Frontend-Fixtures pruefen weiterhin den
-Quellvertrag. Neun ausfuehrbare BAS-Fixtures pruefen Werte, Kontrollfluss,
+Quellvertrag. Dreizehn ausfuehrbare BAS-Fixtures pruefen Werte, Kontrollfluss,
 Prozeduren, Built-ins, Aggregate, DATA, Fehlerfortsetzung, das private
-Speicherbyte, endlose Ausfuehrung und getrennte Fehlerzustaende.
+Speicherbyte, Text und Eingabe, Zeit und Zufall, CalcDelay-Pacing,
+sequentielle Dateien, endlose Ausfuehrung und getrennte Fehlerzustaende.
 Zusaetzlich werden exakte Laufzeitpositionen und Fehlernummern, Rekursion,
-verschachteltes ByRef, Hostfehler, Reset, Nullbudget-Abbruch und ein echter
-`subsystem_runtime`-Close vor der naechsten Gastscheibe direkt getestet.
+verschachteltes ByRef, Hostfehler, Reset, Nullbudget-Abbruch, Fokus- und
+Instanztrennung, pausierte Wartezeit, Fensterereignisse waehrend SLEEP,
+absolute und relative Dateipfade sowie Storage-Fehler direkt getestet.
 
 Die optionale lokale Realprogrammabnahme lautet:
 
@@ -171,9 +240,11 @@ Sie liest ausschliesslich
 29.434 Byte und die SHA-256-Pruefsumme
 `9926FC1F50C4B489EC4C1B0DA5BD2C497EBF4282B3259C28A835A743E24699F7` und
 uebergibt danach die unveraenderten Bytes an dasselbe Frontend und den
-produktiven Binder. Die vollstaendige Daten- und Prozedurstruktur muss ohne
-Quelltextaenderung ein gueltiges Instruktionsprogramm ergeben. Der normale
-Build benoetigt diese lokale Datei nicht.
+produktiven Binder. Ein zweiter Test fuehrt das Original durch Intro, zwei
+editierte Spielernamen, ungueltige und gueltige Spiel-/Schwerkraftwerte sowie
+Winkel und Geschwindigkeit. Nur ein ausdruecklicher Testhost nimmt die noch
+ausstehenden Grafik- und Audioanweisungen an; der Lauf muss am spaeteren
+POINT-Grafikguard enden. Der normale Build benoetigt diese lokale Datei nicht.
 
 Referenzen und Rechte
 ---------------------
@@ -193,7 +264,6 @@ Weitergaberechte getrennt geklaert sein.
 Noch nicht Bestandteil dieses Stands
 ------------------------------------
 
-- Textausgabe, Tastatur, Eingabe, Gastzeit, Zufall und Dateilaufzeit
 - virtueller Grafikbildschirm und Grafikbefehle
 - Audio und Music Macro Language
 - produktives Laden und Anzeigen einer BAS-Datei im Fenster

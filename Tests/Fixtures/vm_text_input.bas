@@ -1,0 +1,15 @@
+DEFINT A-Z
+SCREEN 0
+WIDTH 80, 25
+COLOR 14, 1
+CLS
+VIEW PRINT 2 TO 4
+LOCATE 2, 3, 0
+PRINT "R4BASIC"; TAB(20); SPACE$(2); "INPUT"
+LINE INPUT "Name: "; Name$
+INPUT "Count"; Count
+INPUT "Gravity"; Gravity#
+VIEW PRINT
+LOCATE 25, 1, 1
+PRINT Name$; Count; Gravity#;
+END

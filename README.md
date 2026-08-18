@@ -5,20 +5,20 @@ R4X module with the subsystem identity `r4os.basic` and the guest format
 `basic.qbasic-source`.
 
 The current release keeps the versioned R4BASIC v1 source contract and adds
-the QBasic aggregate and error model to the one-time compiler and cooperative
-VM. Fixed and dynamic arrays, user-defined records, DATA, aggregate ByRef,
-statement-accurate error continuation, and the private NumLock compatibility
-byte now execute without reparsing source text.
+the text console, interactive input, guest time, random state, and sequential
+files to the one-time compiler and cooperative VM. These layers join the
+existing scalar, procedure, aggregate, DATA, error, and private NumLock
+models without reparsing source text.
 
 The installed R4X does not load a guest file or open its final BASIC window
-yet. Text I/O, time, random numbers, files, graphics, and audio remain
-separate later layers. Their already accepted source forms compile to visible
-deferred host guards rather than silently doing nothing.
+yet. Graphics and audio remain separate later layers. Their already accepted
+source forms compile to visible deferred host guards rather than silently
+doing nothing.
 
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `0.3.0`
+- Module version: `0.4.0`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -42,11 +42,13 @@ file documented in `COMPATIBILITY.md`:
 
     Build.bat gorilla-test
 
-That step verifies and parses the unchanged file, then binds its complete
-data and procedure structure into the same typed instruction program. The
-file is not part of this repository and is never downloaded by the build.
-The normal public test step uses only original, redistributable BAS fixtures
-under `Tests/Fixtures`.
+That step verifies and parses the unchanged file, binds its complete data and
+procedure structure, and executes its intro and initial input path through
+two names, game count, gravity, angle, and velocity. A test-only explicit
+host accepts the still-deferred graphics and audio statements; execution
+must stop at the later `POINT` graphics guard. The file is not part of this
+repository and is never downloaded by the build. The normal public test step
+uses only original, redistributable BAS fixtures under `Tests/Fixtures`.
 
 The build starters map the current local R4OS SDK and Contract checkouts from
 `Settings.R4S`. The URL and hash in `build.zig.zon` record the last verified

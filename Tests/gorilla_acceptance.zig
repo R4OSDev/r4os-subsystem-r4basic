@@ -55,3 +55,195 @@ test "canonical local GORILLA.BAS tokenizes and parses unchanged" {
     try std.testing.expect(program.record_types.len != 0);
     try std.testing.expect(program.data_items.len != 0);
 }
+
+const DeferredProbe = struct {
+    calls: u32 = 0,
+    beeps: u32 = 0,
+
+    fn accept(context: ?*anyopaque, keyword: frontend.Keyword) core.vm.DeferredStatementError!void {
+        const self: *DeferredProbe = @ptrCast(@alignCast(context.?));
+        switch (keyword) {
+            .beep, .circle, .get, .line, .paint, .palette, .play, .pset, .put => {},
+            else => return error.Unsupported,
+        }
+        self.calls += 1;
+        if (keyword == .beep) self.beeps += 1;
+    }
+};
+
+test "canonical local GORILLA.BAS reaches names gravity angle and velocity input unchanged" {
+    const allocator = std.testing.allocator;
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, canonical_path, allocator, .limited(frontend.maximum_source_bytes));
+    defer allocator.free(source);
+
+    var program = try core.compiler.compile(allocator, canonical_path, source);
+    defer program.deinit();
+    try std.testing.expect(program.ok());
+
+    var probe = DeferredProbe{};
+    var machine = try core.vm.Vm.init(allocator, &program, .{
+        .context = &probe,
+        .deferred_statement = DeferredProbe.accept,
+        .initial_random_seed = 0x0042_4242,
+    });
+    defer machine.deinit();
+
+    const Stage = enum {
+        intro,
+        intro_key,
+        player_one,
+        player_two,
+        game_invalid,
+        game_valid,
+        gravity_invalid,
+        gravity_valid,
+        choice,
+        choice_key,
+        angle,
+        angle_key,
+        velocity,
+        velocity_key,
+        graphics_guard,
+    };
+    var stage: Stage = .intro;
+    var delay_slices: u8 = 0;
+    var guest_ns: u64 = 0;
+    var reached_graphics_guard = false;
+
+    for (0..80_000) |_| {
+        machine.setGuestTime(guest_ns);
+        const slice = machine.runSlice(256);
+        guest_ns +|= 10 * std.time.ns_per_ms;
+
+        if (slice.status == .runtime_error) {
+            if (stage == .graphics_guard) {
+                const diagnostic = machine.runtime_diagnostic.?;
+                try std.testing.expectEqual(core.vm.RuntimeCode.host_failure, diagnostic.code);
+                try std.testing.expectEqual(@as(u32, 977), diagnostic.span.line);
+                reached_graphics_guard = true;
+                break;
+            }
+            std.debug.print("unexpected GORILLA VM error in {s}: {s}:{d}:{d} {s}\n", .{
+                @tagName(stage),
+                machine.runtime_diagnostic.?.file_name,
+                machine.runtime_diagnostic.?.span.line,
+                machine.runtime_diagnostic.?.span.column,
+                @tagName(machine.runtime_diagnostic.?.code),
+            });
+            return error.UnexpectedGorillaRuntimeError;
+        }
+
+        switch (stage) {
+            .intro => if (screenContains(&machine, "Press any key to continue")) {
+                stage = .intro_key;
+                delay_slices = 3;
+            },
+            .intro_key => if (delay_slices != 0) {
+                delay_slices -= 1;
+            } else {
+                try feedInput(&machine, "X");
+                stage = .player_one;
+            },
+            .player_one => if (slice.status == .waiting and screenContains(&machine, "Name of Player 1")) {
+                try feedInput(&machine, "Alix\x08ce\r");
+                stage = .player_two;
+            },
+            .player_two => if (slice.status == .waiting and screenContains(&machine, "Name of Player 2")) {
+                try feedInput(&machine, "Bob\r");
+                stage = .game_invalid;
+            },
+            .game_invalid => if (slice.status == .waiting and screenContains(&machine, "Play to how many")) {
+                try feedInput(&machine, "xx\r");
+                stage = .game_valid;
+            },
+            .game_valid => if (slice.status == .waiting and screenContains(&machine, "Play to how many")) {
+                try feedInput(&machine, "3\r");
+                stage = .gravity_invalid;
+            },
+            .gravity_invalid => if (slice.status == .waiting and screenContains(&machine, "Gravity in Meters")) {
+                try feedInput(&machine, "bad\r");
+                stage = .gravity_valid;
+            },
+            .gravity_valid => if (slice.status == .waiting and screenContains(&machine, "Gravity in Meters")) {
+                try feedInput(&machine, "9.8\r");
+                stage = .choice;
+            },
+            .choice => if (screenContains(&machine, "Your Choice?")) {
+                stage = .choice_key;
+                delay_slices = 2;
+            },
+            .choice_key => if (delay_slices != 0) {
+                delay_slices -= 1;
+            } else {
+                try feedInput(&machine, "P");
+                stage = .angle;
+            },
+            .angle => if (screenContains(&machine, "Angle:")) {
+                stage = .angle_key;
+                delay_slices = 2;
+            },
+            .angle_key => if (delay_slices != 0) {
+                delay_slices -= 1;
+            } else {
+                try feedInput(&machine, "4X6\x085\r");
+                stage = .velocity;
+            },
+            .velocity => if (screenContains(&machine, "Velocity:")) {
+                stage = .velocity_key;
+                delay_slices = 2;
+            },
+            .velocity_key => if (delay_slices != 0) {
+                delay_slices -= 1;
+            } else {
+                try feedInput(&machine, "9Q0\r");
+                stage = .graphics_guard;
+            },
+            .graphics_guard => {},
+        }
+    }
+
+    try std.testing.expect(reached_graphics_guard);
+    try expectString(&machine, "Name1$", "Alice");
+    try expectString(&machine, "Name2$", "Bob");
+    try expectInteger(&machine, "NumGames", 3);
+    try expectDouble(&machine, "gravity#", 9.8);
+    try std.testing.expect(probe.calls > 100);
+    try std.testing.expectEqual(@as(u32, 2), probe.beeps);
+}
+
+fn screenContains(machine: *const core.vm.Vm, needle: []const u8) bool {
+    var row_bytes: [core.text_screen.columns]u8 = undefined;
+    for (0..core.text_screen.rows) |row| {
+        if (!machine.textScreen().copyRow(row, &row_bytes)) return false;
+        if (std.mem.indexOf(u8, &row_bytes, needle) != null) return true;
+    }
+    return false;
+}
+
+fn feedInput(machine: *core.vm.Vm, bytes: []const u8) !void {
+    for (bytes) |byte| {
+        const accepted = switch (byte) {
+            8, 10, 13 => try machine.enqueueKeyCode(byte),
+            else => try machine.enqueueTextCodepoint(byte),
+        };
+        try std.testing.expect(accepted);
+    }
+}
+
+fn expectInteger(machine: *const core.vm.Vm, name: []const u8, expected: i16) !void {
+    const actual = machine.global(name) orelse return error.MissingGorillaGlobal;
+    try std.testing.expectEqual(core.bytecode.ValueType.integer, actual.valueType());
+    try std.testing.expectEqual(expected, actual.integer);
+}
+
+fn expectDouble(machine: *const core.vm.Vm, name: []const u8, expected: f64) !void {
+    const actual = machine.global(name) orelse return error.MissingGorillaGlobal;
+    try std.testing.expectEqual(core.bytecode.ValueType.double, actual.valueType());
+    try std.testing.expectApproxEqAbs(expected, actual.double, 0.0000001);
+}
+
+fn expectString(machine: *const core.vm.Vm, name: []const u8, expected: []const u8) !void {
+    const actual = machine.global(name) orelse return error.MissingGorillaGlobal;
+    try std.testing.expectEqual(core.bytecode.ValueType.string, actual.valueType());
+    try std.testing.expectEqualStrings(expected, actual.string);
+}

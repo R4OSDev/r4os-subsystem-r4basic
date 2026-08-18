@@ -1,7 +1,7 @@
 const std = @import("std");
 const frontend = @import("frontend.zig");
 
-pub const contract_version = "1.1.0";
+pub const contract_version = "1.2.0";
 pub const invalid_index: u32 = std.math.maxInt(u32);
 pub const unknown_dimensions: u8 = std.math.maxInt(u8);
 
@@ -84,6 +84,12 @@ pub const ProcedureKind = enum(u8) {
     def_fn,
 };
 
+pub const FileMode = enum(u8) {
+    input,
+    output,
+    append,
+};
+
 pub const Procedure = struct {
     name: frontend.Span,
     kind: ProcedureKind,
@@ -127,6 +133,25 @@ pub const OpCode = enum(u8) {
     peek,
     poke,
     screen_mode_probe,
+    text_width,
+    text_color,
+    text_cls,
+    text_locate,
+    text_view_print,
+    print_begin_screen,
+    print_begin_file,
+    print_value,
+    print_tab,
+    print_comma,
+    print_question,
+    print_newline,
+    print_end,
+    input_console,
+    input_file,
+    randomize,
+    sleep,
+    file_open,
+    file_close,
     deferred_statement,
     deferred_builtin,
     convert,

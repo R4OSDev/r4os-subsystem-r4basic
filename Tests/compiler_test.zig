@@ -11,6 +11,10 @@ const fixture_paths = struct {
     const arrays_records_data = "Tests/Fixtures/vm_arrays_records_data.bas";
     const error_resume = "Tests/Fixtures/vm_error_resume.bas";
     const private_memory = "Tests/Fixtures/vm_private_memory.bas";
+    const text_input = "Tests/Fixtures/vm_text_input.bas";
+    const time_random = "Tests/Fixtures/vm_time_random.bas";
+    const pacing = "Tests/Fixtures/vm_pacing.bas";
+    const sequential_files = "Tests/Fixtures/vm_sequential_files.bas";
 };
 
 test "core compiler emits a bound instruction program" {
@@ -455,6 +459,7 @@ test "simultaneous instances isolate stacks instruction pointers errors and exit
 
 const RuntimeHostProbe = struct {
     close_next: bool = false,
+    handled_left: u32 = 0,
     polls: u32 = 0,
 
     fn driver(self: *RuntimeHostProbe) core.runtime_adapter.api.HostDriver {
@@ -464,6 +469,10 @@ const RuntimeHostProbe = struct {
     fn poll(context: *anyopaque) core.runtime_adapter.api.HostPollResult {
         const self: *RuntimeHostProbe = @ptrCast(@alignCast(context));
         self.polls += 1;
+        if (self.handled_left != 0) {
+            self.handled_left -= 1;
+            return .handled;
+        }
         if (self.close_next) {
             self.close_next = false;
             return .{ .command = .close };
@@ -514,6 +523,356 @@ test "subsystem runtime polls close before the next bounded BASIC slice" {
     try std.testing.expectEqual(before_close, machine.total_instructions);
     try std.testing.expectEqual(@as(u64, 2), runtime.stats.slices);
     try std.testing.expect(runtime.resources_closed);
+}
+
+test "text screen PRINT and interactive INPUT preserve editing and redo semantics" {
+    var program = try compileFixture(fixture_paths.text_input);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runToCompletion(128, 32));
+    const initial_screen = machine.textScreen();
+    try std.testing.expectEqual(@as(u8, 'R'), initial_screen.cell(1, 2).?.character);
+    try std.testing.expectEqual(@as(u8, 14), initial_screen.cell(1, 2).?.foreground);
+    try std.testing.expectEqual(@as(u8, 1), initial_screen.cell(1, 2).?.background);
+    try std.testing.expect(!initial_screen.cursor_visible);
+
+    try feedInput(&machine, "Alix");
+    try std.testing.expect(try machine.enqueueKeyCode(8));
+    try feedInput(&machine, "ce\r");
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runToCompletion(128, 32));
+    try expectString(&machine, "Name$", "Alice");
+
+    try feedInput(&machine, "not-a-number\r");
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runToCompletion(128, 32));
+    var found_redo = false;
+    var row_bytes: [core.text_screen.columns]u8 = undefined;
+    for (0..core.text_screen.rows) |row| {
+        try std.testing.expect(machine.textScreen().copyRow(row, &row_bytes));
+        if (std.mem.indexOf(u8, &row_bytes, "Redo from start") != null) found_redo = true;
+    }
+    try std.testing.expect(found_redo);
+
+    try feedInput(&machine, "3\r");
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runToCompletion(128, 32));
+    try feedInput(&machine, "9.8\r");
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 32));
+    try expectInteger(&machine, "Count", 3);
+    try expectDouble(&machine, "Gravity#", 9.8);
+    try std.testing.expect(machine.textScreen().cursor_visible);
+}
+
+test "INKEY is nonblocking focus-aware and isolated per VM" {
+    const source = "First$ = INKEY$\nSecond$ = INKEY$\nEND\n";
+    var program = try core.compiler.compile(std.testing.allocator, "inkey.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var first = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer first.deinit();
+    var second = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer second.deinit();
+
+    first.setInputFocused(false);
+    try std.testing.expect(!try first.enqueueTextCodepoint('X'));
+    first.setInputFocused(true);
+    try std.testing.expect(try first.enqueueTextCodepoint('A'));
+    try std.testing.expect(try second.enqueueTextCodepoint('B'));
+    try std.testing.expectEqual(core.vm.Status.halted, first.runToCompletion(32, 8));
+    try std.testing.expectEqual(core.vm.Status.halted, second.runToCompletion(32, 8));
+    try expectString(&first, "First$", "A");
+    try expectString(&first, "Second$", "");
+    try expectString(&second, "First$", "B");
+    try expectString(&second, "Second$", "");
+
+    var adapter = core.runtime_adapter.Adapter.init(&first);
+    try std.testing.expect(adapter.handleInput(.{ .focus = .{ .focused = false, .tick = 1 } }));
+    try std.testing.expect(!adapter.handleInput(.{ .text = .{ .codepoint = 'Z', .modifiers = 0, .tick = 2 } }));
+}
+
+test "TIMER SLEEP and RND use injected pause-free guest state" {
+    var program = try compileFixture(fixture_paths.time_random);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    machine.setGuestTime(10 * std.time.ns_per_s);
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runToCompletion(128, 32));
+    const first_value = machine.global("First!").?.single;
+    try expectSingle(&machine, "Held!", first_value);
+    const negative_value = machine.global("NegativeA!").?.single;
+    try expectSingle(&machine, "NegativeB!", negative_value);
+    try expectSingle(&machine, "Before!", 10.0);
+
+    machine.setGuestTime(10 * std.time.ns_per_s + 500 * std.time.ns_per_ms);
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runSlice(128).status);
+    machine.setGuestTime(11 * std.time.ns_per_s);
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 32));
+    try expectSingle(&machine, "After!", 11.0);
+
+    const timer_seed_source = "RANDOMIZE TIMER\nValue! = RND\nEND\n";
+    var seeded_program = try core.compiler.compile(std.testing.allocator, "timer-seed.bas", timer_seed_source);
+    defer seeded_program.deinit();
+    try expectProgramOk(&seeded_program);
+    var early = try core.vm.Vm.init(std.testing.allocator, &seeded_program, .{});
+    defer early.deinit();
+    var late = try core.vm.Vm.init(std.testing.allocator, &seeded_program, .{});
+    defer late.deinit();
+    early.setGuestTime(1 * std.time.ns_per_s);
+    late.setGuestTime(2 * std.time.ns_per_s);
+    try std.testing.expectEqual(core.vm.Status.halted, early.runToCompletion(32, 8));
+    try std.testing.expectEqual(core.vm.Status.halted, late.runToCompletion(32, 8));
+    try std.testing.expect(early.global("Value!").?.single != late.global("Value!").?.single);
+}
+
+test "SLEEP yields cooperatively and a new key interrupts it" {
+    var program = try core.compiler.compile(std.testing.allocator, "sleep.bas", "DEFINT A-Z\nSLEEP 5\nDone = 1\nEND\n");
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    machine.setGuestTime(3 * std.time.ns_per_s);
+    const waiting = machine.runToCompletion(32, 8);
+    try std.testing.expectEqual(core.vm.Status.waiting, waiting);
+    try std.testing.expect(try machine.enqueueTextCodepoint('X'));
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(32, 8));
+    try expectInteger(&machine, "Done", 1);
+}
+
+test "bare RANDOMIZE prompts retries invalid seeds and stays reproducible" {
+    var program = try core.compiler.compile(std.testing.allocator, "randomize.bas", "RANDOMIZE\nValue! = RND\nEND\n");
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var first = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer first.deinit();
+    var second = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer second.deinit();
+
+    for ([_]*core.vm.Vm{ &first, &second }) |machine| {
+        try std.testing.expectEqual(core.vm.Status.waiting, machine.runToCompletion(32, 8));
+        try std.testing.expect(screenContainsText(machine, "Random Number Seed"));
+        try feedInput(machine, "invalid\r");
+        try std.testing.expectEqual(core.vm.Status.waiting, machine.runToCompletion(32, 8));
+        try std.testing.expect(screenContainsText(machine, "Redo from start"));
+        try feedInput(machine, "42\r");
+        try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(32, 8));
+    }
+    try std.testing.expectEqual(first.global("Value!").?.single, second.global("Value!").?.single);
+}
+
+test "runtime guest clock excludes pause time and polls host actions while BASIC waits" {
+    var program = try core.compiler.compile(std.testing.allocator, "pause.bas", "Before! = TIMER\nSLEEP 1\nAfter! = TIMER\nEND\n");
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    var adapter = core.runtime_adapter.Adapter.init(&machine);
+    var host = RuntimeHostProbe{};
+    var runtime = try core.runtime_adapter.api.Runtime.init(.{
+        .slice_budget = 4096,
+        .max_input_events = 8,
+        .max_wait_ticks = 1,
+    }, 1000, 0, null);
+
+    _ = runtime.cycle(0, adapter.driver(), host.driver());
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.status);
+    const slices_before_pause = runtime.stats.slices;
+    runtime.request(.pause, 100, adapter.driver());
+    host.handled_left = 3;
+    _ = runtime.cycle(1000, adapter.driver(), host.driver());
+    try std.testing.expectEqual(core.runtime_adapter.api.LifecycleState.paused, runtime.state);
+    try std.testing.expectEqual(slices_before_pause, runtime.stats.slices);
+    try std.testing.expectEqual(@as(u64, 3), runtime.stats.input_events);
+
+    runtime.request(.resume_running, 5000, adapter.driver());
+    _ = runtime.cycle(5000, adapter.driver(), host.driver());
+    const finished = runtime.cycle(5900, adapter.driver(), host.driver());
+    switch (finished) {
+        .finished => |result| {
+            try std.testing.expectEqual(core.runtime_adapter.api.LifecycleState.completed, result.state);
+            try std.testing.expectEqual(@as(i32, 0), result.exit_code);
+        },
+        .wait => return error.ExpectedCompletedRuntime,
+    }
+    try expectSingle(&machine, "Before!", 0.0);
+    try expectSingle(&machine, "After!", 1.0);
+}
+
+test "CalcDelay and Rest use reproducible bounded guest pacing" {
+    var first_program = try compileFixture(fixture_paths.pacing);
+    defer first_program.deinit();
+    try expectProgramOk(&first_program);
+    var second_program = try compileFixture(fixture_paths.pacing);
+    defer second_program.deinit();
+    try expectProgramOk(&second_program);
+
+    const first = try runPacingProgram(&first_program);
+    const second = try runPacingProgram(&second_program);
+    try std.testing.expectEqual(first.finish_tick, second.finish_tick);
+    try std.testing.expectEqual(first.machine_speed, second.machine_speed);
+    try std.testing.expectApproxEqAbs(first.elapsed, second.elapsed, 0.000001);
+    try std.testing.expect(first.machine_speed >= 450 and first.machine_speed <= 550);
+    try std.testing.expect(first.elapsed >= 0.09 and first.elapsed <= 0.12);
+}
+
+const PacingResult = struct {
+    finish_tick: u64,
+    machine_speed: f32,
+    elapsed: f64,
+};
+
+fn runPacingProgram(program: *const core.bytecode.Program) !PacingResult {
+    var machine = try core.vm.Vm.init(std.testing.allocator, program, .{});
+    defer machine.deinit();
+    var adapter = core.runtime_adapter.Adapter.init(&machine);
+    var host = RuntimeHostProbe{};
+    var runtime = try core.runtime_adapter.api.Runtime.init(.{
+        .slice_budget = 4096,
+        .max_input_events = 4,
+        .max_wait_ticks = 1,
+    }, 1000, 0, null);
+
+    var finish_tick: u64 = 0;
+    for (0..3000) |raw_tick| {
+        const tick: u64 = @intCast(raw_tick);
+        const result = runtime.cycle(tick, adapter.driver(), host.driver());
+        if (result == .finished) {
+            try std.testing.expectEqual(core.runtime_adapter.api.LifecycleState.completed, result.finished.state);
+            finish_tick = tick;
+            break;
+        }
+    }
+    if (finish_tick == 0) return error.PacingProgramDidNotFinish;
+    return .{
+        .finish_tick = finish_tick,
+        .machine_speed = machine.global("MachSpeed").?.single,
+        .elapsed = machine.global("After#").?.double - machine.global("Before#").?.double,
+    };
+}
+
+const MemoryFiles = struct {
+    input: []const u8 = "\"Alice\",3\r\nLine two\r\n",
+    output: std.ArrayList(u8) = .empty,
+    appended: std.ArrayList(u8) = .empty,
+    absolute_output: std.ArrayList(u8) = .empty,
+    reads: u32 = 0,
+    writes: u32 = 0,
+
+    fn deinit(self: *MemoryFiles) void {
+        self.output.deinit(std.testing.allocator);
+        self.appended.deinit(std.testing.allocator);
+        self.absolute_output.deinit(std.testing.allocator);
+    }
+
+    fn read(context: ?*anyopaque, path: []const u8, offset: u32, out: []u8) core.vm.FileReadResult {
+        const self: *MemoryFiles = @ptrCast(@alignCast(context.?));
+        self.reads += 1;
+        if (!std.ascii.eqlIgnoreCase(path, "C:\\GAMES\\input.txt")) return .{ .failure = .not_found };
+        if (offset >= self.input.len) return .end;
+        const count = @min(out.len, self.input.len - offset);
+        @memcpy(out[0..count], self.input[offset..][0..count]);
+        return .{ .bytes = @intCast(count) };
+    }
+
+    fn write(context: ?*anyopaque, path: []const u8, bytes: []const u8, append: bool) core.vm.FileWriteResult {
+        const self: *MemoryFiles = @ptrCast(@alignCast(context.?));
+        self.writes += 1;
+        const target = if (std.ascii.eqlIgnoreCase(path, "C:\\GAMES\\output.txt"))
+            &self.output
+        else if (std.ascii.eqlIgnoreCase(path, "C:\\GAMES\\append.txt"))
+            &self.appended
+        else if (std.ascii.eqlIgnoreCase(path, "C:\\GAMES\\absolute.txt"))
+            &self.absolute_output
+        else
+            return .{ .failure = .path_error };
+        if (!append) target.clearRetainingCapacity();
+        target.appendSlice(std.testing.allocator, bytes) catch return .{ .failure = .too_large };
+        return .ok;
+    }
+};
+
+test "sequential files resolve guest paths and preserve INPUT PRINT and EOF" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, fixture_paths.sequential_files, std.testing.allocator, .limited(256 * 1024));
+    defer std.testing.allocator.free(source);
+    var program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\PROGRAM.BAS", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var files = MemoryFiles{};
+    defer files.deinit();
+    try files.appended.appendSlice(std.testing.allocator, "head\r\n");
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{
+        .file_context = &files,
+        .file_read = MemoryFiles.read,
+        .file_write = MemoryFiles.write,
+    });
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 32));
+    try expectString(&machine, "Name$", "Alice");
+    try expectInteger(&machine, "Score", 3);
+    try expectString(&machine, "Message$", "Line two");
+    try expectInteger(&machine, "AtEnd", -1);
+    try expectString(&machine, "AbsoluteName$", "\"Alice\",3");
+    try std.testing.expectEqualStrings("Alice 3 \r\nLine two", files.output.items);
+    try std.testing.expectEqualStrings("head\r\ntail\r\n", files.appended.items);
+    try std.testing.expectEqualStrings("\"Alice\",3", files.absolute_output.items);
+    try std.testing.expect(files.reads != 0);
+    try std.testing.expect(files.writes >= 4);
+}
+
+test "file modes numbers devices and missing paths fail visibly" {
+    const Case = struct {
+        source: []const u8,
+        expected: core.vm.RuntimeCode,
+        number: i32,
+    };
+    const cases = [_]Case{
+        .{ .source = "OPEN \"input.txt\" FOR INPUT AS #0\nEND\n", .expected = .bad_file_number, .number = 52 },
+        .{ .source = "OPEN \"missing.txt\" FOR INPUT AS #1\nEND\n", .expected = .file_not_found, .number = 53 },
+        .{ .source = "OPEN \"input.txt\" FOR INPUT AS #1\nPRINT #1, \"bad\"\nEND\n", .expected = .bad_file_mode, .number = 54 },
+        .{ .source = "OPEN \"COM1:\" FOR OUTPUT AS #1\nEND\n", .expected = .bad_file_name, .number = 64 },
+    };
+    for (cases) |case| {
+        var program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\NEGATIVE.BAS", case.source);
+        defer program.deinit();
+        try expectProgramOk(&program);
+        var files = MemoryFiles{};
+        defer files.deinit();
+        var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{
+            .file_context = &files,
+            .file_read = MemoryFiles.read,
+            .file_write = MemoryFiles.write,
+        });
+        defer machine.deinit();
+        try std.testing.expectEqual(core.vm.Status.runtime_error, machine.runToCompletion(64, 16));
+        const diagnostic = machine.runtime_diagnostic orelse return error.MissingRuntimeDiagnostic;
+        try std.testing.expectEqual(case.expected, diagnostic.code);
+        try std.testing.expectEqual(case.number, diagnostic.qbasicErrorNumber());
+    }
+
+    var bridge = core.storage_adapter.Adapter.init(undefined);
+    var services = core.vm.HostServices{};
+    bridge.install(&services);
+    try std.testing.expect(services.file_context != null);
+}
+
+fn feedInput(machine: *core.vm.Vm, bytes: []const u8) !void {
+    for (bytes) |byte| {
+        const accepted = switch (byte) {
+            '\r', '\n', 8 => try machine.enqueueKeyCode(byte),
+            else => try machine.enqueueTextCodepoint(byte),
+        };
+        try std.testing.expect(accepted);
+    }
+}
+
+fn screenContainsText(machine: *const core.vm.Vm, needle: []const u8) bool {
+    var row_bytes: [core.text_screen.columns]u8 = undefined;
+    for (0..core.text_screen.rows) |row| {
+        if (!machine.textScreen().copyRow(row, &row_bytes)) return false;
+        if (std.mem.indexOf(u8, &row_bytes, needle) != null) return true;
+    }
+    return false;
 }
 
 fn compileFixture(path: []const u8) !core.bytecode.Program {

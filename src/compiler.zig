@@ -255,6 +255,18 @@ const Builder = struct {
             .resume_ => self.parseResume(),
             .poke => self.parsePoke(),
             .screen => self.parseScreen(),
+            .width => self.parseTextWidth(),
+            .color => self.parseTextColor(),
+            .cls => self.parseTextCls(),
+            .locate => self.parseTextLocate(),
+            .view => self.parseTextView(),
+            .print => self.parsePrintStatement(),
+            .input => self.parseInputStatement(false),
+            .line => self.parseLineStatement(),
+            .randomize => self.parseRandomize(),
+            .sleep => self.parseSleep(),
+            .open => self.parseOpen(),
+            .close => self.parseClose(),
             .return_ => self.parseReturn(),
             .exit => self.parseExit(),
             .end => self.parseEnd(),
@@ -907,6 +919,260 @@ const Builder = struct {
         return true;
     }
 
+    fn parseTextWidth(self: *Builder) !bool {
+        const statement = self.advance();
+        const columns_type = (try self.parseExpression()) orelse return false;
+        if (!columns_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        var count: u32 = 1;
+        if (self.consume(.comma)) {
+            const rows_type = (try self.parseExpression()) orelse return false;
+            if (!rows_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            count = 2;
+        }
+        _ = try self.emit(.text_width, count, 0, statement.span);
+        return true;
+    }
+
+    fn parseTextColor(self: *Builder) !bool {
+        const statement = self.advance();
+        var mask: u32 = 0;
+        var count: u32 = 0;
+        var position: u32 = 0;
+        while (position < 2 and !self.atBoundary() and !self.atKeyword(.else_)) : (position += 1) {
+            if (!self.at(.comma)) {
+                const value_type = (try self.parseExpression()) orelse return false;
+                if (!value_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+                mask |= @as(u32, 1) << @intCast(position);
+                count += 1;
+            }
+            if (!self.consume(.comma)) break;
+        }
+        _ = try self.emit(.text_color, mask, count, statement.span);
+        return true;
+    }
+
+    fn parseTextCls(self: *Builder) !bool {
+        const statement = self.advance();
+        var count: u32 = 0;
+        if (!self.atBoundary() and !self.atKeyword(.else_)) {
+            const mode_type = (try self.parseExpression()) orelse return false;
+            if (!mode_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            count = 1;
+        }
+        _ = try self.emit(.text_cls, count, 0, statement.span);
+        return true;
+    }
+
+    fn parseTextLocate(self: *Builder) !bool {
+        const statement = self.advance();
+        var mask: u32 = 0;
+        var count: u32 = 0;
+        var position: u32 = 0;
+        while (position < 5 and !self.atBoundary() and !self.atKeyword(.else_)) : (position += 1) {
+            if (!self.at(.comma)) {
+                const value_type = (try self.parseExpression()) orelse return false;
+                if (!value_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+                mask |= @as(u32, 1) << @intCast(position);
+                count += 1;
+            }
+            if (!self.consume(.comma)) break;
+        }
+        _ = try self.emit(.text_locate, mask, count, statement.span);
+        return true;
+    }
+
+    fn parseTextView(self: *Builder) !bool {
+        const statement = self.advance();
+        if (!try self.expectKeyword(.print)) return false;
+        if (self.atBoundary() or self.atKeyword(.else_)) {
+            _ = try self.emit(.text_view_print, 0, 0, statement.span);
+            return true;
+        }
+        const top_type = (try self.parseExpression()) orelse return false;
+        if (!top_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        if (!try self.expectKeyword(.to)) return false;
+        const bottom_type = (try self.parseExpression()) orelse return false;
+        if (!bottom_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        _ = try self.emit(.text_view_print, 2, 0, statement.span);
+        return true;
+    }
+
+    fn parsePrintStatement(self: *Builder) !bool {
+        const statement = self.advance();
+        if (self.consume(.hash)) {
+            const file_type = (try self.parseExpression()) orelse return false;
+            if (!file_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            if (!try self.expect(.comma)) return false;
+            _ = try self.emit(.print_begin_file, 0, 0, statement.span);
+        } else {
+            _ = try self.emit(.print_begin_screen, 0, 0, statement.span);
+        }
+
+        var trailing_separator = false;
+        while (!self.atBoundary() and !self.atKeyword(.else_)) {
+            if (self.consume(.semicolon)) {
+                trailing_separator = true;
+                continue;
+            }
+            if (self.consume(.comma)) {
+                _ = try self.emit(.print_comma, 0, 0, statement.span);
+                trailing_separator = true;
+                continue;
+            }
+            if (self.consumeKeyword(.tab)) {
+                if (!try self.expect(.left_paren)) return false;
+                const column_type = (try self.parseExpression()) orelse return false;
+                if (!column_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+                if (!try self.expect(.right_paren)) return false;
+                _ = try self.emit(.print_tab, 0, 0, statement.span);
+                trailing_separator = false;
+                continue;
+            }
+            const value_type = (try self.parseExpression()) orelse return false;
+            _ = value_type;
+            _ = try self.emit(.print_value, 0, 0, statement.span);
+            trailing_separator = false;
+        }
+        if (!trailing_separator) _ = try self.emit(.print_newline, 0, 0, statement.span);
+        _ = try self.emit(.print_end, 0, 0, statement.span);
+        return true;
+    }
+
+    fn parseInputStatement(self: *Builder, line_input: bool) !bool {
+        const statement = self.advance();
+        return self.parseInputBody(statement, line_input);
+    }
+
+    fn parseLineStatement(self: *Builder) !bool {
+        const statement = self.advance();
+        if (self.consumeKeyword(.input)) return self.parseInputBody(statement, true);
+        while (!self.atBoundary() and !self.atKeyword(.else_)) _ = self.advance();
+        _ = try self.emit(.deferred_statement, @intFromEnum(frontend.Keyword.line), 0, statement.span);
+        return true;
+    }
+
+    fn parseInputBody(self: *Builder, statement: frontend.Token, line_input: bool) !bool {
+        const keep_same_line = self.consume(.semicolon);
+        if (self.consume(.hash)) {
+            const file_type = (try self.parseExpression()) orelse return false;
+            if (!file_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            if (!try self.expect(.comma)) return false;
+            const count = try self.parseInputTargets(statement.span, line_input);
+            if (count == 0) return false;
+            _ = try self.emit(.input_file, count, @intFromBool(line_input), statement.span);
+            return true;
+        }
+
+        var has_prompt = false;
+        if (self.at(.string)) {
+            _ = try self.emit(.print_begin_screen, 0, 0, statement.span);
+            const prompt_type = (try self.parseExpression()) orelse return false;
+            if (prompt_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+            _ = try self.emit(.print_value, 0, 0, statement.span);
+            const question = if (self.consume(.semicolon))
+                !line_input
+            else if (self.consume(.comma))
+                false
+            else
+                return self.fail(.expected_token);
+            if (question) _ = try self.emit(.print_question, 0, 0, statement.span);
+            _ = try self.emit(.print_end, 0, 0, statement.span);
+            has_prompt = true;
+        }
+        if (!has_prompt and !line_input) {
+            _ = try self.emit(.print_begin_screen, 0, 0, statement.span);
+            _ = try self.emit(.print_question, 0, 0, statement.span);
+            _ = try self.emit(.print_end, 0, 0, statement.span);
+        }
+
+        const count = try self.parseInputTargets(statement.span, line_input);
+        if (count == 0) return false;
+        const flags = @as(u32, @intFromBool(line_input)) | (@as(u32, @intFromBool(keep_same_line)) << 1);
+        _ = try self.emit(.input_console, count, flags, statement.span);
+        return true;
+    }
+
+    fn parseInputTargets(self: *Builder, span: frontend.Span, line_input: bool) !u32 {
+        var count: u32 = 0;
+        while (true) {
+            const name = (try self.expectIdentifier()) orelse return 0;
+            const target = (try self.parseLvalueReference(name, true)) orelse return 0;
+            if (target.is_whole_array or target.record_type != bytecode.invalid_index) {
+                try self.addDiagnostic(.invalid_record_access, name.span);
+                return 0;
+            }
+            if (line_input and target.value_type != .string) try self.addDiagnostic(.type_mismatch, span);
+            count += 1;
+            if (!self.consume(.comma)) break;
+            if (line_input) {
+                try self.addDiagnostic(.wrong_argument_count, span);
+                return 0;
+            }
+        }
+        return count;
+    }
+
+    fn parseRandomize(self: *Builder) !bool {
+        const statement = self.advance();
+        var count: u32 = 0;
+        if (!self.atBoundary() and !self.atKeyword(.else_)) {
+            const seed_type = (try self.parseExpression()) orelse return false;
+            if (!seed_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            count = 1;
+        }
+        _ = try self.emit(.randomize, count, 0, statement.span);
+        return true;
+    }
+
+    fn parseSleep(self: *Builder) !bool {
+        const statement = self.advance();
+        var count: u32 = 0;
+        if (!self.atBoundary() and !self.atKeyword(.else_)) {
+            const seconds_type = (try self.parseExpression()) orelse return false;
+            if (!seconds_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            count = 1;
+        }
+        _ = try self.emit(.sleep, count, 0, statement.span);
+        return true;
+    }
+
+    fn parseOpen(self: *Builder) !bool {
+        const statement = self.advance();
+        const path_type = (try self.parseExpression()) orelse return false;
+        if (path_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+        if (!try self.expectKeyword(.for_)) return false;
+        const mode: bytecode.FileMode = if (self.consumeKeyword(.input))
+            .input
+        else if (self.consumeKeyword(.output))
+            .output
+        else if (self.consumeKeyword(.append))
+            .append
+        else
+            return self.fail(.unsupported_core_feature);
+        if (!try self.expectKeyword(.as)) return false;
+        if (!try self.expect(.hash)) return false;
+        const file_type = (try self.parseExpression()) orelse return false;
+        if (!file_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        _ = try self.emit(.file_open, @intFromEnum(mode), 0, statement.span);
+        return true;
+    }
+
+    fn parseClose(self: *Builder) !bool {
+        const statement = self.advance();
+        var count: u32 = 0;
+        if (!self.atBoundary() and !self.atKeyword(.else_)) {
+            while (true) {
+                if (!try self.expect(.hash)) return false;
+                const file_type = (try self.parseExpression()) orelse return false;
+                if (!file_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+                count += 1;
+                if (!self.consume(.comma)) break;
+            }
+        }
+        _ = try self.emit(.file_close, count, 0, statement.span);
+        return true;
+    }
+
     fn parseDeferredStatement(self: *Builder) !bool {
         const statement = self.advance();
         while (!self.atBoundary() and !self.atKeyword(.else_)) _ = self.advance();
@@ -1548,7 +1814,7 @@ const Builder = struct {
         const result_type = try self.validateBuiltin(builtin, argument_types[0..argument_count], function_token.span) orelse return null;
         switch (builtin) {
             .peek => _ = try self.emit(.peek, 0, 0, function_token.span),
-            .eof, .inkey_string, .point, .rnd, .timer => _ = try self.emit(.deferred_builtin, @intFromEnum(builtin), @intCast(argument_count), function_token.span),
+            .point => _ = try self.emit(.deferred_builtin, @intFromEnum(builtin), @intCast(argument_count), function_token.span),
             else => _ = try self.emit(.call_builtin, @intFromEnum(builtin), @intCast(argument_count), function_token.span),
         }
         return result_type;

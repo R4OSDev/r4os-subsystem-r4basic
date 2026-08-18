@@ -14,6 +14,10 @@ Primaere Sprachreferenz:
 - Fuer VM-Vertrag 1.1 wurden die Abschnitte zu DIM, REDIM, TYPE, DATA,
   READ, RESTORE, DECLARE/AS ANY, ON ERROR, RESUME, DEF SEG, PEEK und POKE
   unmittelbar aus der lokalen Language-Reference-Arbeitskopie ausgewertet.
+- Fuer VM-Vertrag 1.2 wurden die Abschnitte zu SCREEN, WIDTH, COLOR, CLS,
+  LOCATE, VIEW PRINT, PRINT/PRINT#, INPUT/INPUT#, LINE INPUT/LINE INPUT#,
+  INKEY$, TIMER, SLEEP, RANDOMIZE, RND, OPEN, CLOSE und EOF unmittelbar aus
+  derselben lokalen Language-Reference-Arbeitskopie ausgewertet.
 - Daraus uebernommen wurden ausschliesslich Sprachsemantik und Grenzen;
   Parser-, Speicher-, Alias-, Bytecode- und Fehlerflusscode sind eine neue
   eigenstaendige R4OS-Implementierung.
@@ -33,6 +37,7 @@ Sekundaerer Architekturvergleich:
 
 Permanenter Testbestand:
 - Alle Dateien unter Tests/Fixtures sind neue, originale R4OS-Testprogramme,
-  einschliesslich der Aggregate-, Fehlerfluss- und Speichergrenzfixtures.
+  einschliesslich der Aggregate-, Fehlerfluss-, Speichergrenz-, Text-,
+  Eingabe-, Zeit-, Zufalls-, Pacing- und Dateifixtures.
 - Sie enthalten weder Quellzeilen noch Datenbloecke der lokalen
   Realprogrammabnahme.
