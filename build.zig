@@ -42,7 +42,7 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = .Debug,
     });
-    gorilla_module.addImport("frontend", frontend_module);
+    gorilla_module.addImport("core", core_module);
     const gorilla_tests = b.addTest(.{ .root_module = gorilla_module });
     const run_gorilla_tests = b.addRunArtifact(gorilla_tests);
 

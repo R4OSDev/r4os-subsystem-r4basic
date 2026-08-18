@@ -1,0 +1,8 @@
+DEFINT A-Z
+
+DEF SEG = 0
+Original = PEEK(1047)
+POKE 1047, Original OR 32
+Enabled = PEEK(1047)
+DEF SEG
+END

@@ -1,5 +1,6 @@
 const std = @import("std");
-const frontend = @import("frontend");
+const core = @import("core");
+const frontend = core.frontend;
 
 const canonical_path = "../../../Artifacts/Distribution/Injection/Temp/gorilla.bas";
 const canonical_size: usize = 29_434;
@@ -35,4 +36,22 @@ test "canonical local GORILLA.BAS tokenizes and parses unchanged" {
         }
     }
     try std.testing.expect(result.ok());
+
+    var program = try core.compiler.compile(allocator, canonical_path, source);
+    defer program.deinit();
+    if (!program.ok()) {
+        for (program.diagnostics) |diagnostic| {
+            std.debug.print("{s}:{d}:{d}: {s}: {s}\n", .{
+                diagnostic.file_name,
+                diagnostic.span.line,
+                diagnostic.span.column,
+                @tagName(diagnostic.code),
+                diagnostic.span.bytes(program.source),
+            });
+        }
+    }
+    try std.testing.expect(program.ok());
+    try std.testing.expect(program.instructions.len != 0);
+    try std.testing.expect(program.record_types.len != 0);
+    try std.testing.expect(program.data_items.len != 0);
 }

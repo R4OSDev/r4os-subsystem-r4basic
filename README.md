@@ -4,20 +4,21 @@ R4BASIC is the QBasic-compatible subsystem host for R4OS. It is a normal GUI
 R4X module with the subsystem identity `r4os.basic` and the guest format
 `basic.qbasic-source`.
 
-The current core release keeps the versioned R4BASIC v1 source contract and
-adds a one-time compiler, typed bytecode program, and cooperative virtual
-machine for its first executable subset. Expressions, scalar values,
-control flow, procedures, functions, and the required math and byte-string
-built-ins now execute without reparsing loop bodies.
+The current release keeps the versioned R4BASIC v1 source contract and adds
+the QBasic aggregate and error model to the one-time compiler and cooperative
+VM. Fixed and dynamic arrays, user-defined records, DATA, aggregate ByRef,
+statement-accurate error continuation, and the private NumLock compatibility
+byte now execute without reparsing source text.
 
 The installed R4X does not load a guest file or open its final BASIC window
-yet. Arrays, records, data statements, text I/O, time, random numbers, files,
-graphics, and audio remain separate later layers.
+yet. Text I/O, time, random numbers, files, graphics, and audio remain
+separate later layers. Their already accepted source forms compile to visible
+deferred host guards rather than silently doing nothing.
 
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `0.2.0`
+- Module version: `0.3.0`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -41,9 +42,11 @@ file documented in `COMPATIBILITY.md`:
 
     Build.bat gorilla-test
 
-That file is not part of this repository and is never downloaded by the
-build. The normal public test step uses only original, redistributable BAS
-fixtures under `Tests/Fixtures`.
+That step verifies and parses the unchanged file, then binds its complete
+data and procedure structure into the same typed instruction program. The
+file is not part of this repository and is never downloaded by the build.
+The normal public test step uses only original, redistributable BAS fixtures
+under `Tests/Fixtures`.
 
 The build starters map the current local R4OS SDK and Contract checkouts from
 `Settings.R4S`. The URL and hash in `build.zig.zon` record the last verified

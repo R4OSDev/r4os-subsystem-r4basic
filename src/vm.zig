@@ -3,11 +3,12 @@ const bytecode = @import("bytecode.zig");
 const frontend = @import("frontend.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "1.0.0";
+pub const contract_version = "1.1.0";
 pub const default_instruction_budget: u32 = 4096;
 pub const maximum_value_stack: usize = 16_384;
 pub const maximum_call_depth: usize = 256;
 pub const maximum_gosub_depth: usize = 1024;
+pub const maximum_array_elements: usize = 16 * 1024 * 1024;
 
 pub const MathOperation = enum(u8) {
     atn,
@@ -17,10 +18,12 @@ pub const MathOperation = enum(u8) {
 };
 
 pub const HostMathError = error{MathFault};
+pub const ScreenModeError = error{ModeUnavailable};
 
 pub const HostServices = struct {
     context: ?*anyopaque = null,
     math: *const fn (?*anyopaque, MathOperation, f64, f64) HostMathError!f64 = defaultMath,
+    screen_mode: *const fn (?*anyopaque, i32) ScreenModeError!void = acceptScreenMode,
     should_cancel: *const fn (?*anyopaque) bool = neverCancel,
 };
 
@@ -36,6 +39,11 @@ pub const RuntimeCode = enum(u8) {
     gosub_without_return,
     invalid_instruction,
     host_failure,
+    subscript_out_of_range,
+    array_already_dimensioned,
+    out_of_data,
+    resume_without_error,
+    restricted_memory,
 };
 
 pub const RuntimeDiagnostic = struct {
@@ -46,11 +54,15 @@ pub const RuntimeDiagnostic = struct {
 
     pub fn qbasicErrorNumber(self: RuntimeDiagnostic) i32 {
         return switch (self.code) {
-            .illegal_function_call => 5,
+            .illegal_function_call, .restricted_memory => 5,
             .overflow => 6,
             .out_of_memory => 7,
             .division_by_zero => 11,
             .type_mismatch => 13,
+            .subscript_out_of_range => 9,
+            .array_already_dimensioned => 10,
+            .out_of_data => 4,
+            .resume_without_error => 20,
             .stack_overflow, .stack_underflow, .call_depth_exceeded, .gosub_without_return, .invalid_instruction, .host_failure => 70,
         };
     }
@@ -81,22 +93,69 @@ const ExecutionError = values.Fault || error{
     GosubWithoutReturn,
     InvalidInstruction,
     HostFailure,
+    SubscriptOutOfRange,
+    ArrayAlreadyDimensioned,
+    OutOfData,
+    ResumeWithoutError,
+    RestrictedMemory,
+    Rethrow,
 };
 
-const Location = struct {
-    frame: u32,
-    index: u32,
+pub const Dimension = struct {
+    lower: i32,
+    upper: i32,
+    stride: usize,
 };
 
-const global_frame = bytecode.invalid_index;
+const ArrayValue = struct {
+    value_type: bytecode.ValueType,
+    record_type: u32,
+    expected_dimensions: u8,
+    is_dynamic: bool,
+    dimensions: []Dimension,
+    elements: []Cell,
+
+    fn deinit(self: *ArrayValue, allocator: std.mem.Allocator) void {
+        for (self.elements) |*element| element.deinit(allocator);
+        allocator.free(self.elements);
+        allocator.free(self.dimensions);
+        self.* = undefined;
+    }
+};
+
+const RecordValue = struct {
+    record_type: u32,
+    fields: []Cell,
+
+    fn deinit(self: *RecordValue, allocator: std.mem.Allocator) void {
+        for (self.fields) |*field| field.deinit(allocator);
+        allocator.free(self.fields);
+        self.* = undefined;
+    }
+};
+
+const OwnedValue = union(enum) {
+    scalar: values.Value,
+    array: ArrayValue,
+    record: RecordValue,
+
+    fn deinit(self: *OwnedValue, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .scalar => |*scalar| scalar.deinit(allocator),
+            .array => |*array| array.deinit(allocator),
+            .record => |*record| record.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
 
 const Cell = union(enum) {
-    owned: values.Value,
-    alias: Location,
+    owned: OwnedValue,
+    alias: *Cell,
 
     fn deinit(self: *Cell, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .owned => |*value| value.deinit(allocator),
+            .owned => |*owned| owned.deinit(allocator),
             .alias => {},
         }
         self.* = undefined;
@@ -107,6 +166,10 @@ const Frame = struct {
     procedure_id: u32,
     return_ip: u32,
     stack_base: usize,
+    call_resume_ip: u32,
+    call_resume_next: u32,
+    error_handler_ip: u32 = bytecode.invalid_index,
+    error_handler_active: bool = false,
     locals: []Cell,
 
     fn deinit(self: *Frame, allocator: std.mem.Allocator) void {
@@ -118,7 +181,7 @@ const Frame = struct {
 
 const StackItem = union(enum) {
     value: values.Value,
-    reference: Location,
+    reference: *Cell,
 
     fn deinit(self: *StackItem, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -134,11 +197,26 @@ const GosubEntry = struct {
     frame_depth: usize,
 };
 
+const ActiveError = struct {
+    diagnostic: RuntimeDiagnostic,
+    resume_ip: u32,
+    resume_next_ip: u32,
+    handler_frame: u32,
+};
+
+const ResumeMode = enum {
+    retry,
+    next,
+    label,
+};
+
+const module_frame = bytecode.invalid_index;
+
 pub const Vm = struct {
     allocator: std.mem.Allocator,
     program: *const bytecode.Program,
     host: HostServices,
-    globals: []values.Value,
+    globals: []Cell,
     stack: std.ArrayList(StackItem) = .empty,
     frames: std.ArrayList(Frame) = .empty,
     gosub_stack: std.ArrayList(GosubEntry) = .empty,
@@ -147,6 +225,15 @@ pub const Vm = struct {
     status: Status = .ready,
     exit_code: i32 = 0,
     runtime_diagnostic: ?RuntimeDiagnostic = null,
+    trapped_diagnostic: ?RuntimeDiagnostic = null,
+    active_error: ?ActiveError = null,
+    module_error_handler_ip: u32 = bytecode.invalid_index,
+    module_error_handler_active: bool = false,
+    data_pointer: usize = 0,
+    compatibility_segment_zero: bool = false,
+    virtual_bios_byte: u8 = 0,
+    statement_stack_base: usize = 0,
+    current_statement_start: u32 = bytecode.invalid_index,
     cancel_requested: bool = false,
 
     pub fn init(
@@ -199,6 +286,15 @@ pub const Vm = struct {
         self.status = .ready;
         self.exit_code = 0;
         self.runtime_diagnostic = null;
+        self.trapped_diagnostic = null;
+        self.active_error = null;
+        self.module_error_handler_ip = bytecode.invalid_index;
+        self.module_error_handler_active = false;
+        self.data_pointer = 0;
+        self.compatibility_segment_zero = false;
+        self.virtual_bios_byte = 0;
+        self.statement_stack_base = 0;
+        self.current_statement_start = bytecode.invalid_index;
         self.cancel_requested = false;
     }
 
@@ -226,9 +322,27 @@ pub const Vm = struct {
 
             const instruction_index = self.instruction_pointer;
             const instruction = self.program.instructions[instruction_index];
+            const statement_start = if (instruction.statement_start == bytecode.invalid_index) instruction_index else instruction.statement_start;
+            if (self.current_statement_start != statement_start) {
+                self.current_statement_start = statement_start;
+                self.statement_stack_base = self.stack.items.len;
+            }
             self.instruction_pointer += 1;
             self.execute(instruction) catch |fault| {
-                self.recordError(runtimeCode(fault), instruction_index);
+                const code = if (fault == error.Rethrow and self.active_error != null)
+                    self.active_error.?.diagnostic.code
+                else
+                    runtimeCode(fault);
+                if (fault != error.Rethrow and self.trapError(code, instruction_index, instruction)) {
+                    executed += 1;
+                    self.total_instructions += 1;
+                    continue;
+                }
+                if (fault == error.Rethrow and self.active_error != null) {
+                    self.recordDiagnostic(self.active_error.?.diagnostic);
+                } else {
+                    self.recordError(code, instruction_index);
+                }
                 return .{ .status = self.status, .instructions = executed };
             };
             executed += 1;
@@ -251,7 +365,68 @@ pub const Vm = struct {
     pub fn global(self: *const Vm, name: []const u8) ?*const values.Value {
         for (self.program.globals, 0..) |variable, index| {
             if (variable.hidden) continue;
-            if (std.ascii.eqlIgnoreCase(variable.name.bytes(self.program.source), name)) return &self.globals[index];
+            if (std.ascii.eqlIgnoreCase(variable.name.bytes(self.program.source), name)) {
+                const cell = resolveCellConst(&self.globals[index]) orelse return null;
+                return switch (cell.owned) {
+                    .scalar => |*scalar| scalar,
+                    else => null,
+                };
+            }
+        }
+        return null;
+    }
+
+    pub fn globalArrayElement(self: *const Vm, name: []const u8, indices: []const i32) ?*const values.Value {
+        const root = self.globalCell(name) orelse return null;
+        const array = switch (root.owned) {
+            .array => |*value| value,
+            else => return null,
+        };
+        const element = arrayElementConst(array, indices) orelse return null;
+        return switch (element.owned) {
+            .scalar => |*scalar| scalar,
+            else => null,
+        };
+    }
+
+    pub fn globalArrayRecordField(
+        self: *const Vm,
+        name: []const u8,
+        indices: []const i32,
+        field_name: []const u8,
+    ) ?*const values.Value {
+        const root = self.globalCell(name) orelse return null;
+        const array = switch (root.owned) {
+            .array => |*value| value,
+            else => return null,
+        };
+        const element = arrayElementConst(array, indices) orelse return null;
+        const record = switch (element.owned) {
+            .record => |*value| value,
+            else => return null,
+        };
+        const record_type = self.program.record_types[record.record_type];
+        for (record_type.fields, 0..) |field, field_index| {
+            if (std.ascii.eqlIgnoreCase(field.name.bytes(self.program.source), field_name)) {
+                const field_cell = resolveCellConst(&record.fields[field_index]) orelse return null;
+                return switch (field_cell.owned) {
+                    .scalar => |*scalar| scalar,
+                    else => null,
+                };
+            }
+        }
+        return null;
+    }
+
+    pub fn virtualNumLockByte(self: *const Vm) u8 {
+        return self.virtual_bios_byte;
+    }
+
+    fn globalCell(self: *const Vm, name: []const u8) ?*const Cell {
+        for (self.program.globals, 0..) |variable, index| {
+            if (!variable.hidden and std.ascii.eqlIgnoreCase(variable.name.bytes(self.program.source), name)) {
+                return resolveCellConst(&self.globals[index]);
+            }
         }
         return null;
     }
@@ -275,12 +450,32 @@ pub const Vm = struct {
                 self.program.constants[instruction.a],
                 self.program.source,
             )),
-            .load_global => try self.load(.{ .frame = global_frame, .index = instruction.a }),
-            .load_local => try self.load(try self.localLocation(instruction.a)),
-            .store_global, .initialize_global => try self.store(.{ .frame = global_frame, .index = instruction.a }, bytecode.decodeValueType(instruction.b)),
-            .store_local, .initialize_local => try self.store(try self.localLocation(instruction.a), bytecode.decodeValueType(instruction.b)),
-            .push_global_reference => try self.pushReference(.{ .frame = global_frame, .index = instruction.a }),
-            .push_local_reference => try self.pushReference(try self.localLocation(instruction.a)),
+            .load_global => try self.load(try self.globalCellAt(instruction.a)),
+            .load_local => try self.load(try self.localCellAt(instruction.a)),
+            .store_global, .initialize_global => try self.store(try self.globalCellAt(instruction.a), bytecode.decodeValueType(instruction.b)),
+            .store_local, .initialize_local => try self.store(try self.localCellAt(instruction.a), bytecode.decodeValueType(instruction.b)),
+            .push_global_reference => try self.pushReference(try self.globalCellAt(instruction.a)),
+            .push_local_reference => try self.pushReference(try self.localCellAt(instruction.a)),
+            .array_default_lower => try self.arrayDefaultLower(),
+            .select_array_element => try self.selectArrayElement(instruction.a),
+            .select_record_field => try self.selectRecordField(instruction.a),
+            .load_reference => try self.load(try self.popReference()),
+            .store_reference => try self.storeReference(bytecode.decodeValueType(instruction.a)),
+            .dimension => try self.dimensionArray(instruction.a, false),
+            .redimension => try self.dimensionArray(instruction.a, true),
+            .read_data => try self.readData(bytecode.decodeValueType(instruction.a)),
+            .restore_data => self.data_pointer = instruction.a,
+            .set_error_handler => try self.setErrorHandler(instruction.a),
+            .resume_error => try self.resumeError(.retry, 0),
+            .resume_next => try self.resumeError(.next, 0),
+            .resume_label => try self.resumeError(.label, instruction.a),
+            .set_segment => try self.setSegment(),
+            .reset_segment => self.compatibility_segment_zero = false,
+            .peek => try self.peek(),
+            .poke => try self.poke(),
+            .screen_mode_probe => try self.screenModeProbe(),
+            .deferred_statement => return error.HostFailure,
+            .deferred_builtin => try self.deferredBuiltin(instruction.b),
             .convert => try self.convertTop(bytecode.decodeValueType(instruction.a)),
             .negate => try self.unaryNegate(bytecode.decodeValueType(instruction.a)),
             .logical_not => try self.unaryLogicalNot(),
@@ -301,7 +496,7 @@ pub const Vm = struct {
             .compare_greater => try self.comparison(.greater),
             .compare_greater_equal => try self.comparison(.greater_equal),
             .call_builtin => try self.callBuiltin(@enumFromInt(@as(u8, @intCast(instruction.a))), instruction.b),
-            .call => try self.callProcedure(instruction.a, instruction.b),
+            .call => try self.callProcedure(instruction.a, instruction.b, instruction),
             .return_procedure => try self.returnProcedure(),
             .jump => self.instruction_pointer = instruction.a,
             .jump_if_false => {
@@ -323,19 +518,283 @@ pub const Vm = struct {
         }
     }
 
-    fn load(self: *Vm, location: Location) ExecutionError!void {
-        const value = try self.valueAt(location);
+    fn load(self: *Vm, cell: *Cell) ExecutionError!void {
+        const value = try scalarAt(cell);
         try self.pushValue(try value.clone(self.allocator));
     }
 
-    fn store(self: *Vm, location: Location, target: bytecode.ValueType) ExecutionError!void {
+    fn store(self: *Vm, cell: *Cell, target: bytecode.ValueType) ExecutionError!void {
         var incoming = try self.popValue();
         defer incoming.deinit(self.allocator);
         var converted = try values.convert(self.allocator, incoming, target);
         errdefer converted.deinit(self.allocator);
-        const destination = try self.valueAtMutable(location);
+        const destination = try scalarAtMutable(cell);
         destination.deinit(self.allocator);
         destination.* = converted;
+    }
+
+    fn storeReference(self: *Vm, target: bytecode.ValueType) ExecutionError!void {
+        var incoming = try self.popValue();
+        defer incoming.deinit(self.allocator);
+        const cell = try self.popReference();
+        var converted = try values.convert(self.allocator, incoming, target);
+        errdefer converted.deinit(self.allocator);
+        const destination = try scalarAtMutable(cell);
+        destination.deinit(self.allocator);
+        destination.* = converted;
+    }
+
+    fn arrayDefaultLower(self: *Vm) ExecutionError!void {
+        var upper = try self.popValue();
+        self.pushValue(.{ .integer = 0 }) catch |fault| {
+            upper.deinit(self.allocator);
+            return fault;
+        };
+        try self.pushValue(upper);
+    }
+
+    fn selectArrayElement(self: *Vm, dimension_count: u32) ExecutionError!void {
+        if (dimension_count == 0 or dimension_count > bytecode.unknown_dimensions) return error.InvalidInstruction;
+        var indices: [60]i32 = undefined;
+        if (dimension_count > indices.len) return error.InvalidInstruction;
+        var remaining: usize = @intCast(dimension_count);
+        while (remaining != 0) {
+            var index_value = try self.popValue();
+            defer index_value.deinit(self.allocator);
+            remaining -= 1;
+            indices[remaining] = try values.asLong(index_value);
+        }
+        const root = resolveCell(try self.popReference()) orelse return error.InvalidInstruction;
+        const array = switch (root.owned) {
+            .array => |*value| value,
+            else => return error.TypeMismatch,
+        };
+        const element = arrayElement(array, indices[0..dimension_count]) orelse return error.SubscriptOutOfRange;
+        try self.pushReference(element);
+    }
+
+    fn selectRecordField(self: *Vm, field_index: u32) ExecutionError!void {
+        const root = resolveCell(try self.popReference()) orelse return error.InvalidInstruction;
+        const record = switch (root.owned) {
+            .record => |*value| value,
+            else => return error.TypeMismatch,
+        };
+        if (field_index >= record.fields.len) return error.InvalidInstruction;
+        try self.pushReference(&record.fields[field_index]);
+    }
+
+    fn dimensionArray(self: *Vm, dimension_count: u32, redimension: bool) ExecutionError!void {
+        if (dimension_count == 0 or dimension_count > 60) return error.InvalidInstruction;
+        const root = resolveCell(try self.popReference()) orelse return error.InvalidInstruction;
+        const array = switch (root.owned) {
+            .array => |*value| value,
+            else => return error.TypeMismatch,
+        };
+        if (array.expected_dimensions != bytecode.unknown_dimensions and array.expected_dimensions != dimension_count) {
+            return error.SubscriptOutOfRange;
+        }
+        if (redimension and !array.is_dynamic) return error.IllegalFunctionCall;
+        if (!redimension and array.dimensions.len != 0) return error.ArrayAlreadyDimensioned;
+
+        var lowers: [60]i32 = undefined;
+        var uppers: [60]i32 = undefined;
+        var remaining: usize = @intCast(dimension_count);
+        while (remaining != 0) {
+            var upper_value = try self.popValue();
+            defer upper_value.deinit(self.allocator);
+            var lower_value = try self.popValue();
+            defer lower_value.deinit(self.allocator);
+            remaining -= 1;
+            const lower = try values.asLong(lower_value);
+            const upper = try values.asLong(upper_value);
+            if (lower < std.math.minInt(i16) or lower > std.math.maxInt(i16) or
+                upper < std.math.minInt(i16) or upper > std.math.maxInt(i16) or lower > upper)
+            {
+                return error.SubscriptOutOfRange;
+            }
+            lowers[remaining] = lower;
+            uppers[remaining] = upper;
+        }
+        try self.resizeArray(array, lowers[0..dimension_count], uppers[0..dimension_count]);
+    }
+
+    fn resizeArray(self: *Vm, array: *ArrayValue, lowers: []const i32, uppers: []const i32) ExecutionError!void {
+        const dimensions = try self.allocator.alloc(Dimension, lowers.len);
+        errdefer self.allocator.free(dimensions);
+        var total: usize = 1;
+        var reverse = lowers.len;
+        while (reverse != 0) {
+            reverse -= 1;
+            const length: usize = @intCast(uppers[reverse] - lowers[reverse] + 1);
+            if (length != 0 and total > maximum_array_elements / length) return error.OutOfMemory;
+            dimensions[reverse] = .{ .lower = lowers[reverse], .upper = uppers[reverse], .stride = total };
+            total *= length;
+        }
+        if (total > maximum_array_elements) return error.OutOfMemory;
+        const elements = try self.allocator.alloc(Cell, total);
+        var initialized: usize = 0;
+        errdefer {
+            for (elements[0..initialized]) |*element| element.deinit(self.allocator);
+            self.allocator.free(elements);
+        }
+        for (elements) |*element| {
+            element.* = try allocateElement(self.allocator, self.program, array.value_type, array.record_type);
+            initialized += 1;
+        }
+
+        for (array.elements) |*element| element.deinit(self.allocator);
+        self.allocator.free(array.elements);
+        self.allocator.free(array.dimensions);
+        array.elements = elements;
+        array.dimensions = dimensions;
+    }
+
+    fn readData(self: *Vm, target: bytecode.ValueType) ExecutionError!void {
+        const destination = try self.popReference();
+        if (self.data_pointer >= self.program.data_items.len) return error.OutOfData;
+        var converted = try dataValue(self.allocator, self.program.data_items[self.data_pointer], self.program.source, target);
+        errdefer converted.deinit(self.allocator);
+        const scalar = try scalarAtMutable(destination);
+        scalar.deinit(self.allocator);
+        scalar.* = converted;
+        self.data_pointer += 1;
+    }
+
+    fn setErrorHandler(self: *Vm, target: u32) ExecutionError!void {
+        if (target != bytecode.invalid_index and target >= self.program.instructions.len) return error.InvalidInstruction;
+        const frame_id: u32 = if (self.frames.items.len == 0) module_frame else @intCast(self.frames.items.len - 1);
+        if (target == bytecode.invalid_index and self.active_error != null and self.active_error.?.handler_frame == frame_id) {
+            return error.Rethrow;
+        }
+        if (frame_id == module_frame) {
+            self.module_error_handler_ip = target;
+            self.module_error_handler_active = false;
+        } else {
+            self.frames.items[frame_id].error_handler_ip = target;
+            self.frames.items[frame_id].error_handler_active = false;
+        }
+    }
+
+    fn resumeError(self: *Vm, mode: ResumeMode, label: u32) ExecutionError!void {
+        const active = self.active_error orelse return error.ResumeWithoutError;
+        if (active.handler_frame == module_frame) {
+            self.module_error_handler_active = false;
+        } else {
+            if (active.handler_frame >= self.frames.items.len) return error.InvalidInstruction;
+            self.frames.items[active.handler_frame].error_handler_active = false;
+        }
+        self.instruction_pointer = switch (mode) {
+            .retry => active.resume_ip,
+            .next => active.resume_next_ip,
+            .label => label,
+        };
+        if (self.instruction_pointer >= self.program.instructions.len) return error.InvalidInstruction;
+        self.active_error = null;
+        self.current_statement_start = bytecode.invalid_index;
+        self.statement_stack_base = self.stack.items.len;
+    }
+
+    fn trapError(self: *Vm, code: RuntimeCode, instruction_index: u32, instruction: bytecode.Instruction) bool {
+        if (!isCatchable(code)) return false;
+        var handler_frame: u32 = module_frame;
+        var handler_ip: u32 = bytecode.invalid_index;
+        var search = self.frames.items.len;
+        while (search != 0) {
+            search -= 1;
+            const frame = self.frames.items[search];
+            if (frame.error_handler_ip != bytecode.invalid_index and !frame.error_handler_active) {
+                handler_frame = @intCast(search);
+                handler_ip = frame.error_handler_ip;
+                break;
+            }
+        }
+        if (handler_ip == bytecode.invalid_index and
+            self.module_error_handler_ip != bytecode.invalid_index and !self.module_error_handler_active)
+        {
+            handler_frame = module_frame;
+            handler_ip = self.module_error_handler_ip;
+        }
+        if (handler_ip == bytecode.invalid_index) return false;
+
+        var resume_ip = if (instruction.statement_start == bytecode.invalid_index) instruction_index else instruction.statement_start;
+        var resume_next_ip = if (instruction.statement_next == bytecode.invalid_index) self.instruction_pointer else instruction.statement_next;
+        const keep_frames: usize = if (handler_frame == module_frame) 0 else @as(usize, handler_frame) + 1;
+        if (self.frames.items.len > keep_frames) {
+            const child = self.frames.items[keep_frames];
+            resume_ip = child.call_resume_ip;
+            resume_next_ip = child.call_resume_next;
+        }
+
+        self.discardStackFrom(@min(self.statement_stack_base, self.stack.items.len));
+        while (self.frames.items.len > keep_frames) {
+            var frame = self.frames.pop().?;
+            self.discardStackFrom(@min(frame.stack_base, self.stack.items.len));
+            frame.deinit(self.allocator);
+        }
+        while (self.gosub_stack.items.len != 0 and self.gosub_stack.items[self.gosub_stack.items.len - 1].frame_depth > keep_frames) {
+            _ = self.gosub_stack.pop();
+        }
+
+        const diagnostic = self.makeDiagnostic(code, instruction_index);
+        self.trapped_diagnostic = diagnostic;
+        self.active_error = .{
+            .diagnostic = diagnostic,
+            .resume_ip = resume_ip,
+            .resume_next_ip = resume_next_ip,
+            .handler_frame = handler_frame,
+        };
+        if (handler_frame == module_frame) {
+            self.module_error_handler_active = true;
+        } else {
+            self.frames.items[handler_frame].error_handler_active = true;
+        }
+        self.instruction_pointer = handler_ip;
+        self.current_statement_start = bytecode.invalid_index;
+        self.statement_stack_base = self.stack.items.len;
+        return true;
+    }
+
+    fn setSegment(self: *Vm) ExecutionError!void {
+        var segment = try self.popValue();
+        defer segment.deinit(self.allocator);
+        if (try values.asLong(segment) != 0) return error.RestrictedMemory;
+        self.compatibility_segment_zero = true;
+    }
+
+    fn peek(self: *Vm) ExecutionError!void {
+        var address = try self.popValue();
+        defer address.deinit(self.allocator);
+        if (!self.compatibility_segment_zero or try values.asLong(address) != 1047) return error.RestrictedMemory;
+        try self.pushValue(.{ .integer = self.virtual_bios_byte });
+    }
+
+    fn poke(self: *Vm) ExecutionError!void {
+        var byte_value = try self.popValue();
+        defer byte_value.deinit(self.allocator);
+        var address = try self.popValue();
+        defer address.deinit(self.allocator);
+        const byte = try values.asLong(byte_value);
+        if (!self.compatibility_segment_zero or try values.asLong(address) != 1047 or byte < 0 or byte > 255) {
+            return error.RestrictedMemory;
+        }
+        self.virtual_bios_byte = @intCast(byte);
+    }
+
+    fn screenModeProbe(self: *Vm) ExecutionError!void {
+        var mode_value = try self.popValue();
+        defer mode_value.deinit(self.allocator);
+        const mode = try values.asLong(mode_value);
+        self.host.screen_mode(self.host.context, mode) catch return error.IllegalFunctionCall;
+    }
+
+    fn deferredBuiltin(self: *Vm, argument_count: u32) ExecutionError!void {
+        if (argument_count > self.stack.items.len) return error.StackUnderflow;
+        var remaining = argument_count;
+        while (remaining != 0) : (remaining -= 1) {
+            var argument = try self.popValue();
+            argument.deinit(self.allocator);
+        }
+        return error.HostFailure;
     }
 
     fn convertTop(self: *Vm, target: bytecode.ValueType) ExecutionError!void {
@@ -396,7 +855,12 @@ pub const Vm = struct {
         return values.isTrue(condition);
     }
 
-    fn callProcedure(self: *Vm, procedure_id: u32, argument_count: u32) ExecutionError!void {
+    fn callProcedure(
+        self: *Vm,
+        procedure_id: u32,
+        argument_count: u32,
+        call_instruction: bytecode.Instruction,
+    ) ExecutionError!void {
         if (procedure_id >= self.program.procedures.len) return error.InvalidInstruction;
         if (self.frames.items.len >= maximum_call_depth) return error.CallDepthExceeded;
         const procedure = self.program.procedures[procedure_id];
@@ -410,7 +874,7 @@ pub const Vm = struct {
             self.allocator.free(locals);
         }
         for (procedure.locals, 0..) |variable, index| {
-            locals[index] = .{ .owned = try values.defaultValue(self.allocator, variable.value_type) };
+            locals[index] = try allocateVariable(self.allocator, self.program, variable);
             initialized += 1;
         }
 
@@ -418,11 +882,16 @@ pub const Vm = struct {
             const item = self.stack.items[stack_base + index];
             switch (parameter.passing_mode) {
                 .by_ref => switch (item) {
-                    .reference => |location| {
+                    .reference => |cell| {
                         locals[parameter.local_index].deinit(self.allocator);
-                        locals[parameter.local_index] = .{ .alias = try self.resolveLocation(location) };
+                        locals[parameter.local_index] = .{ .alias = resolveCell(cell) orelse return error.InvalidInstruction };
                     },
-                    .value => return error.TypeMismatch,
+                    .value => |value| {
+                        var converted = try values.convert(self.allocator, value, parameter.value_type);
+                        errdefer converted.deinit(self.allocator);
+                        locals[parameter.local_index].deinit(self.allocator);
+                        locals[parameter.local_index] = .{ .owned = .{ .scalar = converted } };
+                    },
                 },
                 .by_value => {
                     var argument = try self.cloneStackItem(item);
@@ -430,7 +899,7 @@ pub const Vm = struct {
                     var converted = try values.convert(self.allocator, argument, parameter.value_type);
                     errdefer converted.deinit(self.allocator);
                     locals[parameter.local_index].deinit(self.allocator);
-                    locals[parameter.local_index] = .{ .owned = converted };
+                    locals[parameter.local_index] = .{ .owned = .{ .scalar = converted } };
                 },
             }
         }
@@ -439,6 +908,8 @@ pub const Vm = struct {
             .procedure_id = procedure_id,
             .return_ip = self.instruction_pointer,
             .stack_base = stack_base,
+            .call_resume_ip = call_instruction.statement_start,
+            .call_resume_next = call_instruction.statement_next,
             .locals = locals,
         });
         self.discardStackFrom(stack_base);
@@ -451,10 +922,7 @@ pub const Vm = struct {
         const procedure = self.program.procedures[self.frames.items[frame_depth - 1].procedure_id];
         var return_value: ?values.Value = null;
         if (procedure.returnsValue()) {
-            return_value = try (try self.valueAt(.{
-                .frame = @intCast(frame_depth - 1),
-                .index = procedure.return_local,
-            })).clone(self.allocator);
+            return_value = try (try scalarAt(&self.frames.items[frame_depth - 1].locals[procedure.return_local])).clone(self.allocator);
         }
 
         var frame = self.frames.pop().?;
@@ -511,10 +979,12 @@ pub const Vm = struct {
             .len => .{ .integer = @intCast(arguments[0].string.len) },
             .ltrim_string => self.leftTrim(arguments[0]),
             .mid_string => self.midString(arguments),
+            .peek => error.HostFailure,
             .space_string => self.spaceString(arguments[0]),
             .str_string => self.numberString(arguments[0]),
             .ucase_string => self.upperString(arguments[0]),
             .val => self.val(arguments[0]),
+            .eof, .inkey_string, .point, .rnd, .timer => error.HostFailure,
         };
     }
 
@@ -644,23 +1114,35 @@ pub const Vm = struct {
         try self.stack.append(self.allocator, .{ .value = value });
     }
 
-    fn pushReference(self: *Vm, location: Location) ExecutionError!void {
+    fn pushReference(self: *Vm, cell: *Cell) ExecutionError!void {
         if (self.stack.items.len >= maximum_value_stack) return error.StackOverflow;
-        try self.stack.append(self.allocator, .{ .reference = try self.resolveLocation(location) });
+        try self.stack.append(self.allocator, .{ .reference = resolveCell(cell) orelse return error.InvalidInstruction });
+    }
+
+    fn popReference(self: *Vm) ExecutionError!*Cell {
+        const item = self.stack.pop() orelse return error.StackUnderflow;
+        return switch (item) {
+            .reference => |cell| resolveCell(cell) orelse error.InvalidInstruction,
+            .value => |value| blk: {
+                var owned = value;
+                owned.deinit(self.allocator);
+                break :blk error.TypeMismatch;
+            },
+        };
     }
 
     fn popValue(self: *Vm) ExecutionError!values.Value {
         const item = self.stack.pop() orelse return error.StackUnderflow;
         return switch (item) {
             .value => |value| value,
-            .reference => |location| (try self.valueAt(location)).clone(self.allocator),
+            .reference => |cell| (try scalarAt(cell)).clone(self.allocator),
         };
     }
 
     fn cloneStackItem(self: *Vm, item: StackItem) ExecutionError!values.Value {
         return switch (item) {
             .value => |value| value.clone(self.allocator),
-            .reference => |location| (try self.valueAt(location)).clone(self.allocator),
+            .reference => |cell| (try scalarAt(cell)).clone(self.allocator),
         };
     }
 
@@ -671,56 +1153,33 @@ pub const Vm = struct {
         }
     }
 
-    fn localLocation(self: *Vm, index: u32) ExecutionError!Location {
+    fn localCellAt(self: *Vm, index: u32) ExecutionError!*Cell {
         if (self.frames.items.len == 0) return error.InvalidInstruction;
         if (index >= self.frames.items[self.frames.items.len - 1].locals.len) return error.InvalidInstruction;
-        return .{ .frame = @intCast(self.frames.items.len - 1), .index = index };
+        return resolveCell(&self.frames.items[self.frames.items.len - 1].locals[index]) orelse error.InvalidInstruction;
     }
 
-    fn resolveLocation(self: *Vm, original: Location) ExecutionError!Location {
-        var location = original;
-        var depth: usize = 0;
-        while (location.frame != global_frame) : (depth += 1) {
-            if (depth > maximum_call_depth) return error.InvalidInstruction;
-            if (location.frame >= self.frames.items.len) return error.InvalidInstruction;
-            const frame = &self.frames.items[location.frame];
-            if (location.index >= frame.locals.len) return error.InvalidInstruction;
-            switch (frame.locals[location.index]) {
-                .owned => return location,
-                .alias => |target| location = target,
-            }
-        }
-        if (location.index >= self.globals.len) return error.InvalidInstruction;
-        return location;
-    }
-
-    fn valueAt(self: *Vm, original: Location) ExecutionError!*const values.Value {
-        const location = try self.resolveLocation(original);
-        if (location.frame == global_frame) return &self.globals[location.index];
-        const cell = &self.frames.items[location.frame].locals[location.index];
-        return &cell.owned;
-    }
-
-    fn valueAtMutable(self: *Vm, original: Location) ExecutionError!*values.Value {
-        const location = try self.resolveLocation(original);
-        if (location.frame == global_frame) return &self.globals[location.index];
-        const cell = &self.frames.items[location.frame].locals[location.index];
-        return &cell.owned;
+    fn globalCellAt(self: *Vm, index: u32) ExecutionError!*Cell {
+        if (index >= self.globals.len) return error.InvalidInstruction;
+        return resolveCell(&self.globals[index]) orelse error.InvalidInstruction;
     }
 
     fn recordError(self: *Vm, code: RuntimeCode, instruction: u32) void {
+        self.recordDiagnostic(self.makeDiagnostic(code, instruction));
+    }
+
+    fn recordDiagnostic(self: *Vm, diagnostic: RuntimeDiagnostic) void {
+        self.runtime_diagnostic = diagnostic;
+        self.status = .runtime_error;
+        self.exit_code = self.runtime_diagnostic.?.qbasicErrorNumber();
+    }
+
+    fn makeDiagnostic(self: *const Vm, code: RuntimeCode, instruction: u32) RuntimeDiagnostic {
         const span: frontend.Span = if (instruction < self.program.instructions.len)
             self.program.instructions[instruction].span
         else
             .{ .start = 0, .end = 0, .line = 1, .column = 1 };
-        self.runtime_diagnostic = .{
-            .code = code,
-            .file_name = self.program.file_name,
-            .span = span,
-            .instruction = instruction,
-        };
-        self.status = .runtime_error;
-        self.exit_code = self.runtime_diagnostic.?.qbasicErrorNumber();
+        return .{ .code = code, .file_name = self.program.file_name, .span = span, .instruction = instruction };
     }
 };
 
@@ -757,6 +1216,19 @@ fn runtimeCode(fault: ExecutionError) RuntimeCode {
         error.GosubWithoutReturn => .gosub_without_return,
         error.InvalidInstruction => .invalid_instruction,
         error.HostFailure => .host_failure,
+        error.SubscriptOutOfRange => .subscript_out_of_range,
+        error.ArrayAlreadyDimensioned => .array_already_dimensioned,
+        error.OutOfData => .out_of_data,
+        error.ResumeWithoutError => .resume_without_error,
+        error.RestrictedMemory => .restricted_memory,
+        error.Rethrow => .invalid_instruction,
+    };
+}
+
+fn isCatchable(code: RuntimeCode) bool {
+    return switch (code) {
+        .overflow, .division_by_zero, .type_mismatch, .illegal_function_call, .out_of_memory, .subscript_out_of_range, .array_already_dimensioned, .out_of_data, .restricted_memory => true,
+        .stack_overflow, .stack_underflow, .call_depth_exceeded, .gosub_without_return, .invalid_instruction, .host_failure, .resume_without_error => false,
     };
 }
 
@@ -771,28 +1243,159 @@ fn defaultMath(_: ?*anyopaque, operation: MathOperation, first: f64, second: f64
     return result;
 }
 
+fn acceptScreenMode(_: ?*anyopaque, _: i32) ScreenModeError!void {}
+
 fn neverCancel(_: ?*anyopaque) bool {
     return false;
 }
 
-fn allocateGlobals(allocator: std.mem.Allocator, program: *const bytecode.Program) InitError![]values.Value {
-    const globals = try allocator.alloc(values.Value, program.globals.len);
+fn allocateGlobals(allocator: std.mem.Allocator, program: *const bytecode.Program) InitError![]Cell {
+    const globals = try allocator.alloc(Cell, program.globals.len);
     var initialized: usize = 0;
     errdefer {
-        for (globals[0..initialized]) |*value| value.deinit(allocator);
+        for (globals[0..initialized]) |*cell| cell.deinit(allocator);
         allocator.free(globals);
     }
     for (program.globals, 0..) |variable, index| {
-        globals[index] = values.defaultValue(allocator, variable.value_type) catch |fault| switch (fault) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => unreachable,
-        };
+        globals[index] = allocateVariable(allocator, program, variable) catch return error.OutOfMemory;
         initialized += 1;
     }
     return globals;
 }
 
-fn deinitGlobals(allocator: std.mem.Allocator, globals: []values.Value) void {
-    for (globals) |*value| value.deinit(allocator);
+fn deinitGlobals(allocator: std.mem.Allocator, globals: []Cell) void {
+    for (globals) |*cell| cell.deinit(allocator);
     allocator.free(globals);
+}
+
+fn allocateVariable(
+    allocator: std.mem.Allocator,
+    program: *const bytecode.Program,
+    variable: bytecode.Variable,
+) ExecutionError!Cell {
+    if (variable.isArray()) {
+        const dimensions = try allocator.alloc(Dimension, 0);
+        errdefer allocator.free(dimensions);
+        const elements = try allocator.alloc(Cell, 0);
+        return .{ .owned = .{ .array = .{
+            .value_type = variable.value_type,
+            .record_type = variable.record_type,
+            .expected_dimensions = variable.dimensions,
+            .is_dynamic = variable.is_dynamic,
+            .dimensions = dimensions,
+            .elements = elements,
+        } } };
+    }
+    return allocateElement(allocator, program, variable.value_type, variable.record_type);
+}
+
+fn allocateElement(
+    allocator: std.mem.Allocator,
+    program: *const bytecode.Program,
+    value_type: bytecode.ValueType,
+    record_type: u32,
+) ExecutionError!Cell {
+    if (record_type == bytecode.invalid_index) {
+        return .{ .owned = .{ .scalar = try values.defaultValue(allocator, value_type) } };
+    }
+    if (record_type >= program.record_types.len) return error.InvalidInstruction;
+    const definition = program.record_types[record_type];
+    const fields = try allocator.alloc(Cell, definition.fields.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |*field| field.deinit(allocator);
+        allocator.free(fields);
+    }
+    for (definition.fields, 0..) |field, index| {
+        fields[index] = .{ .owned = .{ .scalar = try values.defaultValue(allocator, field.value_type) } };
+        initialized += 1;
+    }
+    return .{ .owned = .{ .record = .{ .record_type = record_type, .fields = fields } } };
+}
+
+fn resolveCell(original: *Cell) ?*Cell {
+    var cell = original;
+    var depth: usize = 0;
+    while (depth <= maximum_call_depth) : (depth += 1) {
+        switch (cell.*) {
+            .owned => return cell,
+            .alias => |target| cell = target,
+        }
+    }
+    return null;
+}
+
+fn resolveCellConst(original: *const Cell) ?*const Cell {
+    var cell = original;
+    var depth: usize = 0;
+    while (depth <= maximum_call_depth) : (depth += 1) {
+        switch (cell.*) {
+            .owned => return cell,
+            .alias => |target| cell = target,
+        }
+    }
+    return null;
+}
+
+fn scalarAt(cell: *const Cell) ExecutionError!*const values.Value {
+    const resolved = resolveCellConst(cell) orelse return error.InvalidInstruction;
+    return switch (resolved.owned) {
+        .scalar => |*scalar| scalar,
+        else => error.TypeMismatch,
+    };
+}
+
+fn scalarAtMutable(cell: *Cell) ExecutionError!*values.Value {
+    const resolved = resolveCell(cell) orelse return error.InvalidInstruction;
+    return switch (resolved.owned) {
+        .scalar => |*scalar| scalar,
+        else => error.TypeMismatch,
+    };
+}
+
+fn arrayElement(array: *ArrayValue, indices: []const i32) ?*Cell {
+    if (indices.len != array.dimensions.len) return null;
+    var offset: usize = 0;
+    for (array.dimensions, indices) |dimension, index| {
+        if (index < dimension.lower or index > dimension.upper) return null;
+        offset += @as(usize, @intCast(index - dimension.lower)) * dimension.stride;
+    }
+    if (offset >= array.elements.len) return null;
+    return resolveCell(&array.elements[offset]);
+}
+
+fn arrayElementConst(array: *const ArrayValue, indices: []const i32) ?*const Cell {
+    if (indices.len != array.dimensions.len) return null;
+    var offset: usize = 0;
+    for (array.dimensions, indices) |dimension, index| {
+        if (index < dimension.lower or index > dimension.upper) return null;
+        offset += @as(usize, @intCast(index - dimension.lower)) * dimension.stride;
+    }
+    if (offset >= array.elements.len) return null;
+    return resolveCellConst(&array.elements[offset]);
+}
+
+fn dataValue(
+    allocator: std.mem.Allocator,
+    item: bytecode.DataItem,
+    source: []const u8,
+    target: bytecode.ValueType,
+) ExecutionError!values.Value {
+    if (item.constant == .string) {
+        if (target != .string) return error.TypeMismatch;
+        const token = item.constant.string.bytes(source);
+        const bytes = if (item.string_is_quoted and token.len >= 2) token[1 .. token.len - 1] else token;
+        return .{ .string = try allocator.dupe(u8, bytes) };
+    }
+    var raw = try values.fromConstant(allocator, item.constant, source);
+    defer raw.deinit(allocator);
+    if (target != .string) return values.convert(allocator, raw, target);
+    const text = switch (raw) {
+        .integer => |number| try std.fmt.allocPrint(allocator, "{d}", .{number}),
+        .long => |number| try std.fmt.allocPrint(allocator, "{d}", .{number}),
+        .single => |number| try std.fmt.allocPrint(allocator, "{d}", .{number}),
+        .double => |number| try std.fmt.allocPrint(allocator, "{d}", .{number}),
+        .string => unreachable,
+    };
+    return .{ .string = text };
 }

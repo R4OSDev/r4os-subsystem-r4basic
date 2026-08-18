@@ -1,8 +1,9 @@
 const std = @import("std");
 const frontend = @import("frontend.zig");
 
-pub const contract_version = "1.0.0";
+pub const contract_version = "1.1.0";
 pub const invalid_index: u32 = std.math.maxInt(u32);
+pub const unknown_dimensions: u8 = std.math.maxInt(u8);
 
 pub const ValueType = enum(u8) {
     integer,
@@ -31,10 +32,21 @@ pub const Constant = union(ValueType) {
 pub const Variable = struct {
     name: frontend.Span,
     value_type: ValueType,
+    record_type: u32 = invalid_index,
+    dimensions: u8 = 0,
+    is_dynamic: bool = false,
     is_constant: bool = false,
     is_parameter: bool = false,
     is_shared: bool = false,
     hidden: bool = false,
+
+    pub fn isArray(self: Variable) bool {
+        return self.dimensions != 0;
+    }
+
+    pub fn isRecord(self: Variable) bool {
+        return self.record_type != invalid_index;
+    }
 };
 
 pub const PassingMode = enum(u8) {
@@ -45,7 +57,25 @@ pub const PassingMode = enum(u8) {
 pub const Parameter = struct {
     local_index: u32,
     value_type: ValueType,
+    record_type: u32 = invalid_index,
+    is_array: bool = false,
+    accepts_any: bool = false,
     passing_mode: PassingMode,
+};
+
+pub const RecordField = struct {
+    name: frontend.Span,
+    value_type: ValueType,
+};
+
+pub const RecordType = struct {
+    name: frontend.Span,
+    fields: []RecordField,
+};
+
+pub const DataItem = struct {
+    constant: Constant,
+    string_is_quoted: bool = false,
 };
 
 pub const ProcedureKind = enum(u8) {
@@ -79,6 +109,26 @@ pub const OpCode = enum(u8) {
     initialize_local,
     push_global_reference,
     push_local_reference,
+    array_default_lower,
+    select_array_element,
+    select_record_field,
+    load_reference,
+    store_reference,
+    dimension,
+    redimension,
+    read_data,
+    restore_data,
+    set_error_handler,
+    resume_error,
+    resume_next,
+    resume_label,
+    set_segment,
+    reset_segment,
+    peek,
+    poke,
+    screen_mode_probe,
+    deferred_statement,
+    deferred_builtin,
     convert,
     negate,
     logical_not,
@@ -122,11 +172,17 @@ pub const Builtin = enum(u8) {
     len,
     ltrim_string,
     mid_string,
+    peek,
     sin,
     space_string,
     str_string,
     ucase_string,
     val,
+    eof,
+    inkey_string,
+    point,
+    rnd,
+    timer,
 };
 
 pub const Instruction = struct {
@@ -134,6 +190,8 @@ pub const Instruction = struct {
     a: u32 = 0,
     b: u32 = 0,
     span: frontend.Span,
+    statement_start: u32 = invalid_index,
+    statement_next: u32 = invalid_index,
 };
 
 pub const DiagnosticCode = enum(u8) {
@@ -152,6 +210,14 @@ pub const DiagnosticCode = enum(u8) {
     wrong_argument_count,
     invalid_byref_argument,
     invalid_number,
+    invalid_array_bounds,
+    wrong_dimension_count,
+    unknown_type,
+    unknown_field,
+    invalid_record_access,
+    invalid_array_argument,
+    invalid_error_handler,
+    invalid_data_item,
     block_mismatch,
     block_not_closed,
     capacity_exceeded,
@@ -180,6 +246,14 @@ pub const Diagnostic = struct {
             .wrong_argument_count => "procedure or function has the wrong number of arguments",
             .invalid_byref_argument => "ByRef argument must be a compatible scalar variable",
             .invalid_number => "numeric literal is outside the v1 value range",
+            .invalid_array_bounds => "array bounds are invalid",
+            .wrong_dimension_count => "array reference has the wrong number of dimensions",
+            .unknown_type => "user-defined type is not declared",
+            .unknown_field => "record field is not declared",
+            .invalid_record_access => "record value requires a declared field",
+            .invalid_array_argument => "array argument must be a compatible whole array",
+            .invalid_error_handler => "error handler target is invalid",
+            .invalid_data_item => "DATA item is not a supported constant",
             .block_mismatch => "block terminator does not match the active block",
             .block_not_closed => "block is not closed before end of source",
             .capacity_exceeded => "compiled program exceeds a deterministic v1 capacity",
@@ -195,6 +269,8 @@ pub const Program = struct {
     constants: []Constant,
     globals: []Variable,
     procedures: []Procedure,
+    record_types: []RecordType,
+    data_items: []DataItem,
     diagnostics: []Diagnostic,
     module_entry: u32,
     parse_passes: u32 = 1,
@@ -213,6 +289,9 @@ pub const Program = struct {
             self.allocator.free(procedure.locals);
             self.allocator.free(procedure.parameters);
         }
+        for (self.record_types) |record_type| self.allocator.free(record_type.fields);
+        self.allocator.free(self.record_types);
+        self.allocator.free(self.data_items);
         self.allocator.free(self.procedures);
         self.allocator.free(self.globals);
         self.allocator.free(self.constants);

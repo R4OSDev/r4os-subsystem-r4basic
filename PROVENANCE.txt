@@ -11,6 +11,12 @@ Primaere Sprachreferenz:
 - Microsoft QuickBASIC 4.5 Programming in BASIC.
 - Lokaler Referenzindex: D:\R4OS\ExFiles\Reference\Basic\README.txt
 - PCjs-Revision: 67b950f7eed3447c5c056e3d048ba4f62a94aead
+- Fuer VM-Vertrag 1.1 wurden die Abschnitte zu DIM, REDIM, TYPE, DATA,
+  READ, RESTORE, DECLARE/AS ANY, ON ERROR, RESUME, DEF SEG, PEEK und POKE
+  unmittelbar aus der lokalen Language-Reference-Arbeitskopie ausgewertet.
+- Daraus uebernommen wurden ausschliesslich Sprachsemantik und Grenzen;
+  Parser-, Speicher-, Alias-, Bytecode- und Fehlerflusscode sind eine neue
+  eigenstaendige R4OS-Implementierung.
 
 Reale lokale Abnahmequelle:
 - Pfad: D:\R4OS\Artifacts\Distribution\Injection\Temp\gorilla.bas
@@ -26,6 +32,7 @@ Sekundaerer Architekturvergleich:
   uebernommen.
 
 Permanenter Testbestand:
-- Alle Dateien unter Tests/Fixtures sind neue, originale R4OS-Testprogramme.
+- Alle Dateien unter Tests/Fixtures sind neue, originale R4OS-Testprogramme,
+  einschliesslich der Aggregate-, Fehlerfluss- und Speichergrenzfixtures.
 - Sie enthalten weder Quellzeilen noch Datenbloecke der lokalen
   Realprogrammabnahme.

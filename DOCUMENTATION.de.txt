@@ -6,12 +6,13 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.66.6
+Stand 0.66.7
 ------------
 
 Diese Ausbaustufe besitzt das produktive Modulprojekt, das versionierte
-Quellfrontend und den ersten ausfuehrbaren BASIC-Kern. Der Compiler
-tokenisiert einen Quelltext genau einmal, bindet skalare Symbole und erzeugt
+Quellfrontend und den ausfuehrbaren BASIC-Datenkern. Der Compiler
+tokenisiert einen Quelltext genau einmal, bindet skalare und zusammengesetzte
+Symbole und erzeugt
 eine unveraenderliche Instruktionsdarstellung mit festen Sprungzielen. Die
 typisierte VM fuehrt danach ausschliesslich diese vorbereiteten Instruktionen
 aus. Schleifen lesen oder parsen den Quelltext nicht erneut.
@@ -68,13 +69,15 @@ stabilen Quellspan. Labels werden pro Modul- oder Prozedurscope auf feste
 Instruktionsindizes aufgeloest; unbekannte Ziele sind Compile-Diagnosen.
 
 Der ausfuehrbare Kern umfasst INTEGER, LONG, SINGLE, DOUBLE und dynamische
-Byte-Strings, DEFINT und Typsuffixe, skalare DIM-/DIM-SHARED-Variablen,
+Byte-Strings, DEFINT und Typsuffixe, skalare sowie mehrdimensionale
+DIM-/DIM-SHARED-Variablen,
 Konstanten, Ausdruecke und Vergleiche. IF/ELSEIF/ELSE, SELECT CASE,
 FOR/NEXT, WHILE/WEND, alle vor- und nachgeprueften DO/LOOP-Formen,
 GOTO sowie GOSUB/RETURN besitzen gebundene Spruenge.
 
-DECLARE, SUB, FUNCTION, explizite und implizite Aufrufe, skalare ByRef- und
-ByVal-Parameter sowie einzeilige DEF-FN-Funktionen verwenden getrennte
+DECLARE, SUB, FUNCTION, explizite und implizite Aufrufe, skalare und
+zusammengesetzte ByRef- sowie skalare ByVal-Parameter und einzeilige
+DEF-FN-Funktionen verwenden getrennte
 Aufrufrahmen. ByRef-Zellen sind echte Aliase; DEF FN erhaelt eigene
 ByVal-Parameter und sieht entsprechend der vereinbarten BASIC-Semantik die
 Modulvariablen. Rekursive Funktionen behalten lokale Werte und Rueckgaben je
@@ -85,6 +88,55 @@ Werte, Auswertungs- und Aufrufstapel, GOSUB-Stapel, Instruktionszeiger,
 Abbruchmarke, Diagnose und Exitcode. Arithmetik, Konvertierung, Rundung,
 Stringgrenze und QBasic-Fehlernummern sind im VM-Vertrag festgelegt.
 Mathematische Hostfunktionen und Abbruchabfrage werden injiziert.
+
+Arrays, Datensaetze und DATA
+----------------------------
+
+DIM und DIM SHARED koennen feste oder dynamische Arrays mit bis zu 60
+Dimensionen und expliziten vorzeichenbehafteten Unter- und Obergrenzen
+anlegen. Ohne Untergrenze gilt null. REDIM behaelt Rang und Elementtyp bei,
+verwirft den alten Inhalt und initialisiert die neue Belegung. Pro Array gilt
+vor dem Allokationsversuch eine feste Schutzgrenze von 16.777.216 Elementen.
+
+TYPE-Deklarationen werden in unveraenderliche Layouts aus skalaren Feldern
+gebunden. Laufzeitwerte besitzen dagegen pro Instanz eigene Feldzellen.
+Dasselbe gilt fuer Arrays von TYPE-Werten. Feld- und Arrayzugriffe werden als
+gebundene Selektoren ausgefuehrt; es existiert weder eine rohe Gastadresse
+noch ein Zahlenwert, der als Hostzeiger interpretiert werden koennte.
+
+ByRef verwendet echte Zellaliase fuer Skalare, Arrayelemente, ganze Arrays
+und Datensaetze. Ein Ausdruck an einem normalen ByRef-Skalarparameter wird
+QBasic-kompatibel als temporaerer konvertierter Wert uebergeben. Ganze
+Arrays verlangen leere Klammern. AS ANY lockert nur die Typpruefung der
+Vorwaertsdeklaration; die konkrete Prozedurdefinition legt den Elementtyp
+weiterhin fest.
+
+Alle DATA-Anweisungen werden beim Binden in eine quelltextgeordnete,
+unveraenderliche Programmtabelle ueberfuehrt. Jede VM besitzt einen eigenen
+READ-Zeiger. RESTORE setzt ihn auf den Programmanfang oder auf ein bereits
+gebundenes Datenlabel. Positive und negative LONG-Bildwerte durchlaufen
+dabei keine Gleitkommakonvertierung.
+
+Fehlerfluss und privates Kompatibilitaetsgeraet
+-----------------------------------------------
+
+ON ERROR GOTO, ON ERROR GOTO 0, RESUME und RESUME NEXT besitzen
+instanzlokalen Zustand. Jede Bytecode-Instruktion kennt Anfang und Nachfolger
+ihres BASIC-Statements. RESUME baut deshalb auch bei mehreren
+Operandeninstruktionen das ganze fehlerhafte Statement neu auf; RESUME NEXT
+springt exakt dahinter. Ein unbehandelter Fehler beendet nur seine VM.
+
+Die vorlaeufige SCREEN-Modusabfrage ist als injizierbarer Hostaufruf
+vorhanden, damit der Modusfallback bereits vor der Grafikschicht echt durch
+den BASIC-Fehlerpfad getestet wird. Spaetere Text-, Zeit-, Datei-, Grafik-
+und Audioanweisungen besitzen sichtbare Deferred-Guards und werden niemals
+als erfolgreiche Leeroperation ausgegeben.
+
+DEF SEG = 0 schaltet ausschliesslich ein privates Byte an Offset 1047 frei.
+PEEK und POKE koennen damit das von GORILLA.BAS verwendete NumLock-Bit lesen
+und setzen. DEF SEG ohne Wert schliesst den Zugriff. Jeder andere Offset oder
+jedes andere Segment ist ein BASIC-Laufzeitfehler; R4OS- und Hostspeicher
+sind strukturell unerreichbar.
 
 `src/runtime_adapter.zig` bildet die VM auf `r4os.subsystem_runtime` ab. Pro
 Hostzyklus wird genau eine BASIC-Scheibe mit dem vom Runtime-Host gelieferten
@@ -101,10 +153,11 @@ Der normale, vollstaendig oeffentliche Testlauf lautet:
 
     Build.bat test
 
-Er baut und inspiziert das GUI-R4X und fuehrt 20 Host-Component-Tests aus.
+Er baut und inspiziert das GUI-R4X und fuehrt 25 Host-Component-Tests aus.
 Vier positive und vier negative Frontend-Fixtures pruefen weiterhin den
-Quellvertrag. Sechs ausfuehrbare BAS-Fixtures pruefen Werte, Kontrollfluss,
-Prozeduren, Built-ins, endlose Ausfuehrung und getrennte Fehlerzustaende.
+Quellvertrag. Neun ausfuehrbare BAS-Fixtures pruefen Werte, Kontrollfluss,
+Prozeduren, Built-ins, Aggregate, DATA, Fehlerfortsetzung, das private
+Speicherbyte, endlose Ausfuehrung und getrennte Fehlerzustaende.
 Zusaetzlich werden exakte Laufzeitpositionen und Fehlernummern, Rekursion,
 verschachteltes ByRef, Hostfehler, Reset, Nullbudget-Abbruch und ein echter
 `subsystem_runtime`-Close vor der naechsten Gastscheibe direkt getestet.
@@ -117,7 +170,9 @@ Sie liest ausschliesslich
 `D:\R4OS\Artifacts\Distribution\Injection\Temp\gorilla.bas`, verlangt
 29.434 Byte und die SHA-256-Pruefsumme
 `9926FC1F50C4B489EC4C1B0DA5BD2C497EBF4282B3259C28A835A743E24699F7` und
-uebergibt danach die unveraenderten Bytes an dasselbe Frontend. Der normale
+uebergibt danach die unveraenderten Bytes an dasselbe Frontend und den
+produktiven Binder. Die vollstaendige Daten- und Prozedurstruktur muss ohne
+Quelltextaenderung ein gueltiges Instruktionsprogramm ergeben. Der normale
 Build benoetigt diese lokale Datei nicht.
 
 Referenzen und Rechte
@@ -138,7 +193,6 @@ Weitergaberechte getrennt geklaert sein.
 Noch nicht Bestandteil dieses Stands
 ------------------------------------
 
-- Arrays, benutzerdefinierte Typen, DATA/READ/RESTORE und BASIC-Fehlerfluss
 - Textausgabe, Tastatur, Eingabe, Gastzeit, Zufall und Dateilaufzeit
 - virtueller Grafikbildschirm und Grafikbefehle
 - Audio und Music Macro Language

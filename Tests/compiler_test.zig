@@ -8,6 +8,9 @@ const fixture_paths = struct {
     const builtins = "Tests/Fixtures/vm_builtins.bas";
     const infinite = "Tests/Fixtures/vm_infinite.bas";
     const isolation = "Tests/Fixtures/vm_isolation.bas";
+    const arrays_records_data = "Tests/Fixtures/vm_arrays_records_data.bas";
+    const error_resume = "Tests/Fixtures/vm_error_resume.bas";
+    const private_memory = "Tests/Fixtures/vm_private_memory.bas";
 };
 
 test "core compiler emits a bound instruction program" {
@@ -176,15 +179,15 @@ test "injected host failures become deterministic runtime diagnostics" {
     try std.testing.expectEqual(@as(u32, 10), diagnostic.span.column);
 }
 
-test "compiler rejects invalid ByRef labels and later-layer syntax" {
+test "compiler rejects invalid bindings labels and array shapes" {
     const Case = struct {
         source: []const u8,
         expected: core.bytecode.DiagnosticCode,
     };
     const cases = [_]Case{
-        .{ .source = "DECLARE SUB SetValue(BYREF Value AS INTEGER)\nCALL SetValue(1 + 2)\nEND\n", .expected = .invalid_byref_argument },
+        .{ .source = "DECLARE SUB SetValues(Values() AS INTEGER)\nDIM Value AS INTEGER\nCALL SetValues(Value)\nEND\nSUB SetValues(Values() AS INTEGER)\nEND SUB\n", .expected = .invalid_array_argument },
         .{ .source = "GOTO Missing\nEND\n", .expected = .unknown_label },
-        .{ .source = "DIM Values(1 TO 3)\nEND\n", .expected = .unsupported_core_feature },
+        .{ .source = "DIM Values(1 TO 3)\nValue = Values(1, 2)\nEND\n", .expected = .wrong_dimension_count },
         .{ .source = "CONST Fixed = 1\nFixed = 2\nEND\n", .expected = .constant_assignment },
         .{ .source = "IF \"text\" THEN Value = 1\nEND\n", .expected = .type_mismatch },
         .{ .source = "FOR Index = \"text\" TO 3\nNEXT Index\nEND\n", .expected = .type_mismatch },
@@ -194,6 +197,184 @@ test "compiler rejects invalid ByRef labels and later-layer syntax" {
         defer program.deinit();
         try std.testing.expect(!program.ok());
         try std.testing.expect(containsCompileDiagnostic(program.diagnostics, case.expected));
+    }
+}
+
+test "dynamic arrays records DATA and aggregate ByRef remain instance local" {
+    var program = try compileFixture(fixture_paths.arrays_records_data);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    try std.testing.expectEqual(@as(usize, 1), program.record_types.len);
+    try std.testing.expectEqual(@as(usize, 3), program.data_items.len);
+    try std.testing.expectEqual(@as(i32, -2_134_835_200), program.data_items[1].constant.long);
+
+    var first = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer first.deinit();
+    var second = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer second.deinit();
+
+    try std.testing.expectEqual(core.vm.Status.halted, first.runToCompletion(128, 64));
+    try expectArrayLong(&first, "Image&", &.{0}, 458_758);
+    try expectArrayLong(&first, "Image&", &.{1}, -2_134_835_200);
+    try expectArrayLong(&first, "Image&", &.{2}, 1_886_416_900);
+    try expectArrayLong(&first, "Grid&", &.{ -1, 2 }, 458_758);
+    try expectArrayLong(&first, "Grid&", &.{ 0, 3 }, 458_759);
+    try expectArrayRecordInteger(&first, "Points", &.{2}, "XCoor", 23);
+    try expectArrayRecordInteger(&first, "Points", &.{2}, "YCoor", 55);
+    try expectInteger(&first, "SharedCount", 1);
+
+    try std.testing.expect(second.globalArrayElement("Image&", &.{0}) == null);
+    try std.testing.expectEqual(core.vm.Status.halted, second.runToCompletion(128, 64));
+    try expectArrayLong(&second, "Image&", &.{1}, -2_134_835_200);
+    try expectInteger(&second, "SharedCount", 1);
+
+    try first.reset();
+    try std.testing.expect(first.globalArrayElement("Image&", &.{0}) == null);
+    try expectInteger(&first, "SharedCount", 0);
+    try std.testing.expectEqual(core.vm.Status.halted, first.runToCompletion(128, 64));
+    try expectArrayRecordInteger(&first, "Points", &.{2}, "YCoor", 55);
+}
+
+test "fixed bounds REDIM reset and RESTORE preserve typed DATA order" {
+    const source =
+        "DEFINT A-Z\n" ++
+        "DIM Fixed(-2 TO -1, 4 TO 5)\n" ++
+        "Fixed(-2, 4) = 17\n" ++
+        "'$DYNAMIC\n" ++
+        "DIM Dynamic&(1)\n" ++
+        "Dynamic&(0) = 99\n" ++
+        "REDIM Dynamic&(-1 TO 1)\n" ++
+        "ResetValue& = Dynamic&(0)\n" ++
+        "READ First, Word$, Signed&\n" ++
+        "RESTORE\n" ++
+        "READ NumericText$\n" ++
+        "END\n" ++
+        "Items:\n" ++
+        "DATA 7, hello, -8\n";
+    var program = try core.compiler.compile(std.testing.allocator, "array-data.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(64, 32));
+    const fixed = machine.globalArrayElement("Fixed", &.{ -2, 4 }) orelse return error.MissingFixedElement;
+    try std.testing.expectEqual(@as(i16, 17), fixed.integer);
+    try expectLong(&machine, "ResetValue&", 0);
+    try expectInteger(&machine, "First", 7);
+    try expectString(&machine, "Word$", "hello");
+    try expectLong(&machine, "Signed&", -8);
+    try expectString(&machine, "NumericText$", "7");
+}
+
+test "aggregate runtime errors are bounded and deterministic" {
+    const cases = [_]struct {
+        source: []const u8,
+        expected: core.vm.RuntimeCode,
+        number: i32,
+    }{
+        .{ .source = "DEFINT A-Z\nDIM Values(1 TO 2)\nValue = Values(3)\nEND\n", .expected = .subscript_out_of_range, .number = 9 },
+        .{ .source = "DEFINT A-Z\nREAD Value\nEND\n", .expected = .out_of_data, .number = 4 },
+        .{ .source = "DEFINT A-Z\nRESUME NEXT\nEND\n", .expected = .resume_without_error, .number = 20 },
+    };
+    for (cases) |case| {
+        var program = try core.compiler.compile(std.testing.allocator, "aggregate-error.bas", case.source);
+        defer program.deinit();
+        try expectProgramOk(&program);
+        var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+        defer machine.deinit();
+        try std.testing.expectEqual(core.vm.Status.runtime_error, machine.runToCompletion(32, 8));
+        try std.testing.expectEqual(case.expected, machine.runtime_diagnostic.?.code);
+        try std.testing.expectEqual(case.number, machine.exit_code);
+    }
+}
+
+const ScreenProbe = struct {
+    calls: u32 = 0,
+
+    fn screenMode(context: ?*anyopaque, mode: i32) core.vm.ScreenModeError!void {
+        const self: *ScreenProbe = @ptrCast(@alignCast(context.?));
+        self.calls += 1;
+        if (mode == 9) return error.ModeUnavailable;
+    }
+};
+
+test "ON ERROR retries or skips whole statements and unhandled faults stay local" {
+    var program = try compileFixture(fixture_paths.error_resume);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var probe: ScreenProbe = .{};
+    var handled = try core.vm.Vm.init(std.testing.allocator, &program, .{
+        .context = &probe,
+        .screen_mode = ScreenProbe.screenMode,
+    });
+    defer handled.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, handled.runToCompletion(64, 64));
+    try std.testing.expectEqual(@as(u32, 3), probe.calls);
+    try expectInteger(&handled, "RetryCount", 1);
+    try expectInteger(&handled, "NextCount", 1);
+    try expectInteger(&handled, "AfterRetry", 1);
+    try expectInteger(&handled, "AfterNext", 1);
+    try std.testing.expect(handled.runtime_diagnostic == null);
+    try std.testing.expectEqual(core.vm.RuntimeCode.illegal_function_call, handled.trapped_diagnostic.?.code);
+
+    var unhandled_program = try core.compiler.compile(std.testing.allocator, "unhandled.bas", "DEFINT A-Z\nSCREEN 9\nEND\n");
+    defer unhandled_program.deinit();
+    try expectProgramOk(&unhandled_program);
+    var failing_probe: ScreenProbe = .{};
+    var unhandled = try core.vm.Vm.init(std.testing.allocator, &unhandled_program, .{
+        .context = &failing_probe,
+        .screen_mode = ScreenProbe.screenMode,
+    });
+    defer unhandled.deinit();
+    try std.testing.expectEqual(core.vm.Status.runtime_error, unhandled.runToCompletion(16, 8));
+    try std.testing.expectEqual(core.vm.RuntimeCode.illegal_function_call, unhandled.runtime_diagnostic.?.code);
+    try std.testing.expectEqual(@as(i32, 5), unhandled.exit_code);
+    try std.testing.expectEqual(core.vm.Status.halted, handled.status);
+
+    var handler_fault_program = try core.compiler.compile(std.testing.allocator, "handler-fault.bas", "DEFINT A-Z\nON ERROR GOTO Handler\nSCREEN 9\nEND\nHandler:\nValue = 1 / 0\nRESUME NEXT\n");
+    defer handler_fault_program.deinit();
+    try expectProgramOk(&handler_fault_program);
+    var handler_probe: ScreenProbe = .{};
+    var handler_fault = try core.vm.Vm.init(std.testing.allocator, &handler_fault_program, .{
+        .context = &handler_probe,
+        .screen_mode = ScreenProbe.screenMode,
+    });
+    defer handler_fault.deinit();
+    try std.testing.expectEqual(core.vm.Status.runtime_error, handler_fault.runToCompletion(32, 8));
+    try std.testing.expectEqual(core.vm.RuntimeCode.division_by_zero, handler_fault.runtime_diagnostic.?.code);
+    try std.testing.expectEqual(@as(i32, 11), handler_fault.exit_code);
+}
+
+test "DEF SEG PEEK and POKE expose only the private NumLock byte" {
+    var program = try compileFixture(fixture_paths.private_memory);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var first = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer first.deinit();
+    var second = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer second.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, first.runToCompletion(32, 16));
+    try expectInteger(&first, "Original", 0);
+    try expectInteger(&first, "Enabled", 32);
+    try std.testing.expectEqual(@as(u8, 32), first.virtualNumLockByte());
+    try std.testing.expectEqual(@as(u8, 0), second.virtualNumLockByte());
+    try first.reset();
+    try std.testing.expectEqual(@as(u8, 0), first.virtualNumLockByte());
+
+    const invalid_sources = [_][]const u8{
+        "DEFINT A-Z\nDEF SEG = 0\nValue = PEEK(1046)\nEND\n",
+        "DEFINT A-Z\nValue = PEEK(1047)\nEND\n",
+        "DEFINT A-Z\nDEF SEG = 1\nEND\n",
+    };
+    for (invalid_sources) |source| {
+        var invalid_program = try core.compiler.compile(std.testing.allocator, "restricted-memory.bas", source);
+        defer invalid_program.deinit();
+        try expectProgramOk(&invalid_program);
+        var invalid = try core.vm.Vm.init(std.testing.allocator, &invalid_program, .{});
+        defer invalid.deinit();
+        try std.testing.expectEqual(core.vm.Status.runtime_error, invalid.runToCompletion(16, 8));
+        try std.testing.expectEqual(core.vm.RuntimeCode.restricted_memory, invalid.runtime_diagnostic.?.code);
+        try std.testing.expectEqual(@as(i32, 5), invalid.exit_code);
     }
 }
 
@@ -384,6 +565,24 @@ fn expectString(machine: *const core.vm.Vm, name: []const u8, expected: []const 
     const actual = machine.global(name) orelse return error.MissingGlobal;
     try std.testing.expectEqual(core.bytecode.ValueType.string, actual.valueType());
     try std.testing.expectEqualStrings(expected, actual.string);
+}
+
+fn expectArrayLong(machine: *const core.vm.Vm, name: []const u8, indices: []const i32, expected: i32) !void {
+    const actual = machine.globalArrayElement(name, indices) orelse return error.MissingArrayElement;
+    try std.testing.expectEqual(core.bytecode.ValueType.long, actual.valueType());
+    try std.testing.expectEqual(expected, actual.long);
+}
+
+fn expectArrayRecordInteger(
+    machine: *const core.vm.Vm,
+    name: []const u8,
+    indices: []const i32,
+    field: []const u8,
+    expected: i16,
+) !void {
+    const actual = machine.globalArrayRecordField(name, indices, field) orelse return error.MissingRecordField;
+    try std.testing.expectEqual(core.bytecode.ValueType.integer, actual.valueType());
+    try std.testing.expectEqual(expected, actual.integer);
 }
 
 fn containsCompileDiagnostic(diagnostics: []const core.bytecode.Diagnostic, expected: core.bytecode.DiagnosticCode) bool {
