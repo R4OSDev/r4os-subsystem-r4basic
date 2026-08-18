@@ -22,11 +22,11 @@ test "canonical local GORILLA.BAS tokenizes and parses unchanged" {
     std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
     try std.testing.expectEqualSlices(u8, canonical_sha256[0..], digest[0..]);
 
-    const result = frontend.analyze(source, tokens[0..], diagnostics[0..]);
+    const result = frontend.analyzeNamed(canonical_path, source, tokens[0..], diagnostics[0..]);
     if (!result.ok()) {
         for (diagnostics[0..result.diagnostic_count]) |diagnostic| {
             std.debug.print("{s}:{d}:{d}: {s}: {s}\n", .{
-                canonical_path,
+                diagnostic.file_name,
                 diagnostic.span.line,
                 diagnostic.span.column,
                 @tagName(diagnostic.code),

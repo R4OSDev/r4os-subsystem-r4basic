@@ -6,4 +6,3 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     if (app.profile != .desktop) return 64;
     return 0;
 }
-

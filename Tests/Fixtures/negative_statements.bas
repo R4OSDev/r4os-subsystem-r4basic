@@ -1,0 +1,11 @@
+BLOAD "legacy.bin"
+OPEN "data.bin" FOR RANDOM AS #1
+PALETTE 1
+PUT (0, 0), Pixels, OR
+LINE (0, 0)-(1, 1), 1, X
+VIEW 1 TO 2
+EXIT WHILE
+SCREEN
+PLAY
+SOUND 440, 1
+PRINT USING "##"; 1

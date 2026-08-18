@@ -3,32 +3,251 @@ const frontend = @import("frontend");
 
 var tokens: [frontend.recommended_token_capacity]frontend.Token = undefined;
 var diagnostics: [frontend.recommended_diagnostic_capacity]frontend.Diagnostic = undefined;
+var repeat_tokens: [frontend.recommended_token_capacity]frontend.Token = undefined;
+var repeat_diagnostics: [frontend.recommended_diagnostic_capacity]frontend.Diagnostic = undefined;
 
-test "frontend accepts a minimal structured BASIC program" {
-    const source =
-        \\'$DYNAMIC
-        \\DEFINT A-Z
-        \\DECLARE SUB Hello (Name$)
-        \\CONST TRUE = -1
-        \\DIM SHARED Values(1 TO 4) AS INTEGER
-        \\IF TRUE THEN
-        \\  Hello "R4OS"
-        \\END IF
-        \\END
-        \\SUB Hello (Name$)
-        \\  PRINT UCASE$(Name$);
-        \\END SUB
-    ;
-    const result = frontend.analyze(source, tokens[0..], diagnostics[0..]);
-    if (!result.ok()) dumpDiagnostics(source, result);
+const positive_fixtures = [_][]const u8{
+    "Tests/Fixtures/positive_source_contract.bas",
+    "Tests/Fixtures/positive_declarations.bas",
+    "Tests/Fixtures/positive_control_flow.bas",
+    "Tests/Fixtures/positive_io_graphics.bas",
+};
+
+const ExpectedDiagnostic = struct {
+    code: frontend.DiagnosticCode,
+    line: u32,
+};
+
+const NegativeFixture = struct {
+    path: []const u8,
+    expected: []const ExpectedDiagnostic,
+};
+
+const negative_fixtures = [_]NegativeFixture{
+    .{
+        .path = "Tests/Fixtures/negative_lexical.bas",
+        .expected = &.{
+            .{ .code = .unsupported_metacommand, .line = 1 },
+            .{ .code = .invalid_byte, .line = 2 },
+            .{ .code = .invalid_identifier, .line = 3 },
+            .{ .code = .invalid_number, .line = 4 },
+            .{ .code = .invalid_byte, .line = 5 },
+            .{ .code = .invalid_byte, .line = 6 },
+            .{ .code = .unterminated_string, .line = 7 },
+        },
+    },
+    .{
+        .path = "Tests/Fixtures/negative_structure.bas",
+        .expected = &.{
+            .{ .code = .expected_identifier, .line = 1 },
+            .{ .code = .expected_identifier, .line = 2 },
+            .{ .code = .unmatched_block, .line = 3 },
+            .{ .code = .unmatched_block, .line = 5 },
+            .{ .code = .unmatched_block, .line = 6 },
+            .{ .code = .unclosed_block, .line = 8 },
+        },
+    },
+    .{
+        .path = "Tests/Fixtures/negative_statements.bas",
+        .expected = &.{
+            .{ .code = .unsupported_statement, .line = 1 },
+            .{ .code = .unsupported_statement, .line = 2 },
+            .{ .code = .expected_expression, .line = 3 },
+            .{ .code = .expected_token, .line = 4 },
+            .{ .code = .unexpected_token, .line = 5 },
+            .{ .code = .expected_token, .line = 6 },
+            .{ .code = .expected_token, .line = 7 },
+            .{ .code = .expected_expression, .line = 8 },
+            .{ .code = .expected_expression, .line = 9 },
+            .{ .code = .unsupported_statement, .line = 10 },
+            .{ .code = .expected_expression, .line = 11 },
+        },
+    },
+    .{
+        .path = "Tests/Fixtures/negative_expressions.bas",
+        .expected = &.{
+            .{ .code = .wrong_argument_count, .line = 1 },
+            .{ .code = .wrong_argument_count, .line = 2 },
+            .{ .code = .wrong_argument_count, .line = 3 },
+            .{ .code = .wrong_argument_count, .line = 4 },
+            .{ .code = .wrong_argument_count, .line = 5 },
+            .{ .code = .wrong_argument_count, .line = 6 },
+            .{ .code = .wrong_argument_count, .line = 7 },
+            .{ .code = .wrong_argument_count, .line = 8 },
+            .{ .code = .expected_expression, .line = 9 },
+            .{ .code = .expected_separator, .line = 10 },
+            .{ .code = .invalid_byte, .line = 11 },
+            .{ .code = .expected_expression, .line = 12 },
+            .{ .code = .expected_expression, .line = 13 },
+        },
+    },
+};
+
+test "all public positive BAS fixtures satisfy the v1 source contract" {
+    const allocator = std.testing.allocator;
+    for (positive_fixtures) |path| {
+        const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(frontend.maximum_source_bytes));
+        defer allocator.free(source);
+
+        const result = frontend.analyzeNamed(path, source, tokens[0..], diagnostics[0..]);
+        if (!result.ok()) dumpDiagnostics(source, result);
+        try std.testing.expect(!result.diagnostics_truncated);
+        try std.testing.expect(result.ok());
+        try std.testing.expect(result.summary.statements != 0);
+    }
+}
+
+test "negative BAS fixtures produce their contracted diagnostics" {
+    const allocator = std.testing.allocator;
+    for (negative_fixtures) |fixture| {
+        const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, fixture.path, allocator, .limited(frontend.maximum_source_bytes));
+        defer allocator.free(source);
+
+        const result = frontend.analyzeNamed(fixture.path, source, tokens[0..], diagnostics[0..]);
+        if (result.ok()) std.debug.print("negative fixture unexpectedly passed: {s}\n", .{fixture.path});
+        try std.testing.expect(!result.ok());
+        try std.testing.expect(!result.diagnostics_truncated);
+
+        const repeated = frontend.analyzeNamed(fixture.path, source, repeat_tokens[0..], repeat_diagnostics[0..]);
+        try std.testing.expectEqual(result.token_count, repeated.token_count);
+        try std.testing.expectEqual(result.diagnostic_count, repeated.diagnostic_count);
+        try std.testing.expectEqual(result.diagnostics_truncated, repeated.diagnostics_truncated);
+        for (diagnostics[0..result.diagnostic_count], repeat_diagnostics[0..repeated.diagnostic_count]) |first, second| {
+            try std.testing.expectEqual(first.code, second.code);
+            try std.testing.expectEqual(first.span, second.span);
+            try std.testing.expectEqualStrings(first.file_name, second.file_name);
+        }
+
+        for (diagnostics[0..result.diagnostic_count]) |diagnostic| {
+            try std.testing.expectEqualStrings(fixture.path, diagnostic.file_name);
+        }
+        for (fixture.expected) |expected| {
+            if (!containsDiagnostic(result, expected)) {
+                dumpDiagnostics(source, result);
+                std.debug.print("missing diagnostic {s} on line {d} in {s}\n", .{
+                    @tagName(expected.code),
+                    expected.line,
+                    fixture.path,
+                });
+            }
+            try std.testing.expect(containsDiagnostic(result, expected));
+        }
+    }
+}
+
+test "line endings and extended string bytes are source-stable" {
+    const sources = [_][]const u8{
+        "PRINT \"one\"\nPRINT \"two\"\n",
+        "PRINT \"one\"\rPRINT \"two\"\r",
+        "PRINT \"one\"\r\nPRINT \"two\"\r\n",
+        "Text$ = \"\x80\xFF\"\nEND\n",
+    };
+    for (sources, 0..) |source, index| {
+        const result = frontend.analyzeNamed("line-endings.bas", source, tokens[0..], diagnostics[0..]);
+        if (!result.ok()) dumpDiagnostics(source, result);
+        try std.testing.expect(result.ok());
+        if (index < 3) try std.testing.expectEqual(@as(u32, 2), result.summary.statements);
+    }
+}
+
+test "keyword matching preserves the original source spelling" {
+    const source = "DeFiNt A-Z\n";
+    const result = frontend.analyzeNamed("case.bas", source, tokens[0..], diagnostics[0..]);
     try std.testing.expect(result.ok());
-    try std.testing.expect(result.summary.statements >= 8);
-    try std.testing.expectEqual(@as(u32, 1), result.summary.metacommands);
+    try std.testing.expectEqual(frontend.TokenKind.keyword, tokens[0].kind);
+    try std.testing.expectEqual(frontend.Keyword.defint, tokens[0].keyword);
+    try std.testing.expectEqualStrings("DeFiNt", tokens[0].text(source));
+}
+
+test "diagnostics retain exact file line column and byte span" {
+    const source = "PRINT @\r\nPRINT 1\r\n";
+    const result = frontend.analyzeNamed("position.bas", source, tokens[0..], diagnostics[0..]);
+    try std.testing.expect(!result.ok());
+    try std.testing.expect(result.diagnostic_count >= 1);
+    const diagnostic = diagnostics[0];
+    try std.testing.expectEqual(frontend.DiagnosticCode.invalid_byte, diagnostic.code);
+    try std.testing.expectEqualStrings("position.bas", diagnostic.file_name);
+    try std.testing.expectEqual(@as(u32, 1), diagnostic.span.line);
+    try std.testing.expectEqual(@as(u32, 7), diagnostic.span.column);
+    try std.testing.expectEqualStrings("@", diagnostic.span.bytes(source));
+}
+
+test "identifiers honor the 40-byte source-contract boundary" {
+    var accepted_source: [45]u8 = undefined;
+    @memset(accepted_source[0..40], 'A');
+    @memcpy(accepted_source[40..], " = 1\n");
+    const accepted = frontend.analyzeNamed("identifier-40.bas", accepted_source[0..], tokens[0..], diagnostics[0..]);
+    try std.testing.expect(accepted.ok());
+
+    var rejected_source: [46]u8 = undefined;
+    @memset(rejected_source[0..41], 'A');
+    @memcpy(rejected_source[41..], " = 1\n");
+    const rejected = frontend.analyzeNamed("identifier-41.bas", rejected_source[0..], tokens[0..], diagnostics[0..]);
+    try std.testing.expect(!rejected.ok());
+    try std.testing.expect(containsCode(rejected, .invalid_identifier));
+}
+
+test "bounded caller storage fails visibly" {
+    var tiny_tokens: [2]frontend.Token = undefined;
+    const token_result = frontend.analyzeNamed("tokens.bas", "PRINT 1\n", tiny_tokens[0..], diagnostics[0..]);
+    try std.testing.expect(!token_result.ok());
+    try std.testing.expect(containsCode(token_result, .token_capacity_exceeded));
+
+    var no_diagnostics: [0]frontend.Diagnostic = .{};
+    const diagnostic_result = frontend.analyzeNamed("diagnostics.bas", "@", tokens[0..], no_diagnostics[0..]);
+    try std.testing.expect(!diagnostic_result.ok());
+    try std.testing.expect(diagnostic_result.diagnostics_truncated);
+
+    const allocator = std.testing.allocator;
+    const oversized = try allocator.alloc(u8, frontend.maximum_source_bytes + 1);
+    defer allocator.free(oversized);
+    @memset(oversized, ' ');
+    const source_result = frontend.analyzeNamed("large.bas", oversized, tokens[0..], diagnostics[0..]);
+    try std.testing.expect(!source_result.ok());
+    try std.testing.expect(containsCode(source_result, .source_too_large));
+}
+
+test "production sources contain no acceptance-program specialization" {
+    const allocator = std.testing.allocator;
+    const production_sources = [_][]const u8{
+        "src/frontend.zig",
+        "src/main.zig",
+    };
+    for (production_sources) |path| {
+        const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(1024 * 1024));
+        defer allocator.free(source);
+        try std.testing.expect(!containsAsciiIgnoreCase(source, "gorilla"));
+    }
+}
+
+fn containsDiagnostic(result: frontend.Result, expected: ExpectedDiagnostic) bool {
+    for (diagnostics[0..result.diagnostic_count]) |diagnostic| {
+        if (diagnostic.code == expected.code and diagnostic.span.line == expected.line) return true;
+    }
+    return false;
+}
+
+fn containsCode(result: frontend.Result, code: frontend.DiagnosticCode) bool {
+    for (diagnostics[0..result.diagnostic_count]) |diagnostic| {
+        if (diagnostic.code == code) return true;
+    }
+    return false;
+}
+
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) return true;
+    }
+    return false;
 }
 
 fn dumpDiagnostics(source: []const u8, result: frontend.Result) void {
     for (diagnostics[0..result.diagnostic_count]) |diagnostic| {
-        std.debug.print("{d}:{d}: {s}: {s}\n", .{
+        std.debug.print("{s}:{d}:{d}: {s}: {s}\n", .{
+            diagnostic.file_name,
             diagnostic.span.line,
             diagnostic.span.column,
             @tagName(diagnostic.code),
@@ -36,4 +255,3 @@ fn dumpDiagnostics(source: []const u8, result: frontend.Result) void {
         });
     }
 }
-

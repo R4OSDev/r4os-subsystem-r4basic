@@ -1,0 +1,106 @@
+﻿R4BASIC.R4X
+============
+
+R4BASIC ist der eigenstaendige QBasic-kompatible Subsystemhost von R4OS. Das
+Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
+Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
+`GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
+
+Stand 0.66.5
+------------
+
+Diese Ausbaustufe besitzt das produktive Modulprojekt und das versionierte
+Quellfrontend. Der Lexer und Parser fuehren noch keinen BASIC-Code aus. Sie
+pruefen den eingefrorenen v1-Syntaxvertrag, erhalten exakte Quellspannen und
+erzeugen begrenzte, deterministische Diagnosen mit Dateiname, Zeile und
+Spalte. Die spaetere Bindung und Bytecode-VM arbeiten auf diesem Vertrag auf,
+ohne den Quelltext in jeder Schleife erneut einzulesen.
+
+Die vollstaendige zugesagte und ausgeschlossene Sprachoberflaeche steht in
+`COMPATIBILITY.md`. Diese Datei ist die versionierte Projektwahrheit fuer den
+Frontendumfang; das lokale Referenzverzeichnis ist die Wissensbasis, aber
+kein Bestandteil des Repositorys oder des Images.
+
+Frontendaufbau
+--------------
+
+`src/frontend.zig` arbeitet ohne versteckte Heapallokation. Der Aufrufer
+liefert Quellbytes, Dateiname, Tokenspeicher und Diagnosespeicher. Die
+oeffentliche Funktion `analyzeNamed` fuehrt nacheinander Lexer und Parser aus
+und liefert Zaehler, Trunkierungsstatus sowie eine kleine Strukturuebersicht.
+`analyze` bleibt die namenlose Kurzform fuer eingebettete Quellen.
+
+Grenzen:
+
+- maximal 256 KiB Quelltext
+- empfohlener Speicher fuer 24 Ki Tokens
+- empfohlener Speicher fuer 128 Diagnosen
+- maximal 40 Byte je einfachem Bezeichnertoken
+- maximal 128 gleichzeitig offene Syntaxbloecke
+
+Der Lexer verarbeitet CRLF, LF und CR als gleichwertige logische
+Zeilenenden. Er faltet Namen nur zum Vergleich in ASCII, behaelt aber die
+Originalbytes im Span. Bytes oberhalb ASCII bleiben innerhalb von
+Stringliteralen erhalten. Unbekannte Bytes, unvollstaendige Zahlen,
+unbeendete Strings, zu lange Namen und nicht zugesagte Metaanweisungen werden
+sichtbar gemeldet.
+
+Der Parser trennt Statements an Zeilenenden und Doppelpunkten. Nach einem
+Syntaxfehler synchronisiert er nur bis zu dieser sicheren Grenze. Dadurch
+koennen mehrere unabhaengige Fehler gemeldet werden, ohne beliebig weit in
+eine beschaedigte Zeile hinein zu raten. Offene und unpassende Bloecke werden
+getrennt diagnostiziert.
+
+Tests
+-----
+
+Der normale, vollstaendig oeffentliche Testlauf lautet:
+
+    Build.bat test
+
+Er baut und inspiziert das GUI-R4X und fuehrt die Component-Tests aus. Vier
+positive BAS-Fixtures decken Quellvertrag, Deklarationen, Kontrollfluss sowie
+I/O/Grafik/Audio-Syntax ab. Vier negative BAS-Fixtures pruefen Lexergrenzen,
+Strukturfehler, nicht zugesagte Statements und Funktionsaritaeten. Zusaetzlich
+werden Zeilenenden, 8-Bit-Stringbytes, exakte Dateipositionen, deterministische
+Wiederholung und zu kleine Aufruferspeicher direkt getestet.
+
+Die optionale lokale Realprogrammabnahme lautet:
+
+    Build.bat gorilla-test
+
+Sie liest ausschliesslich
+`D:\R4OS\Artifacts\Distribution\Injection\Temp\gorilla.bas`, verlangt
+29.434 Byte und die SHA-256-Pruefsumme
+`9926FC1F50C4B489EC4C1B0DA5BD2C497EBF4282B3259C28A835A743E24699F7` und
+uebergibt danach die unveraenderten Bytes an dasselbe Frontend. Der normale
+Build benoetigt diese lokale Datei nicht.
+
+Referenzen und Rechte
+---------------------
+
+Die lokale Arbeitsreferenz liegt unter
+`D:\R4OS\ExFiles\Reference\Basic\`. Dort sind Herkunft, Revisionen,
+Pruefsummen und Rang der Microsoft-QuickBASIC-Handbuecher sowie der nur zum
+Architekturvergleich beschafften offenen Implementierung dokumentiert.
+
+Weder die Microsoft-Handbuecher noch fremder Interpretercode oder die lokale
+GORILLA.BAS werden in dieses Repository kopiert. `PROVENANCE.txt` beschreibt
+die eigenstaendige Entstehung des Zig-Codes; `THIRD_PARTY_NOTICES.md`
+beschreibt die nicht redistributierten Referenzen. Vor einer spaeteren
+Aufnahme von GORILLA.BAS in ein oeffentliches Image muessen die
+Weitergaberechte getrennt geklaert sein.
+
+Noch nicht Bestandteil dieses Stands
+------------------------------------
+
+- Symbolbindung, Typpruefung und Bytecode
+- Ausfuehrung, Scheduling und Laufzeitfehler
+- virtueller Text- und Grafikbildschirm
+- Tastatur, Gastzeit, Zufall und Dateilaufzeit
+- Audio und Music Macro Language
+- produktives Laden und Anzeigen einer BAS-Datei im Fenster
+
+Diese Funktionen folgen in getrennten Unterversionen. Syntaxakzeptanz allein
+darf in Dokumentation und Tests nie als ausgefuehrte Kompatibilitaet
+bezeichnet werden.

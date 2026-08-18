@@ -1,0 +1,31 @@
+﻿R4BASIC provenance
+==================
+
+Fachliche Entstehung:
+- Neue, eigenstaendige Zig-Implementierung fuer R4OS 0.66.X.
+- Kein Quelltransfer aus einem frueheren R4OS-BASIC-Projekt.
+- Kein uebernommener Quellcode aus einer fremden Interpreterimplementierung.
+
+Primaere Sprachreferenz:
+- Microsoft QuickBASIC 4.5 Language Reference.
+- Microsoft QuickBASIC 4.5 Programming in BASIC.
+- Lokaler Referenzindex: D:\R4OS\ExFiles\Reference\Basic\README.txt
+- PCjs-Revision: 67b950f7eed3447c5c056e3d048ba4f62a94aead
+
+Reale lokale Abnahmequelle:
+- Pfad: D:\R4OS\Artifacts\Distribution\Injection\Temp\gorilla.bas
+- Groesse: 29.434 Byte
+- SHA-256: 9926FC1F50C4B489EC4C1B0DA5BD2C497EBF4282B3259C28A835A743E24699F7
+- Die Datei wird nicht in diesem Repository oder einem oeffentlichen Image
+  mitgefuehrt.
+
+Sekundaerer Architekturvergleich:
+- rusty-basic von Nikolaos Georgiou, Revision
+  2c2ad197c5727d3290775e7a73e24d640a1650a7, MIT License.
+- Bewertet wurden nur allgemeine Schichtgrenzen. Es wurde kein Quellcode
+  uebernommen.
+
+Permanenter Testbestand:
+- Alle Dateien unter Tests/Fixtures sind neue, originale R4OS-Testprogramme.
+- Sie enthalten weder Quellzeilen noch Datenbloecke der lokalen
+  Realprogrammabnahme.

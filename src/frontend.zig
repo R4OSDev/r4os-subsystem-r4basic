@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const contract_version = "1.0.0";
 pub const maximum_source_bytes: usize = 256 * 1024;
+pub const maximum_identifier_bytes: usize = 40;
 pub const recommended_token_capacity: usize = 24 * 1024;
 pub const recommended_diagnostic_capacity: usize = 128;
 
@@ -23,6 +24,7 @@ pub const DiagnosticCode = enum {
     token_capacity_exceeded,
     diagnostic_capacity_exceeded,
     invalid_byte,
+    invalid_identifier,
     invalid_number,
     unterminated_string,
     unsupported_metacommand,
@@ -31,6 +33,7 @@ pub const DiagnosticCode = enum {
     expected_expression,
     expected_separator,
     expected_token,
+    wrong_argument_count,
     unsupported_statement,
     unexpected_token,
     unmatched_block,
@@ -41,6 +44,7 @@ pub const DiagnosticCode = enum {
 pub const Diagnostic = struct {
     code: DiagnosticCode,
     span: Span,
+    file_name: []const u8 = "",
 
     pub fn message(self: Diagnostic) []const u8 {
         return switch (self.code) {
@@ -48,6 +52,7 @@ pub const Diagnostic = struct {
             .token_capacity_exceeded => "token buffer is too small",
             .diagnostic_capacity_exceeded => "diagnostic buffer is too small",
             .invalid_byte => "invalid byte in BASIC source",
+            .invalid_identifier => "BASIC identifier exceeds the v1 length limit",
             .invalid_number => "malformed numeric literal",
             .unterminated_string => "unterminated string literal",
             .unsupported_metacommand => "unsupported BASIC metacommand",
@@ -56,6 +61,7 @@ pub const Diagnostic = struct {
             .expected_expression => "expected BASIC expression",
             .expected_separator => "expected statement separator",
             .expected_token => "required token is missing",
+            .wrong_argument_count => "function has the wrong number of arguments",
             .unsupported_statement => "statement is outside the R4BASIC v1 contract",
             .unexpected_token => "unexpected token",
             .unmatched_block => "block terminator does not match the active block",
@@ -237,6 +243,7 @@ pub const Result = struct {
 
 const DiagnosticSink = struct {
     storage: []Diagnostic,
+    file_name: []const u8,
     count: usize = 0,
     truncated: bool = false,
 
@@ -245,13 +252,17 @@ const DiagnosticSink = struct {
             self.truncated = true;
             return;
         }
-        self.storage[self.count] = .{ .code = code, .span = span };
+        self.storage[self.count] = .{ .code = code, .span = span, .file_name = self.file_name };
         self.count += 1;
     }
 };
 
 pub fn analyze(source: []const u8, tokens: []Token, diagnostics: []Diagnostic) Result {
-    var sink = DiagnosticSink{ .storage = diagnostics };
+    return analyzeNamed("", source, tokens, diagnostics);
+}
+
+pub fn analyzeNamed(file_name: []const u8, source: []const u8, tokens: []Token, diagnostics: []Diagnostic) Result {
+    var sink = DiagnosticSink{ .storage = diagnostics, .file_name = file_name };
     if (source.len > maximum_source_bytes) {
         sink.add(.source_too_large, .{ .start = 0, .end = 0, .line = 1, .column = 1 });
         return .{
@@ -326,7 +337,7 @@ const Lexer = struct {
                 '<', '>' => self.lexComparison(),
                 '"' => self.lexString(),
                 '0'...'9' => self.lexNumber(),
-                'A'...'Z', 'a'...'z', '_' => self.lexWord(),
+                'A'...'Z', 'a'...'z' => self.lexWord(),
                 else => {
                     const span = self.pointSpan();
                     self.diagnostics.add(.invalid_byte, span);
@@ -383,6 +394,9 @@ const Lexer = struct {
         while (self.index < self.source.len and isIdentifierBody(self.source[self.index])) self.advanceByte();
         if (self.index < self.source.len and isTypeSuffix(self.source[self.index])) self.advanceByte();
         const text = self.source[start..self.index];
+        if (text.len > maximum_identifier_bytes) {
+            self.diagnostics.add(.invalid_identifier, self.makeSpan(start, self.index, line, column));
+        }
 
         if (self.statement_start and std.ascii.eqlIgnoreCase(text, "REM")) {
             var probe = self.index;
@@ -426,7 +440,7 @@ const Lexer = struct {
             while (self.index < self.source.len and std.ascii.isDigit(self.source[self.index])) self.advanceByte();
             if (self.index == exponent_start) self.diagnostics.add(.invalid_number, self.makeSpan(start, self.index, line, column));
         }
-        if (self.index < self.source.len and isTypeSuffix(self.source[self.index])) self.advanceByte();
+        if (self.index < self.source.len and isNumericTypeSuffix(self.source[self.index])) self.advanceByte();
         self.emit(.number, .none, self.makeSpan(start, self.index, line, column));
         self.statement_start = false;
     }
@@ -442,10 +456,6 @@ const Lexer = struct {
             if (byte == '\r' or byte == '\n') break;
             if (byte == '"') {
                 self.advanceByte();
-                if (self.index < self.source.len and self.source[self.index] == '"') {
-                    self.advanceByte();
-                    continue;
-                }
                 terminated = true;
                 break;
             }
@@ -532,11 +542,15 @@ const Lexer = struct {
 };
 
 fn isIdentifierBody(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or byte == '_';
+    return std.ascii.isAlphanumeric(byte);
 }
 
 fn isTypeSuffix(byte: u8) bool {
     return byte == '$' or byte == '%' or byte == '&' or byte == '!' or byte == '#';
+}
+
+fn isNumericTypeSuffix(byte: u8) bool {
+    return byte == '%' or byte == '&' or byte == '!' or byte == '#';
 }
 
 fn metacommandKeyword(text: []const u8) Keyword {
@@ -655,10 +669,18 @@ fn keywordFor(text: []const u8) Keyword {
     for (entries) |entry| if (std.ascii.eqlIgnoreCase(text, entry.text)) return entry.keyword;
 
     const unsupported = [_][]const u8{
-        "BLOAD", "BSAVE", "CHAIN", "CHDIR", "CHDRIVE", "COMMON", "DRAW",
-        "ENVIRON", "FIELD", "FILES", "IOCTL", "KEY", "KILL", "LOAD",
-        "LOCK", "LPRINT", "MKDIR", "NAME", "OUT", "PCOPY", "RANDOM",
-        "RMDIR", "RUN", "SAVE", "SHELL", "SYSTEM", "UNLOCK", "WAIT",
+        "ASC",     "BASE",   "BLOAD",    "BSAVE",  "CDBL",    "CHAIN",    "CHDIR",
+        "CHDRIVE", "CLNG",   "COMMAND$", "COMMON", "CSNG",    "CVD",      "CVI",
+        "CVL",     "CVS",    "DATE$",    "DRAW",   "ENVIRON", "ENVIRON$", "EQV",
+        "ERASE",   "ERL",    "ERR",      "EXP",    "FIELD",   "FILES",    "FIX",
+        "FRE",     "HEX$",   "IMP",      "INP",    "INPUT$",  "IOCTL",    "IOCTL$",
+        "IS",      "KEY",    "KILL",     "LBOUND", "LCASE$",  "LOAD",     "LOC",
+        "LOCK",    "LOF",    "LOG",      "LPOS",   "LPRINT",  "MKD$",     "MKDIR",
+        "MKI$",    "MKL$",   "MKS$",     "NAME",   "OCT$",    "OPTION",   "OUT",
+        "PCOPY",   "POS",    "PRESERVE", "PRESET", "RANDOM",  "RIGHT$",   "RMDIR",
+        "RUN",     "SADD",   "SAVE",     "SGN",    "SHELL",   "SOUND",    "SPC",
+        "SQR",     "STICK",  "STRIG",    "SWAP",   "SYSTEM",  "TAN",      "TIME$",
+        "UBOUND",  "UNLOCK", "USING",    "VARPTR", "VARSEG",  "WAIT",     "WRITE",
     };
     for (unsupported) |word| if (std.ascii.eqlIgnoreCase(text, word)) return .unsupported;
     return .none;
@@ -1103,7 +1125,8 @@ const Parser = struct {
             if (count == maximum) return self.fail(.unexpected_token);
             if ((self.atBoundary() or self.atKeyword(.else_)) and !allow_missing) return self.fail(.expected_expression);
         }
-        return count >= minimum;
+        if (count < minimum) return self.fail(.expected_expression);
+        return true;
     }
 
     fn parseViewPrint(self: *Parser) bool {
@@ -1330,14 +1353,40 @@ const Parser = struct {
             return self.parsePostfix();
         }
         if (self.at(.keyword) and isBuiltinFunction(self.current().keyword)) {
-            self.advance();
-            return self.parsePostfix();
+            return self.parseBuiltinFunction();
         }
         if (self.consume(.left_paren)) {
             if (!self.parseExpression() or !self.expect(.right_paren)) return false;
             return self.parsePostfix();
         }
         return self.fail(.expected_expression);
+    }
+
+    fn parseBuiltinFunction(self: *Parser) bool {
+        const token = self.current();
+        const signature = builtinSignature(token.keyword) orelse return self.fail(.expected_expression);
+        self.advance();
+
+        if (!self.consume(.left_paren)) {
+            if (signature.allow_bare) return true;
+            return self.failAt(.expected_token, token.span);
+        }
+        if (!signature.allow_parentheses) return self.failAt(.wrong_argument_count, token.span);
+
+        var argument_count: usize = 0;
+        if (!self.consume(.right_paren)) {
+            while (true) {
+                if (!self.parseExpression()) return false;
+                argument_count += 1;
+                if (!self.consume(.comma)) break;
+            }
+            if (!self.expect(.right_paren)) return false;
+        }
+
+        if (argument_count < signature.minimum or argument_count > signature.maximum) {
+            return self.failAt(.wrong_argument_count, token.span);
+        }
+        return true;
     }
 
     fn parsePostfix(self: *Parser) bool {
@@ -1466,7 +1515,14 @@ fn binaryPrecedence(token: Token) u8 {
     };
 }
 
-fn isBuiltinFunction(keyword: Keyword) bool {
+const BuiltinSignature = struct {
+    minimum: usize,
+    maximum: usize,
+    allow_bare: bool = false,
+    allow_parentheses: bool = true,
+};
+
+fn builtinSignature(keyword: Keyword) ?BuiltinSignature {
     return switch (keyword) {
         .abs,
         .atn,
@@ -1474,24 +1530,30 @@ fn isBuiltinFunction(keyword: Keyword) bool {
         .cint,
         .cos,
         .eof,
-        .inkey_string,
-        .instr,
         .int,
-        .left_string,
         .len,
         .ltrim_string,
-        .mid_string,
         .peek,
-        .point,
-        .rnd,
         .sin,
         .space_string,
         .str_string,
         .tab,
-        .timer,
         .ucase_string,
         .val,
-        => true,
-        else => false,
+        => .{ .minimum = 1, .maximum = 1 },
+        .left_string, .point => .{ .minimum = 2, .maximum = 2 },
+        .instr, .mid_string => .{ .minimum = 2, .maximum = 3 },
+        .rnd => .{ .minimum = 0, .maximum = 1, .allow_bare = true },
+        .inkey_string, .timer => .{
+            .minimum = 0,
+            .maximum = 0,
+            .allow_bare = true,
+            .allow_parentheses = false,
+        },
+        else => null,
     };
+}
+
+fn isBuiltinFunction(keyword: Keyword) bool {
+    return builtinSignature(keyword) != null;
 }
