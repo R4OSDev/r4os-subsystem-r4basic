@@ -4,20 +4,21 @@ R4BASIC is the QBasic-compatible subsystem host for R4OS. It is a normal GUI
 R4X module with the subsystem identity `r4os.basic` and the guest format
 `basic.qbasic-source`.
 
-The current release keeps the versioned R4BASIC v1 source contract and adds
-an instance-local indexed graphics screen to the one-time compiler and
-cooperative VM. `SCREEN 1` and `SCREEN 9`, palettes, drawing, packed images,
-and coordinate `POINT` now execute against guest memory and are published as
-whole or damaged raster frames through `r4os.subsystem_host`.
+The installed R4X is the productive R4BASIC v1 host. Explorer passes one
+absolute `.BAS` path through `R4SUBSYS1`; R4BASIC loads it through the storage
+facade, compiles it once, and runs an isolated VM in a movable, resizable, and
+maximizable window. `SCREEN 0`, `SCREEN 1`, and `SCREEN 9` are presented as
+whole or damaged indexed raster frames through `r4os.subsystem_host`.
 
-The installed R4X does not load a guest file or open its final BASIC window
-yet. Audio remains a separate later layer; its accepted source forms still
-compile to visible deferred host guards rather than silently doing nothing.
+`BEEP` and the supported QuickBASIC `PLAY` Music Macro Language generate
+48 kHz stereo PCM through the buffered subsystem runtime. Foreground and
+background playback follow `MF` and `MB`; unavailable audio degrades visibly
+without stopping guest time, input, or graphics.
 
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `0.5.0`
+- Module version: `1.0.0`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -42,13 +43,13 @@ documented in `COMPATIBILITY.md`:
     Build.bat gorilla-test
 
 That step verifies and parses the unchanged file, binds its complete data and
-procedure structure, and executes its intro, input path, city construction,
-gorilla images, packed banana animation, collision queries, and one complete
-graphical turn. The final 640 by 350 indexed image and programmed palette
-have deterministic golden values. A test-only explicit host accepts only the
-still-deferred audio statements. The file is not part of this repository and
-is read directly from the ignored workspace injection tree. The normal test
-step uses the permanent general BAS fixtures under `Tests/Fixtures`.
+procedure structure, and executes its intro, edited input, city construction,
+banana flight, building collision, gorilla explosion, victory dance, and
+updated score. The final 640 by 350 indexed image, palette, and twelve real
+`PLAY` sequences have deterministic golden values. The file is not part of
+this repository and is read directly from the ignored workspace injection
+tree. The normal test step uses the permanent general BAS fixtures under
+`Tests/Fixtures`, including the standalone audio contract.
 
 The build starters map the current local R4OS SDK and Contract checkouts from
 `Settings.R4S`. The URL and hash in `build.zig.zon` record the last verified

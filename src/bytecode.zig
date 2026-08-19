@@ -176,6 +176,8 @@ pub const OpCode = enum(u8) {
     sleep,
     file_open,
     file_close,
+    audio_beep,
+    audio_play,
     deferred_statement,
     deferred_builtin,
     convert,

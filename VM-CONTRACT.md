@@ -1,6 +1,6 @@
 ﻿# R4BASIC v1 core VM contract
 
-Contract version: `1.3.0`
+Contract version: `1.4.0`
 
 This document freezes the executable R4BASIC language layers. The broader
 source syntax accepted by the frontend remains defined in
@@ -105,12 +105,13 @@ The VM executes:
 - `SCREEN 1`, `SCREEN 9`, `PALETTE`, `PSET`, coordinate `POINT`, `LINE`
   including `B` and `BF`, `CIRCLE`, `PAINT`, and packed `GET`/`PUT` with
   `PSET` and `XOR`;
+- `BEEP` and `PLAY` with the bounded Music Macro Language described below;
 - `RANDOMIZE`, `SLEEP`, and sequential `OPEN`/`CLOSE`;
 - `END`.
 
-Audio statements owned by the later audio layer bind to explicit deferred
-host guards. A host may accept one explicitly; otherwise reaching it is a
-deterministic host-failure diagnostic, never a silent no-op.
+Audio statements bind directly to instance-local bytecode operations. An
+invalid Music Macro Language command raises catchable BASIC error 5 without
+partially changing the queue or persistent music settings.
 
 ## Procedures and functions
 
@@ -141,10 +142,9 @@ The executable built-ins are `ABS`, `ATN`, `CHR$`, `CINT`, `COS`, `EOF`,
 the arities and type categories defined by the source contract.
 
 `ATN`, `COS`, `SIN`, and power call an injected math service. Cancellation
-polling, the SCREEN-mode availability probe, sequential file I/O, and
-acceptance of a still-deferred audio statement are injected separately. A
-missing or failing required host result becomes a deterministic VM error;
-tests do not depend on hidden process-global hooks.
+polling, the SCREEN-mode availability probe, and sequential file I/O are
+injected separately. A missing or failing required host result becomes a
+deterministic VM error; tests do not depend on hidden process-global hooks.
 
 `DEF SEG = 0` selects a private compatibility byte at offset 1047. `PEEK` and
 `POKE` can read or replace that byte, including its NumLock bit. Omitting the
@@ -184,10 +184,11 @@ guest address can become an R4OS or host pointer.
 
 ## Indexed graphics screen
 
-- Each VM owns either no graphics surface, a 320 by 200 `SCREEN 1` surface
-  with four attributes, or a 640 by 350 `SCREEN 9` surface with sixteen
-  attributes. Pixels are indexed bytes and the mutable 256-entry XRGB
-  palette is separate, so `PALETTE` recolors existing pixels immediately.
+- Each VM owns a host-visible 640 by 400 `SCREEN 0` text raster, a 320 by 200
+  `SCREEN 1` surface with four attributes, or a 640 by 350 `SCREEN 9` surface
+  with sixteen attributes. Graphics primitives remain illegal in mode 0.
+  Pixels are indexed bytes and the mutable 256-entry XRGB palette is separate,
+  so `PALETTE` recolors existing graphics pixels immediately.
 - Mode changes allocate a fresh surface atomically, reset the default
   CGA/EGA palette, current graphics point, and text geometry, and mark one
   full damage rectangle. An injected unavailable mode raises catchable BASIC
@@ -210,6 +211,28 @@ guest address can become an R4OS or host pointer.
   changes use damage frames, and an unchanged guest image publishes no frame.
   Mode revisions remain distinct across VM reset so a presenter always binds
   the replacement pixel allocation before publishing it.
+
+## Audio and Music Macro Language
+
+- Every VM owns its music settings, queued events, oscillator phase, playback
+  deadline, and counters. Reset and teardown clear them without touching any
+  other instance.
+- `PLAY` accepts case-insensitive `O0` through `O6`, `<`, `>`, `L1` through
+  `L64`, `T32` through `T255`, `MB`, `MF`, `MN`, `ML`, `MS`, notes `A` through
+  `G` with `#`, `+`, or `-`, optional note lengths and dots, `P` pauses, and
+  numeric notes `N0` through `N84`. Octave, default length, tempo, mode, and
+  articulation persist within one VM.
+- `MB` queues a sequence and lets the next BASIC instruction continue. `MF`
+  waits cooperatively until the complete queued timeline has elapsed. `BEEP`
+  queues an 800 Hz, 200 ms foreground tone. Neither wait spins or blocks host
+  event polling.
+- The generator emits deterministic 48,000 Hz, stereo, signed 16-bit little-
+  endian square-wave PCM. Hardware timbre is deliberately approximate; note,
+  rest, articulation, and tempo durations follow guest time.
+- `r4os.subsystem_runtime` keeps two audio quanta buffered and submits them
+  through R4AUDIO. A missing or failing sink enters visible degraded mode;
+  samples are discarded while the VM, guest clock, input, and video continue.
+  Stream close and runtime shutdown are idempotent.
 
 ## Guest time, pacing, and random state
 
@@ -288,12 +311,12 @@ guest address can become an R4OS or host pointer.
 - Reset constructs a fresh global-value and aggregate set before discarding
   the old state, then clears stacks, DATA cursor, handlers, trapped error,
   private segment and byte, text screen, keyboard and input line, guest-time
-  waits, random state, sequential files, instruction count, cancellation, and
-  exit state.
-- Audio samples remain a later layer. Video presentation is a separate
-  adapter over the VM-owned surface; scheduling, paused time, and host event
-  polling stay in the shared subsystem runtime rather than moving into the
-  interpreter or video host.
+  waits, random state, audio settings and queue, sequential files, instruction
+  count, cancellation, and exit state.
+- Audio rendering and video presentation are separate adapters over VM-owned
+  state. Scheduling, buffered submission, paused time, and host event polling
+  stay in the shared subsystem runtime rather than moving into the interpreter
+  or video host.
 
 ## Instance and ownership contract
 
@@ -301,8 +324,9 @@ An immutable compiled program may be shared by multiple VMs. Each VM owns
 its globals, strings, array bounds and elements, record fields, aliases, DATA
 cursor, error handlers, compatibility byte, text cells and cursor, graphics
 mode, current point, palette, pixels and damage, keyboard
-and pending input, guest time and sleep deadline, random generator, open
-files, evaluation stack, frames, GOSUB stack, instruction pointer,
+and pending input, guest time and sleep deadline, random generator, music
+settings, audio events and oscillator state, open files, evaluation stack,
+frames, GOSUB stack, instruction pointer,
 instruction count, status, diagnostic, cancellation flag, and exit code.
 Mutating, cancelling, resetting, completing, or faulting one instance cannot
 change another instance.
@@ -374,6 +398,8 @@ The permanent general fixtures below are part of this contract:
   two-instance pixel/palette isolation.
 - `vm_packed_images.bas`: original synthetic LONG arrays in the mode 1 and
   mode 9 packed formats, including reversible PUT XOR.
+- `vm_audio.bas`: stateful MML commands, MB continuation, MF and BEEP guest-
+  time waits, PCM generation, buffering, sink teardown, and degraded audio.
 
 `Tests/compiler_test.zig` also fixes negative binding cases, exact runtime
 positions, QBasic error numbers, string overflow, host failure, and
@@ -385,4 +411,5 @@ file modes and device names, and atomic text-state errors.
 blocks of a 640 by 350 full frame, real damage frames, unchanged-frame
 suppression, a sustained 30-frame animation above 20 frames per second, and
 resize letterboxing. The local GORILLA.BAS acceptance exercises the same
-public compiler, VM, packed-image, and presentation paths.
+public compiler, VM, packed-image, presentation, timing, and audio paths
+through a complete deterministic round.

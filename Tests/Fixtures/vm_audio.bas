@@ -1,0 +1,9 @@
+DEFINT A-Z
+
+PLAY "MBT120O4L8C#DP16N0"
+BackgroundDone = 1
+PLAY "MFT240O5L64EF"
+ForegroundDone = 1
+BEEP
+BeepDone = 1
+END

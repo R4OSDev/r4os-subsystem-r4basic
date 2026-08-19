@@ -273,6 +273,8 @@ const Builder = struct {
             .sleep => self.parseSleep(),
             .open => self.parseOpen(),
             .close => self.parseClose(),
+            .beep => self.parseAudioBeep(),
+            .play => self.parseAudioPlay(),
             .return_ => self.parseReturn(),
             .exit => self.parseExit(),
             .end => self.parseEnd(),
@@ -1321,6 +1323,20 @@ const Builder = struct {
             }
         }
         _ = try self.emit(.file_close, count, 0, statement.span);
+        return true;
+    }
+
+    fn parseAudioBeep(self: *Builder) !bool {
+        const statement = self.advance();
+        _ = try self.emit(.audio_beep, 0, 0, statement.span);
+        return true;
+    }
+
+    fn parseAudioPlay(self: *Builder) !bool {
+        const statement = self.advance();
+        const command_type = (try self.parseExpression()) orelse return false;
+        if (command_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+        _ = try self.emit(.audio_play, 0, 0, statement.span);
         return true;
     }
 

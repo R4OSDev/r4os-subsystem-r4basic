@@ -33,12 +33,15 @@ const mode_1_width: u32 = 320;
 const mode_1_height: u32 = 200;
 const mode_9_width: u32 = 640;
 const mode_9_height: u32 = 350;
+const mode_0_width: u32 = 640;
+const mode_0_height: u32 = 400;
 const text_columns_mode_1: usize = 40;
 const text_columns_mode_9: usize = 80;
 const text_rows: usize = 25;
 const text_cell_width: usize = 8;
 const text_cell_height_mode_1: usize = 8;
 const text_cell_height_mode_9: usize = 14;
+const text_cell_height_mode_0: usize = 16;
 const image_header_bytes: usize = 4;
 const maximum_circle_segments: usize = 16_384;
 
@@ -72,25 +75,18 @@ pub const Screen = struct {
     }
 
     pub fn setMode(self: *Screen, allocator: std.mem.Allocator, mode: i32) Error!void {
-        if (mode == 0) {
-            if (self.pixels) |pixels| allocator.free(pixels);
-            self.pixels = null;
-            self.width = 0;
-            self.height = 0;
-            self.mode = 0;
-            self.current = .{ .x = 0, .y = 0 };
-            self.damage = null;
-            self.mode_revision +%= 1;
-            self.content_revision +%= 1;
-            return;
-        }
-
         const width: u32 = switch (mode) {
+            0 => mode_0_width,
             1 => mode_1_width,
             9 => mode_9_width,
             else => return error.IllegalFunctionCall,
         };
-        const height: u32 = if (mode == 1) mode_1_height else mode_9_height;
+        const height: u32 = switch (mode) {
+            0 => mode_0_height,
+            1 => mode_1_height,
+            9 => mode_9_height,
+            else => unreachable,
+        };
         const count = std.math.mul(usize, width, height) catch return error.OutOfMemory;
         const replacement = try allocator.alloc(u8, count);
         @memset(replacement, 0);
@@ -126,10 +122,11 @@ pub const Screen = struct {
     }
 
     pub fn maximumAttribute(self: *const Screen) u8 {
-        return if (self.mode == 1) 3 else if (self.mode == 9) 15 else 0;
+        return if (self.mode == 1) 3 else if (self.mode == 0 or self.mode == 9) 15 else 0;
     }
 
     pub fn setPalette(self: *Screen, requested_attribute: i32, display_color: i32) Error!void {
+        if (self.mode == 0) return error.IllegalFunctionCall;
         if (requested_attribute < 0 or requested_attribute > self.maximumAttribute()) return error.IllegalFunctionCall;
         const hardware_code: u8 = switch (self.mode) {
             1 => if (display_color >= 0 and display_color < ega_16_codes.len)
@@ -174,6 +171,7 @@ pub const Screen = struct {
     }
 
     pub fn point(self: *const Screen, point_value: Point) Error!i32 {
+        if (self.mode == 0) return error.IllegalFunctionCall;
         const pixels = self.pixels orelse return error.IllegalFunctionCall;
         if (!self.contains(point_value.x, point_value.y)) return -1;
         return pixels[self.pixelIndex(point_value.x, point_value.y)];
@@ -277,6 +275,7 @@ pub const Screen = struct {
     }
 
     pub fn capture(self: *const Screen, allocator: std.mem.Allocator, first: Point, second: Point) Error![]u8 {
+        if (self.mode == 0) return error.IllegalFunctionCall;
         const pixels = self.pixels orelse return error.IllegalFunctionCall;
         const left = @min(first.x, second.x);
         const right = @max(first.x, second.x);
@@ -319,6 +318,7 @@ pub const Screen = struct {
     }
 
     pub fn put(self: *Screen, origin: Point, bytes: []const u8, action: bytecode.GraphicsPutAction) Error!void {
+        if (self.mode == 0) return error.IllegalFunctionCall;
         if (self.pixels == null or bytes.len < image_header_bytes) return error.IllegalFunctionCall;
         const width_bits: usize = std.mem.readInt(u16, bytes[0..2], .little);
         const image_height: usize = std.mem.readInt(u16, bytes[2..4], .little);
@@ -367,9 +367,14 @@ pub const Screen = struct {
     }
 
     pub fn renderText(self: *Screen, text: *const text_screen.Screen, cells: text_screen.CellRect) void {
-        if (self.pixels == null or self.mode == 0) return;
+        if (self.pixels == null) return;
         const columns = if (self.mode == 1) text_columns_mode_1 else text_columns_mode_9;
-        const cell_height = if (self.mode == 1) text_cell_height_mode_1 else text_cell_height_mode_9;
+        const cell_height = switch (self.mode) {
+            0 => text_cell_height_mode_0,
+            1 => text_cell_height_mode_1,
+            9 => text_cell_height_mode_9,
+            else => return,
+        };
         const first_x = @min(cells.x, columns);
         const first_y = @min(cells.y, text_rows);
         const last_x = @min(columns, cells.x +| cells.w);
@@ -402,7 +407,7 @@ pub const Screen = struct {
             for (screen_1_defaults, 0..) |logical_color, palette_index| {
                 self.palette[palette_index] = egaRgb(ega_16_codes[logical_color]);
             }
-        } else if (self.mode == 9) {
+        } else if (self.mode == 0 or self.mode == 9) {
             for (ega_16_codes, 0..) |hardware_code, palette_index| {
                 self.palette[palette_index] = egaRgb(hardware_code);
             }
@@ -410,7 +415,7 @@ pub const Screen = struct {
     }
 
     fn attribute(self: *const Screen, requested: i32) Error!u8 {
-        if (self.pixels == null or requested < 0 or requested > self.maximumAttribute()) {
+        if (self.mode == 0 or self.pixels == null or requested < 0 or requested > self.maximumAttribute()) {
             return error.IllegalFunctionCall;
         }
         return @intCast(requested);

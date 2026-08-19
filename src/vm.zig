@@ -1,4 +1,5 @@
 const std = @import("std");
+const audio = @import("audio.zig");
 const bytecode = @import("bytecode.zig");
 const frontend = @import("frontend.zig");
 const graphics_screen = @import("graphics_screen.zig");
@@ -326,6 +327,9 @@ pub const Vm = struct {
     pending_sleep_instruction: u32 = bytecode.invalid_index,
     sleep_deadline_ns: u64 = 0,
     sleep_input_generation: u64 = 0,
+    audio_engine: audio.Engine,
+    pending_audio_instruction: u32 = bytecode.invalid_index,
+    audio_deadline_ns: u64 = 0,
     random_state: u32 = default_random_seed,
     random_last: f32 = 0,
     files: [maximum_file_number + 1]?SequentialFile = [_]?SequentialFile{null} ** (maximum_file_number + 1),
@@ -348,6 +352,7 @@ pub const Vm = struct {
             .globals = globals,
             .instruction_pointer = program.module_entry,
             .random_state = normalizeRandomSeed(host.initial_random_seed),
+            .audio_engine = audio.Engine.init(allocator),
         };
     }
 
@@ -362,6 +367,7 @@ pub const Vm = struct {
         self.gosub_stack.deinit(self.allocator);
         self.keyboard.deinit(self.allocator);
         self.input_line.deinit(self.allocator);
+        self.audio_engine.deinit();
         self.discardFiles();
         self.graphics.deinit(self.allocator);
         deinitGlobals(self.allocator, self.globals);
@@ -374,6 +380,19 @@ pub const Vm = struct {
 
     pub fn setGuestTime(self: *Vm, guest_now_ns: u64) void {
         self.guest_now_ns = guest_now_ns;
+        self.audio_engine.setGuestTime(guest_now_ns);
+    }
+
+    pub fn renderAudio(self: *Vm, out: []u8) i32 {
+        return self.audio_engine.render(out);
+    }
+
+    pub fn audioStats(self: *const Vm) audio.Stats {
+        return self.audio_engine.stats;
+    }
+
+    pub fn pendingAudioFrames(self: *const Vm) u64 {
+        return self.audio_engine.pendingFrames();
     }
 
     pub fn setInputFocused(self: *Vm, focused: bool) void {
@@ -412,6 +431,16 @@ pub const Vm = struct {
     pub fn graphicsView(self: *Vm) ?graphics_screen.View {
         self.syncTextToGraphics();
         return self.graphics.view();
+    }
+
+    pub fn prepareHostDisplay(self: *Vm) InitError!void {
+        if (self.graphics.view() == null) {
+            self.graphics.setMode(self.allocator, 0) catch |fault| switch (fault) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.IllegalFunctionCall => return error.InvalidProgram,
+            };
+        }
+        self.syncTextToGraphics();
     }
 
     pub fn takeGraphicsDamage(self: *Vm) ?graphics_screen.Rect {
@@ -462,6 +491,9 @@ pub const Vm = struct {
         self.pending_sleep_instruction = bytecode.invalid_index;
         self.sleep_deadline_ns = 0;
         self.sleep_input_generation = 0;
+        self.audio_engine.reset();
+        self.pending_audio_instruction = bytecode.invalid_index;
+        self.audio_deadline_ns = 0;
         self.random_state = normalizeRandomSeed(self.host.initial_random_seed);
         self.random_last = 0;
         self.discardFiles();
@@ -685,6 +717,8 @@ pub const Vm = struct {
             .sleep => try self.sleep(instruction_index, instruction.a),
             .file_open => try self.openFile(@enumFromInt(@as(u8, @intCast(instruction.a)))),
             .file_close => try self.closeFiles(instruction.a),
+            .audio_beep => try self.audioBeep(instruction_index),
+            .audio_play => try self.audioPlay(instruction_index),
             .deferred_statement => self.host.deferred_statement(
                 self.host.context,
                 @enumFromInt(@as(u8, @intCast(instruction.a))),
@@ -1124,7 +1158,6 @@ pub const Vm = struct {
     }
 
     fn syncTextToGraphics(self: *Vm) void {
-        if (self.screen_mode == 0) return;
         if (self.text.takeDirty()) |dirty| self.graphics.renderText(&self.text, dirty);
     }
 
@@ -1524,6 +1557,44 @@ pub const Vm = struct {
             return;
         }
         self.wait_wake_ns = @min(self.sleep_deadline_ns, self.guest_now_ns +| input_poll_interval_ns);
+        return error.WouldBlock;
+    }
+
+    fn audioBeep(self: *Vm, instruction_index: u32) ExecutionError!void {
+        if (self.pending_audio_instruction != instruction_index) {
+            const result = self.audio_engine.beep(self.guest_now_ns) catch |fault| switch (fault) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidCommand => return error.IllegalFunctionCall,
+            };
+            self.pending_audio_instruction = instruction_index;
+            self.audio_deadline_ns = result.deadline_ns;
+        }
+        try self.waitForForegroundAudio();
+    }
+
+    fn audioPlay(self: *Vm, instruction_index: u32) ExecutionError!void {
+        if (self.pending_audio_instruction != instruction_index) {
+            var command = try self.popValue();
+            defer command.deinit(self.allocator);
+            if (command != .string) return error.TypeMismatch;
+            const result = self.audio_engine.play(command.string, self.guest_now_ns) catch |fault| switch (fault) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidCommand => return error.IllegalFunctionCall,
+            };
+            if (result.mode == .background or result.deadline_ns <= self.guest_now_ns) return;
+            self.pending_audio_instruction = instruction_index;
+            self.audio_deadline_ns = result.deadline_ns;
+        }
+        try self.waitForForegroundAudio();
+    }
+
+    fn waitForForegroundAudio(self: *Vm) ExecutionError!void {
+        if (self.guest_now_ns >= self.audio_deadline_ns) {
+            self.pending_audio_instruction = bytecode.invalid_index;
+            self.audio_deadline_ns = 0;
+            return;
+        }
+        self.wait_wake_ns = self.audio_deadline_ns;
         return error.WouldBlock;
     }
 

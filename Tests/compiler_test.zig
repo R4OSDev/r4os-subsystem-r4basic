@@ -17,6 +17,7 @@ const fixture_paths = struct {
     const sequential_files = "Tests/Fixtures/vm_sequential_files.bas";
     const graphics = "Tests/Fixtures/vm_graphics.bas";
     const packed_images = "Tests/Fixtures/vm_packed_images.bas";
+    const audio = "Tests/Fixtures/vm_audio.bas";
 };
 
 test "core compiler emits a bound instruction program" {
@@ -548,6 +549,55 @@ const RuntimeHostProbe = struct {
     }
 };
 
+const RuntimeAudioSink = struct {
+    opens: u32 = 0,
+    writes: u32 = 0,
+    closes: u32 = 0,
+    sample_rate: u32 = 0,
+    channels: u16 = 0,
+    non_silent: bool = false,
+
+    fn sink(self: *RuntimeAudioSink) core.runtime_adapter.api.AudioSink {
+        return .{
+            .context = self,
+            .open_fn = open,
+            .write_fn = write,
+            .volume_fn = volume,
+            .close_fn = close,
+        };
+    }
+
+    fn open(context: *anyopaque, config: core.runtime_adapter.api.AudioConfig) i32 {
+        const self: *RuntimeAudioSink = @ptrCast(@alignCast(context));
+        self.opens += 1;
+        self.sample_rate = config.sample_rate;
+        self.channels = config.channels;
+        return 0;
+    }
+
+    fn write(context: *anyopaque, data: []const u8) i32 {
+        const self: *RuntimeAudioSink = @ptrCast(@alignCast(context));
+        self.writes += 1;
+        for (data) |byte| {
+            if (byte != 0) {
+                self.non_silent = true;
+                break;
+            }
+        }
+        return @intCast(data.len);
+    }
+
+    fn volume(_: *anyopaque, _: u32) i32 {
+        return 0;
+    }
+
+    fn close(context: *anyopaque) i32 {
+        const self: *RuntimeAudioSink = @ptrCast(@alignCast(context));
+        self.closes += 1;
+        return 0;
+    }
+};
+
 test "subsystem runtime polls close before the next bounded BASIC slice" {
     var program = try compileFixture(fixture_paths.infinite);
     defer program.deinit();
@@ -701,6 +751,144 @@ test "SLEEP yields cooperatively and a new key interrupts it" {
     try std.testing.expect(try machine.enqueueTextCodepoint('X'));
     try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(32, 8));
     try expectInteger(&machine, "Done", 1);
+}
+
+test "PLAY MML parses stateful commands and rejects invalid ranges atomically" {
+    var engine = core.audio.Engine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    const result = try engine.play("MB T160 O1 L16 B9 N0 B+ A- P8. > C < C MN C MS D ML E", 0);
+    try std.testing.expectEqual(core.audio.PlayMode.background, result.mode);
+    try std.testing.expectEqual(@as(u32, 10), result.event_count);
+    try std.testing.expectEqual(@as(u32, 8), engine.stats.notes);
+    try std.testing.expectEqual(@as(u32, 2), engine.stats.rests);
+    const pending_before = engine.pendingFrames();
+    try std.testing.expect(pending_before != 0);
+
+    var pcm: [core.audio.frame_bytes * 480]u8 = undefined;
+    const rendered = engine.render(&pcm);
+    try std.testing.expectEqual(@as(i32, @intCast(pcm.len)), rendered);
+    try std.testing.expect(engine.pendingFrames() < pending_before);
+    try std.testing.expect(std.mem.indexOfNone(u8, &pcm, &[_]u8{0}) != null);
+
+    const events_before = engine.pendingFrames();
+    const statements_before = engine.stats.play_statements;
+    for ([_][]const u8{ "T31C", "T256C", "L0C", "O7C", "N85", "O6B+", "MX" }) |invalid| {
+        try std.testing.expectError(error.InvalidCommand, engine.play(invalid, 0));
+        try std.testing.expectEqual(events_before, engine.pendingFrames());
+        try std.testing.expectEqual(statements_before, engine.stats.play_statements);
+    }
+}
+
+test "MB continues while MF and BEEP wait on guest time and render PCM" {
+    var program = try compileFixture(fixture_paths.audio);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+
+    machine.setGuestTime(0);
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runToCompletion(64, 32));
+    try expectInteger(&machine, "BackgroundDone", 1);
+    try std.testing.expect(machine.global("ForegroundDone") == null or machine.global("ForegroundDone").?.integer == 0);
+    var pcm: [core.audio.frame_bytes * 480]u8 = undefined;
+    try std.testing.expectEqual(@as(i32, @intCast(pcm.len)), machine.renderAudio(&pcm));
+    try std.testing.expect(std.mem.indexOfNone(u8, &pcm, &[_]u8{0}) != null);
+
+    machine.setGuestTime(std.time.ns_per_s);
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runToCompletion(64, 32));
+    try expectInteger(&machine, "ForegroundDone", 1);
+    try expectInteger(&machine, "BeepDone", 0);
+    const stats = machine.audioStats();
+    try std.testing.expectEqual(@as(u32, 2), stats.play_statements);
+    try std.testing.expectEqual(@as(u32, 1), stats.beep_statements);
+
+    machine.setGuestTime(std.time.ns_per_s + core.audio.beep_duration_ms * std.time.ns_per_ms);
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(64, 32));
+    try expectInteger(&machine, "BeepDone", 1);
+}
+
+test "BEEP reaches the buffered subsystem audio sink and closes it once" {
+    var program = try core.compiler.compile(std.testing.allocator, "buffered-beep.bas", "DEFINT A-Z\nBEEP\nDone = 1\nEND\n");
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    var adapter = core.runtime_adapter.Adapter.init(&machine);
+    var host = RuntimeHostProbe{};
+    var sink = RuntimeAudioSink{};
+    var queue: [core.audio.frame_bytes * 960]u8 = undefined;
+    var scratch: [core.audio.frame_bytes * 480]u8 = undefined;
+    var runtime = try core.runtime_adapter.api.Runtime.init(.{}, 1000, 0, .{
+        .config = .{ .sample_rate = core.audio.sample_rate, .channels = core.audio.channels },
+        .queue_storage = queue[0..],
+        .scratch = scratch[0..],
+        .sink = sink.sink(),
+    });
+
+    var completed = false;
+    for (0..250) |raw_tick| {
+        switch (runtime.cycle(@intCast(raw_tick), adapter.driver(), host.driver())) {
+            .finished => |finished| {
+                try std.testing.expectEqual(core.runtime_adapter.api.LifecycleState.completed, finished.state);
+                completed = true;
+                break;
+            },
+            .wait => {},
+        }
+    }
+    try std.testing.expect(completed);
+    try expectInteger(&machine, "Done", 1);
+    try std.testing.expectEqual(@as(u32, 1), sink.opens);
+    try std.testing.expect(sink.writes != 0);
+    try std.testing.expect(sink.non_silent);
+    try std.testing.expectEqual(core.audio.sample_rate, sink.sample_rate);
+    try std.testing.expectEqual(core.audio.channels, sink.channels);
+    try std.testing.expectEqual(@as(u32, 1), sink.closes);
+    try std.testing.expect(runtime.resources_closed);
+}
+
+test "missing subsystem audio degrades without stopping guest time" {
+    var program = try core.compiler.compile(std.testing.allocator, "degraded-beep.bas", "DEFINT A-Z\nBEEP\nDone = 1\nEND\n");
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    var adapter = core.runtime_adapter.Adapter.init(&machine);
+    var host = RuntimeHostProbe{};
+    var queue: [core.audio.frame_bytes * 960]u8 = undefined;
+    var scratch: [core.audio.frame_bytes * 480]u8 = undefined;
+    var runtime = try core.runtime_adapter.api.Runtime.init(.{}, 1000, 0, .{
+        .config = .{ .sample_rate = core.audio.sample_rate, .channels = core.audio.channels },
+        .queue_storage = queue[0..],
+        .scratch = scratch[0..],
+        .sink = null,
+    });
+
+    _ = runtime.cycle(0, adapter.driver(), host.driver());
+    try std.testing.expectEqual(core.runtime_adapter.api.AudioState.degraded, runtime.audio.state);
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.status);
+    var completed = false;
+    for (1..250) |raw_tick| {
+        if (runtime.cycle(@intCast(raw_tick), adapter.driver(), host.driver()) == .finished) {
+            completed = true;
+            break;
+        }
+    }
+    try std.testing.expect(completed);
+    try expectInteger(&machine, "Done", 1);
+    try std.testing.expect(runtime.resources_closed);
+}
+
+test "invalid PLAY command is a local illegal-function-call runtime error" {
+    var program = try core.compiler.compile(std.testing.allocator, "bad-play.bas", "PLAY \"T31C\"\nEND\n");
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.runtime_error, machine.runToCompletion(32, 8));
+    try std.testing.expectEqual(core.vm.RuntimeCode.illegal_function_call, machine.runtime_diagnostic.?.code);
+    try std.testing.expectEqual(@as(u64, 0), machine.pendingAudioFrames());
 }
 
 test "bare RANDOMIZE prompts retries invalid seeds and stays reproducible" {

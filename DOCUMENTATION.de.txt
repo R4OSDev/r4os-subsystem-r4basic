@@ -6,13 +6,16 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.66.9
+Stand 0.66.10
 ------------
 
-Diese Ausbaustufe besitzt das produktive Modulprojekt, das versionierte
-Quellfrontend und den ausfuehrbaren BASIC-Datenkern samt Textbildschirm,
-Eingabe, Gastzeit, Zufall, sequentiellen Dateien und instanzlokaler
-Indexed8-Grafik. Der Compiler tokenisiert einen Quelltext genau einmal,
+Diese Ausbaustufe ist der produktive R4BASIC-v1-Subsystemhost. Explorer
+uebergibt eine absolute BAS-Datei ueber `R4SUBSYS1`; das R4X liest sie durch
+die Storage-Fassade, kompiliert sie einmal und fuehrt eine getrennte VM in
+einem verschiebbaren, skalierbaren und maximierbaren Fenster aus. Der Kern
+umfasst Textbildschirm, Eingabe, Gastzeit, Zufall, sequentielle Dateien,
+instanzlokale Indexed8-Grafik und gepufferte Audioausgabe. Der Compiler
+tokenisiert einen Quelltext genau einmal,
 bindet skalare und zusammengesetzte Symbole und erzeugt eine unveraenderliche
 Instruktionsdarstellung mit festen Sprungzielen. Die typisierte VM fuehrt
 danach ausschliesslich diese vorbereiteten Instruktionen aus. Schleifen lesen
@@ -130,9 +133,9 @@ springt exakt dahinter. Ein unbehandelter Fehler beendet nur seine VM.
 Die SCREEN-Modusabfrage ist als injizierbarer Hostaufruf vorhanden. Ein nicht
 verfuegbarer Modus erzeugt BASIC-Fehler 5, ohne den bisherigen Bildschirm zu
 ersetzen; der normale ON-ERROR-Fallback von SCREEN 9 auf SCREEN 1 bleibt
-dadurch echt. Nur die noch ausstehenden Audioanweisungen besitzen sichtbare
-Deferred-Guards. Ein Host muss ihre Annahme ausdruecklich injizieren; der
-Standard bleibt ein sichtbarer Fehler.
+dadurch echt. BEEP und PLAY sind dagegen echte Bytecodeoperationen. Eine
+ungueltige MML-Sequenz erzeugt BASIC-Fehler 5, ohne Warteschlange oder
+persistente Musikparameter teilweise zu veraendern.
 
 DEF SEG = 0 schaltet ausschliesslich ein privates Byte an Offset 1047 frei.
 PEEK und POKE koennen damit das von GORILLA.BAS verwendete NumLock-Bit lesen
@@ -239,13 +242,38 @@ geschrieben. Fehlende Dateien, falsche Modi, EOF-Ueberlauf und Pfadfehler
 behalten getrennte QBasic-Fehlernummern. RANDOM/BINARY, Drucker, COM-Ports,
 Loeschen und Verzeichnisveraenderungen sind nicht Bestandteil dieses Stands.
 
-`src/runtime_adapter.zig` bildet die VM auf `r4os.subsystem_runtime` und ihre
-Grafikausgabe auf `r4os.subsystem_host` ab. Pro Hostzyklus wird hoechstens
-eine gepacte BASIC-Scheibe ausgefuehrt. Fenster- und Close-Ereignisse werden
-davor verarbeitet. Reset erzeugt einen frischen Variablensatz und leert
-Stapel, Text, Grafik, Eingabe, Wartezustand, Zufall und offene Dateien; ein
-Fehler oder Abschluss wird in den gemeinsamen Subsystem-Lebenszyklus
-ueberfuehrt. Audio liefert in dieser Stufe noch keine Gastdaten.
+Audio und Music Macro Language
+------------------------------
+
+Jede VM besitzt eigene Musikparameter, Ereignisse, Oszillatorphase und
+Zeitlinie. PLAY versteht O0 bis O6, Oktavwechsel, L1 bis L64, T32 bis T255,
+MB/MF, MN/ML/MS, Noten A bis G mit Vorzeichen und optionaler Laenge sowie
+Pausen, Punkte und N0 bis N84. MB laesst BASIC nach dem Einreihen sofort
+weiterlaufen; MF wartet kooperativ auf die gesamte Zeitlinie. BEEP erzeugt
+einen 800-Hz-Ton von 200 Millisekunden und wartet ebenfalls kooperativ.
+
+Der Generator liefert erkennbares, absichtlich einfaches 48-kHz-Stereo-PCM
+in S16LE. Die gepufferte Subsystemlaufzeit haelt zwei Quanten vor und reicht
+sie ueber R4AUDIO weiter. Fehlt der Dienst oder faellt ein Stream aus, zeigt
+der Fenstertitel die Degradation. Gastzeit, Eingabe und Grafik laufen weiter;
+beim Ende oder Schliessen wird der Stream genau einmal abgebaut.
+
+Produktiver Fensterhost
+-----------------------
+
+`src/main.zig` validiert den `R4SUBSYS1`-Startvertrag und den absoluten
+Gastpfad, liest hoechstens 256 KiB und zeigt Lade-, Syntax- und Laufzeitfehler
+mit Datei und Quellposition im Fenster. `SCREEN 0` wird als 640x400-Textbild
+sichtbar; SCREEN 1 und 9 verwenden die bisherigen Gastpixelpuffer.
+
+`src/runtime_adapter.zig` bildet die VM auf `r4os.subsystem_runtime`, ihre
+Grafik auf `r4os.subsystem_host` und PCM auf dessen Audiopumpe ab. Pro
+Hostzyklus wird hoechstens eine gepacte BASIC-Scheibe ausgefuehrt. Fenster-
+und Close-Ereignisse werden davor verarbeitet; veraenderte Bilder werden auf
+hoechstens etwa 30 Praesentationen pro Gastsekunde begrenzt. Reset leert
+Stapel, Text, Grafik, Audio, Eingabe, Wartezustand, Zufall und offene Dateien;
+Fehler, normales Ende und Fenster-Close verwenden denselben idempotenten
+Ressourcenabbau.
 
 Tests
 -----
@@ -259,8 +287,8 @@ Vier positive und vier negative Frontend-Fixtures pruefen weiterhin den
 Quellvertrag. Die ausfuehrbaren BAS-Fixtures pruefen Werte, Kontrollfluss,
 Prozeduren, Built-ins, Aggregate, DATA, Fehlerfortsetzung, das private
 Speicherbyte, Text und Eingabe, Zeit und Zufall, CalcDelay-Pacing,
-sequentielle Dateien, Grafik und gepackte Bilder, endlose Ausfuehrung und
-getrennte Fehlerzustaende.
+sequentielle Dateien, Grafik, gepackte Bilder, MML, PCM-Pufferung,
+Audio-Degradation, endlose Ausfuehrung und getrennte Fehlerzustaende.
 Zusaetzlich werden exakte Laufzeitpositionen und Fehlernummern, Rekursion,
 verschachteltes ByRef, Hostfehler, Reset, Nullbudget-Abbruch, Fokus- und
 Instanztrennung, pausierte Wartezeit, Fensterereignisse waehrend SLEEP,
@@ -281,10 +309,10 @@ uebergibt danach die unveraenderten Bytes an dasselbe Frontend und den
 produktiven Binder. Ein zweiter Test fuehrt das Original durch Intro, zwei
 editierte Spielernamen, ungueltige und gueltige Spiel-/Schwerkraftwerte sowie
 Winkel und Geschwindigkeit. Danach durchlaeuft es Stadtaufbau, Gorillabilder,
-gepackte Bananendaten, XOR-Bewegung und Kollisionsabfragen bis zum Abschluss
-eines deterministischen grafischen Zugs. Rasterhash und Palette sind fest
-abgenommen. Nur die noch ausstehenden Audioanweisungen werden von einem
-ausdruecklichen Testhost angenommen. Der normale Build benoetigt diese lokale
+gepackte Bananendaten, Flugbahn, XOR-Bewegung, Gebaeudekollision,
+Gorillaexplosion, Siegestanz und aktualisierten Punktestand einer
+vollstaendigen Runde. Rasterhash, Palette, zwei BEEP- und zwoelf echte
+PLAY-Aufrufe sind fest abgenommen. Der normale Build benoetigt diese lokale
 Datei nicht.
 
 Referenzen und lokale Abnahme
@@ -301,12 +329,11 @@ vom Git-Push ausgeschlossenen `Artifacts/Distribution/Injection`-Baum fuer
 Entwicklung und Abnahme gelesen. Ein Upload eines neuen `Release.zip` ist
 nicht Teil der 0.66.X-Roadmap.
 
-Noch nicht Bestandteil dieses Stands
-------------------------------------
+Bewusst ausserhalb von v1
+-------------------------
 
-- Audio und Music Macro Language
-- produktives Laden und Anzeigen einer BAS-Datei im Fenster
-
-Diese Funktionen folgen in getrennten Unterversionen. Syntaxakzeptanz allein
-darf in Dokumentation und Tests nie als ausgefuehrte Kompatibilitaet
-bezeichnet werden.
+R4BASIC ist keine vollstaendige QuickBASIC-4.5- oder GW-BASIC-Umgebung. IDE,
+Debugger, Zeilennummernprogramme, DRAW, BLOAD/BSAVE, Random-/Binary-Dateien,
+Geraete-I/O und allgemeiner Hardwarezugriff bleiben ausserhalb des Vertrags.
+Notepad bleibt fuer BAS-Dateien ueber `Open With` als separater Editor
+verfuegbar.

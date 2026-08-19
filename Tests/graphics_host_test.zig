@@ -63,6 +63,41 @@ const FakeBackend = struct {
     }
 };
 
+test "R4BASIC exposes the initial SCREEN 0 text raster to the window host" {
+    var program = try core.compiler.compile(std.testing.allocator, "text-window.bas", "PRINT \"R4BASIC\"\nEND\n");
+    defer program.deinit();
+    try std.testing.expect(program.ok());
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try machine.prepareHostDisplay();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(32, 8));
+
+    const view = machine.graphicsView() orelse return error.MissingTextRaster;
+    try std.testing.expectEqual(@as(u32, 640), view.width);
+    try std.testing.expectEqual(@as(u32, 400), view.height);
+    try std.testing.expect(std.mem.indexOfNone(u8, view.pixels, &[_]u8{0}) != null);
+
+    var adapter = core.runtime_adapter.Adapter.init(&machine);
+    var placeholder_pixels = [_]u8{0};
+    var placeholder_palette = [_]u32{0} ** host.palette_entries;
+    var scratch: [host.tile_max_pixels]u32 = undefined;
+    var presenter = try host.Presenter.init(
+        try host.Surface.initIndexed8(placeholder_pixels[0..], placeholder_palette[0..], 1, 1),
+        scratch[0..],
+    );
+    var backend: FakeBackend = .{};
+    try std.testing.expect(try adapter.syncVideo(&presenter));
+    const result = presenter.presentTo(backend.backend(), 640, 400);
+    switch (result) {
+        .presented => |info| {
+            try std.testing.expectEqual(host.PresentMode.full, info.mode);
+            try std.testing.expectEqual(@as(u32, 20), info.raster_blocks);
+        },
+        else => return error.UnexpectedPresentResult,
+    }
+    try std.testing.expect(!backend.invalid_raster);
+}
+
 test "R4BASIC publishes full damage and unchanged frames through the subsystem host" {
     const source =
         \\DEFINT A-Z

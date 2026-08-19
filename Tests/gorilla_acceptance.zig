@@ -56,22 +56,7 @@ test "canonical local GORILLA.BAS tokenizes and parses unchanged" {
     try std.testing.expect(program.data_items.len != 0);
 }
 
-const DeferredProbe = struct {
-    calls: u32 = 0,
-    beeps: u32 = 0,
-
-    fn accept(context: ?*anyopaque, keyword: frontend.Keyword) core.vm.DeferredStatementError!void {
-        const self: *DeferredProbe = @ptrCast(@alignCast(context.?));
-        switch (keyword) {
-            .beep, .play => {},
-            else => return error.Unsupported,
-        }
-        self.calls += 1;
-        if (keyword == .beep) self.beeps += 1;
-    }
-};
-
-test "canonical local GORILLA.BAS completes a deterministic graphical turn" {
+test "canonical local GORILLA.BAS completes a deterministic round with victory" {
     const allocator = std.testing.allocator;
     const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, canonical_path, allocator, .limited(frontend.maximum_source_bytes));
     defer allocator.free(source);
@@ -80,10 +65,7 @@ test "canonical local GORILLA.BAS completes a deterministic graphical turn" {
     defer program.deinit();
     try std.testing.expect(program.ok());
 
-    var probe = DeferredProbe{};
     var machine = try core.vm.Vm.init(allocator, &program, .{
-        .context = &probe,
-        .deferred_statement = DeferredProbe.accept,
         .initial_random_seed = 0x0042_4242,
     });
     defer machine.deinit();
@@ -104,11 +86,15 @@ test "canonical local GORILLA.BAS completes a deterministic graphical turn" {
         velocity,
         velocity_key,
         round_animation,
+        second_angle_key,
+        second_velocity,
+        second_velocity_key,
+        victory,
     };
     var stage: Stage = .intro;
     var delay_slices: u8 = 0;
     var guest_ns: u64 = 0;
-    var completed_graphics_round = false;
+    var completed_round = false;
 
     run_loop: for (0..80_000) |_| {
         machine.setGuestTime(guest_ns);
@@ -192,20 +178,40 @@ test "canonical local GORILLA.BAS completes a deterministic graphical turn" {
                 stage = .round_animation;
             },
             .round_animation => if (screenContains(&machine, "Angle:") and !screenContains(&machine, "Velocity:")) {
-                completed_graphics_round = true;
+                stage = .second_angle_key;
+                delay_slices = 2;
+            },
+            .second_angle_key => if (delay_slices != 0) {
+                delay_slices -= 1;
+            } else {
+                try feedInput(&machine, "45\r");
+                stage = .second_velocity;
+            },
+            .second_velocity => if (screenContains(&machine, "Velocity:")) {
+                stage = .second_velocity_key;
+                delay_slices = 2;
+            },
+            .second_velocity_key => if (delay_slices != 0) {
+                delay_slices -= 1;
+            } else {
+                try feedInput(&machine, "1\r");
+                stage = .victory;
+            },
+            .victory => if (screenContains(&machine, "Angle:") and scoreWasUpdated(&machine) and machine.audioStats().play_statements >= 12) {
+                completed_round = true;
                 break :run_loop;
             },
         }
     }
 
-    if (!completed_graphics_round) {
-        std.debug.print("GORILLA guard end: status={s} instructions={d} probe_calls={d}\n", .{ @tagName(machine.status), machine.total_instructions, probe.calls });
+    if (!completed_round) {
+        std.debug.print("GORILLA guard end: status={s} instructions={d} audio_calls={d}\n", .{ @tagName(machine.status), machine.total_instructions, machine.audioStats().play_statements + machine.audioStats().beep_statements });
         var debug_row: [core.text_screen.columns]u8 = undefined;
         for (0..core.text_screen.rows) |row| {
             if (machine.textScreen().copyRow(row, &debug_row)) std.debug.print("{d:0>2}: {s}\n", .{ row + 1, std.mem.trimEnd(u8, &debug_row, " ") });
         }
     }
-    try std.testing.expect(completed_graphics_round);
+    try std.testing.expect(completed_round);
     try expectString(&machine, "Name1$", "Alice");
     try expectString(&machine, "Name2$", "Bob");
     try expectInteger(&machine, "NumGames", 3);
@@ -213,14 +219,15 @@ test "canonical local GORILLA.BAS completes a deterministic graphical turn" {
     const graphics = machine.graphicsView() orelse return error.MissingGorillaGraphics;
     try std.testing.expectEqual(@as(u32, 640), graphics.width);
     try std.testing.expectEqual(@as(u32, 350), graphics.height);
-    try std.testing.expectEqual(@as(u64, 0x9022e6b6962c1eb9), std.hash.Wyhash.hash(0, graphics.pixels));
+    try std.testing.expectEqual(@as(u64, 0xc2b26adb181863cc), std.hash.Wyhash.hash(0, graphics.pixels));
     try std.testing.expectEqual(@as(u32, 0x000000aa), graphics.palette[0]);
     try std.testing.expectEqual(@as(u32, 0x00ffaa55), graphics.palette[1]);
     try std.testing.expectEqual(@as(u32, 0x00ff0055), graphics.palette[2]);
     try std.testing.expectEqual(@as(u32, 0x00ffff00), graphics.palette[3]);
     try std.testing.expectEqual(@as(u32, 0x00ffffff), graphics.palette[9]);
-    try std.testing.expectEqual(@as(u32, 4), probe.calls);
-    try std.testing.expectEqual(@as(u32, 2), probe.beeps);
+    try std.testing.expect(scoreWasUpdated(&machine));
+    try std.testing.expectEqual(@as(u32, 12), machine.audioStats().play_statements);
+    try std.testing.expectEqual(@as(u32, 2), machine.audioStats().beep_statements);
 }
 
 fn screenContains(machine: *const core.vm.Vm, needle: []const u8) bool {
@@ -230,6 +237,10 @@ fn screenContains(machine: *const core.vm.Vm, needle: []const u8) bool {
         if (std.mem.indexOf(u8, &row_bytes, needle) != null) return true;
     }
     return false;
+}
+
+fn scoreWasUpdated(machine: *const core.vm.Vm) bool {
+    return screenContains(machine, "1>Score<0") or screenContains(machine, "0>Score<1");
 }
 
 fn feedInput(machine: *core.vm.Vm, bytes: []const u8) !void {

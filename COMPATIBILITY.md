@@ -11,9 +11,9 @@ Parsing a construct means that its syntax, source span, nesting, and argument
 shape are recognized. It does not by itself claim executable semantics. The
 separate `VM-CONTRACT.md` freezes the scalar, aggregate, DATA, error-flow,
 control-flow, procedure, text, input, time, random, and sequential-file
-subset that is already bound and executed. Indexed graphics are executable
-in VM contract 1.3; audio remains a later subsystem layer against this same
-source contract.
+subset that is already bound and executed. Indexed graphics, Music Macro
+Language, PCM audio, and the productive window host are executable in VM
+contract 1.4.
 
 ## Authority and source identity
 
@@ -104,7 +104,7 @@ the same grammar family. All fixture paths are below `Tests/Fixtures/`.
 | TIME-01 | `RANDOMIZE`, `RND`, `TIMER`, `INKEY$`, and `SLEEP` syntax | yes | `positive_io_graphics.bas` | `negative_expressions.bas`, `negative_statements.bas` |
 | GFX-01 | `SCREEN 1`/`9`, `PALETTE`, `PSET`, coordinate `POINT`, `LINE` including `B`/`BF`, `CIRCLE`, and `PAINT` | yes | `positive_io_graphics.bas` | `negative_statements.bas`, `negative_expressions.bas` |
 | GFX-02 | Graphics `GET` and `PUT` with `PSET` and `XOR` actions | yes | `positive_io_graphics.bas` | `negative_statements.bas` |
-| AUDIO-01 | `BEEP` and `PLAY` expression syntax | yes | `positive_io_graphics.bas` | `negative_statements.bas` |
+| AUDIO-01 | `BEEP` and `PLAY` expression syntax | yes | `positive_io_graphics.bas`, `vm_audio.bas` | `negative_statements.bas` |
 | FILE-01 | Sequential `OPEN` for `INPUT`, `OUTPUT`, or `APPEND`; `CLOSE`, `PRINT #`, `INPUT #`, `LINE INPUT #`, and `EOF` | no, but v1 platform scope | `positive_io_graphics.bas` | `negative_statements.bas`, `negative_expressions.bas` |
 | HW-01 | Selected `DEF SEG`, `PEEK`, and `POKE` syntax for a later private compatibility device | yes | `positive_io_graphics.bas` | `negative_expressions.bas` |
 
@@ -113,10 +113,11 @@ local file size and SHA-256 before passing the unchanged bytes through the
 same public lexer, parser, and typed binder. It then executes the intro and
 initial interaction through two names, invalid and valid game/gravity input,
 and edited angle and velocity input. It then completes one deterministic
-graphical turn through city, gorilla, packed banana, XOR animation, and
-coordinate collision paths. A test-only explicit host accepts only the
-still-deferred sound statements. Compiler and VM behavior remains general;
-the acceptance source does not select a separate production path.
+round through city, packed banana flight, XOR animation, building collision,
+gorilla explosion, victory dance, and an updated score. The same instance-
+local audio engine executes all twelve reached `PLAY` statements and both
+`BEEP` statements. Compiler and VM behavior remains general; the acceptance
+source does not select a separate production path.
 
 ## Built-in function arities
 
@@ -160,8 +161,7 @@ the typed-program phase.
   `PRINT USING`, `DRAW`, `PCOPY`, `BLOAD`, `BSAVE`, and general memory or port
   access.
 - Runtime correctness merely from parse or bind success. Only the subset in
-  `VM-CONTRACT.md` has executable semantics; audio still requires its
-  dedicated acceptance layer.
+  `VM-CONTRACT.md` has executable semantics.
 
 Changing a promise in this document or `VM-CONTRACT.md` requires a
 contract-version decision, an original positive fixture, an original
