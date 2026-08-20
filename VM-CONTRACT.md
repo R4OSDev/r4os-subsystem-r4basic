@@ -235,6 +235,11 @@ guest address can become an R4OS or host pointer.
   delayed graphics or interpreter cycle cannot turn already-generated notes
   into alternating PCM and silence. Submission remains paced through R4AUDIO
   rather than being performed by the VM.
+- After the initial four-quantum prefill, the host submits exactly one quantum
+  per 40 ms audio deadline. Backpressure retains the same caller-owned PCM and
+  retries no earlier than the next deadline; it never polls sink capacity in
+  every host cycle. A transient busy, timeout, full, or service-start race gets
+  three bounded 50 ms open retries before audio degrades.
 - If a host delay exceeds that complete window, the source queue is discarded
   before submission and the VM advances note position and oscillator phase to
   current guest time. Old melody fragments are never replayed late.

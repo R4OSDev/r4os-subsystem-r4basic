@@ -99,7 +99,6 @@ pub fn r4_app_main(app: *r4os.App) i32 {
             .quantum_frames = audio_quantum_frames,
             .target_quanta = audio_target_quanta,
             .max_catchup_quanta = audio_target_quanta,
-            .sink_capacity_prefill = true,
         },
         .queue_storage = audio_queue[0..],
         .scratch = audio_scratch[0..],

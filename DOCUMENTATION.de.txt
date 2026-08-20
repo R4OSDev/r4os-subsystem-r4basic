@@ -256,16 +256,18 @@ einen 800-Hz-Ton von 200 Millisekunden und wartet ebenfalls kooperativ.
 Der Generator liefert erkennbares, absichtlich einfaches 24-kHz-Stereo-PCM
 in S16LE. Ein Servicepaket enthaelt 960 Frames beziehungsweise 40 ms; HDA
 interpoliert es linear in vier 48-kHz-Hardwareperioden. Der produktive Host
-haelt vier solche Quanten und damit 160 ms Quellton vor. Er fuellt den
-HDA-Backend bis zu dessen gemeldeter Kapazitaet, behaelt eine bei Busy nicht
-angenommene Periode in seiner Queue und darf dieselbe begrenzte Anzahl
-nachholen. Ueberschreitet eine Hostverzoegerung das gesamte Fenster, wird der
+haelt vier solche Quanten und damit 160 ms Quellton vor. Nach dieser einmaligen
+Vorfuellung reicht er genau ein Quantum je 40-ms-Audiotermin ein. Ein bei Busy
+nicht angenommenes Quantum bleibt in seiner Queue und wird fruehestens am
+naechsten Audiotermin erneut versucht; es gibt keine kapazitaetsgetriebene
+IPC-Abfrage in jedem Hostzyklus. Ueberschreitet eine Hostverzoegerung das gesamte Fenster, wird der
 alte Quellpuffer vor der Ausgabe verworfen und die VM setzt Notenposition und
 Oszillatorphase auf die aktuelle Gastzeit. Alte Melodiefragmente werden nicht
 verspaetet nachgespielt. Die Ausgabe bleibt ueber R4AUDIO gepact. Fehlt der Dienst oder faellt
-ein Stream aus, zeigt der Fenstertitel die Degradation. Gastzeit, Eingabe und
-Grafik laufen weiter; beim Ende oder Schliessen wird der Stream genau einmal
-abgebaut.
+ein Stream dauerhaft aus, zeigt der Fenstertitel die Degradation. Busy,
+Timeout und ein kurzzeitig noch nicht bereiter Dienst werden dreimal im
+50-ms-Abstand erneut geoeffnet. Gastzeit, Eingabe und Grafik laufen weiter;
+beim Ende oder Schliessen wird der Stream genau einmal abgebaut.
 
 Produktiver Fensterhost
 -----------------------
