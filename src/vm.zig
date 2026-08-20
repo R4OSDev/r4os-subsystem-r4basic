@@ -6,9 +6,9 @@ const graphics_screen = @import("graphics_screen.zig");
 const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "1.3.0";
-pub const default_instruction_budget: u32 = 26;
-pub const execution_slice_interval_ns: u64 = 2 * std.time.ns_per_ms;
+pub const contract_version = "1.5.0";
+pub const default_instruction_budget: u32 = 4096;
+pub const timer_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
 pub const maximum_call_depth: usize = 256;
 pub const maximum_gosub_depth: usize = 1024;
@@ -135,6 +135,27 @@ pub const SliceResult = struct {
     status: Status,
     instructions: u32,
     wake_guest_ns: u64 = 0,
+};
+
+pub const OperationGroup = enum(u8) {
+    value,
+    arithmetic,
+    control,
+    graphics,
+    text,
+    host,
+};
+
+pub const operation_group_count: usize = 6;
+
+pub const PerformanceStats = struct {
+    instructions: u64,
+    groups: [operation_group_count]u64,
+    timer_yields: u64,
+
+    pub fn group(self: *const PerformanceStats, operation_group: OperationGroup) u64 {
+        return self.groups[@intFromEnum(operation_group)];
+    }
 };
 
 pub const InitError = error{
@@ -303,6 +324,8 @@ pub const Vm = struct {
     gosub_stack: std.ArrayList(GosubEntry) = .empty,
     instruction_pointer: u32,
     total_instructions: u64 = 0,
+    operation_groups: [operation_group_count]u64 = .{0} ** operation_group_count,
+    timer_yield_count: u64 = 0,
     status: Status = .ready,
     exit_code: i32 = 0,
     runtime_diagnostic: ?RuntimeDiagnostic = null,
@@ -324,6 +347,8 @@ pub const Vm = struct {
     pending_input_instruction: u32 = bytecode.invalid_index,
     guest_now_ns: u64 = 0,
     wait_wake_ns: u64 = 0,
+    cooperative_timer_pacing: bool = false,
+    next_timer_poll_ns: u64 = 0,
     pending_sleep_instruction: u32 = bytecode.invalid_index,
     sleep_deadline_ns: u64 = 0,
     sleep_input_generation: u64 = 0,
@@ -376,6 +401,10 @@ pub const Vm = struct {
 
     pub fn requestCancel(self: *Vm) void {
         self.cancel_requested = true;
+    }
+
+    pub fn enableCooperativeTimerPacing(self: *Vm) void {
+        self.cooperative_timer_pacing = true;
     }
 
     pub fn setGuestTime(self: *Vm, guest_now_ns: u64) void {
@@ -467,6 +496,8 @@ pub const Vm = struct {
         self.globals = replacement;
         self.instruction_pointer = self.program.module_entry;
         self.total_instructions = 0;
+        self.operation_groups = .{0} ** operation_group_count;
+        self.timer_yield_count = 0;
         self.status = .ready;
         self.exit_code = 0;
         self.runtime_diagnostic = null;
@@ -488,6 +519,7 @@ pub const Vm = struct {
         self.pending_input_instruction = bytecode.invalid_index;
         self.guest_now_ns = 0;
         self.wait_wake_ns = 0;
+        self.next_timer_poll_ns = 0;
         self.pending_sleep_instruction = bytecode.invalid_index;
         self.sleep_deadline_ns = 0;
         self.sleep_input_generation = 0;
@@ -550,6 +582,7 @@ pub const Vm = struct {
                 else
                     runtimeCode(fault);
                 if (fault != error.Rethrow and self.trapError(code, instruction_index, instruction)) {
+                    self.recordOperation(instruction);
                     executed += 1;
                     self.total_instructions += 1;
                     continue;
@@ -561,6 +594,7 @@ pub const Vm = struct {
                 }
                 return .{ .status = self.status, .instructions = executed };
             };
+            self.recordOperation(instruction);
             self.syncTextToGraphics();
             executed += 1;
             self.total_instructions += 1;
@@ -577,6 +611,14 @@ pub const Vm = struct {
             if (result.status != .yielded) return result.status;
         }
         return self.status;
+    }
+
+    pub fn performanceStats(self: *const Vm) PerformanceStats {
+        return .{
+            .instructions = self.total_instructions,
+            .groups = self.operation_groups,
+            .timer_yields = self.timer_yield_count,
+        };
     }
 
     pub fn global(self: *const Vm, name: []const u8) ?*const values.Value {
@@ -658,6 +700,104 @@ pub const Vm = struct {
 
     pub fn gosubDepth(self: *const Vm) usize {
         return self.gosub_stack.items.len;
+    }
+
+    fn recordOperation(self: *Vm, instruction: bytecode.Instruction) void {
+        const group: OperationGroup = switch (instruction.op) {
+            .push_constant,
+            .load_global,
+            .load_local,
+            .store_global,
+            .store_local,
+            .initialize_global,
+            .initialize_local,
+            .push_global_reference,
+            .push_local_reference,
+            .array_default_lower,
+            .select_array_element,
+            .select_record_field,
+            .load_reference,
+            .store_reference,
+            .dimension,
+            .redimension,
+            .read_data,
+            .restore_data,
+            .convert,
+            .pop,
+            => .value,
+            .negate,
+            .logical_not,
+            .add,
+            .subtract,
+            .multiply,
+            .divide,
+            .integer_divide,
+            .modulo,
+            .power,
+            .compare_equal,
+            .compare_not_equal,
+            .compare_less,
+            .compare_less_equal,
+            .compare_greater,
+            .compare_greater_equal,
+            .logical_and,
+            .logical_or,
+            .logical_xor,
+            => .arithmetic,
+            .set_error_handler,
+            .resume_error,
+            .resume_next,
+            .resume_label,
+            .call,
+            .return_procedure,
+            .jump,
+            .jump_if_false,
+            .jump_if_true,
+            .gosub,
+            .return_gosub,
+            .halt,
+            => .control,
+            .screen_mode_probe,
+            .graphics_palette,
+            .graphics_pset,
+            .graphics_line,
+            .graphics_circle,
+            .graphics_paint,
+            .graphics_get,
+            .graphics_put,
+            => .graphics,
+            .text_width,
+            .text_color,
+            .text_cls,
+            .text_locate,
+            .text_view_print,
+            .print_begin_screen,
+            .print_value,
+            .print_tab,
+            .print_comma,
+            .print_question,
+            .print_newline,
+            .print_end,
+            .input_console,
+            => .text,
+            .set_segment,
+            .reset_segment,
+            .peek,
+            .poke,
+            .print_begin_file,
+            .input_file,
+            .randomize,
+            .sleep,
+            .file_open,
+            .file_close,
+            .audio_beep,
+            .audio_play,
+            .deferred_statement,
+            .deferred_builtin,
+            .call_builtin,
+            => .host,
+        };
+        self.operation_groups[@intFromEnum(group)] +%= 1;
     }
 
     fn execute(self: *Vm, instruction_index: u32, instruction: bytecode.Instruction) ExecutionError!void {
@@ -1935,7 +2075,7 @@ pub const Vm = struct {
             .eof => self.endOfFile(arguments[0]),
             .inkey_string => self.inkeyString(),
             .rnd => self.randomNumber(arguments),
-            .timer => .{ .single = self.timerSeconds() },
+            .timer => self.timerValue(),
             .point => blk: {
                 const x = try values.asLong(arguments[0]);
                 const y = try values.asLong(arguments[1]);
@@ -1976,6 +2116,16 @@ pub const Vm = struct {
         const day_ns: u64 = 86_400 * std.time.ns_per_s;
         const within_day = self.guest_now_ns % day_ns;
         return @as(f32, @floatFromInt(within_day)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+    }
+
+    fn timerValue(self: *Vm) ExecutionError!values.Value {
+        if (self.cooperative_timer_pacing and self.guest_now_ns < self.next_timer_poll_ns) {
+            self.wait_wake_ns = self.next_timer_poll_ns;
+            self.timer_yield_count +%= 1;
+            return error.WouldBlock;
+        }
+        if (self.cooperative_timer_pacing) self.next_timer_poll_ns = self.guest_now_ns +| timer_poll_interval_ns;
+        return .{ .single = self.timerSeconds() };
     }
 
     fn hostMath(self: *Vm, operation: MathOperation, input: values.Value, unused: values.Value) ExecutionError!values.Value {

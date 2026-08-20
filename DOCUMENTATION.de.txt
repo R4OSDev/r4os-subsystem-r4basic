@@ -210,11 +210,12 @@ nur eine Gastdeadline und gibt `waiting` zurueck; Eingabe, Fensteraktionen
 und Close werden waehrenddessen weiter gepollt. Eine neue Taste kann SLEEP
 vorzeitig beenden. Pausenzeit wird weder TIMER noch der Deadline zugerechnet.
 
-Der R4BASIC-Adapter begrenzt eine geplante Scheibe auf 26 Instruktionen und
-setzt die naechste Fortsetzung fruehestens zwei Gastmillisekunden spaeter an.
-Dieses feste Pacing haelt die CPU-Abgabe kurz und liefert fuer das historische
-CalcDelay-/Rest-Muster reproduzierbar ungefaehr den vorgesehenen Faktor eins,
-statt die Kalibrierung mit moderner Busy-Wait-Geschwindigkeit aufzublasen.
+Der R4BASIC-Adapter nutzt bis zu 4.096 Instruktionen aus dem gemeinsamen
+Runtime-Budget. Er prueft nach jeweils 64 Instruktionen den produktiven
+monotonen Takt und beendet eine Scheibe nach acht Millisekunden. Lauffaehiger
+Code erhaelt keine pauschale Wartezeit. Eine fruehe wiederholte TIMER-Abfrage
+gibt dagegen bis zur naechsten Gastmillisekunde kooperativ ab. Dadurch bleiben
+CalcDelay-/Rest-Muster reproduzierbar, ohne Grafik und Berechnung mitzubremsen.
 
 RND besitzt einen privaten 24-Bit-Zustand und den letzten Wert. Positive oder
 fehlende Argumente ziehen weiter, null wiederholt und ein negatives Argument
@@ -286,7 +287,7 @@ Er baut und inspiziert das GUI-R4X und fuehrt die Host-Component-Tests aus.
 Vier positive und vier negative Frontend-Fixtures pruefen weiterhin den
 Quellvertrag. Die ausfuehrbaren BAS-Fixtures pruefen Werte, Kontrollfluss,
 Prozeduren, Built-ins, Aggregate, DATA, Fehlerfortsetzung, das private
-Speicherbyte, Text und Eingabe, Zeit und Zufall, CalcDelay-Pacing,
+Speicherbyte, Text und Eingabe, Zeit und Zufall, kooperatives TIMER-Pacing,
 sequentielle Dateien, Grafik, gepackte Bilder, MML, PCM-Pufferung,
 Audio-Degradation, endlose Ausfuehrung und getrennte Fehlerzustaende.
 Zusaetzlich werden exakte Laufzeitpositionen und Fehlernummern, Rekursion,

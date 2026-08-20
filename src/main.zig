@@ -18,6 +18,7 @@ const audio_quantum_frames: usize = runtime_api.default_quantum_frames;
 const audio_queue_frames: usize = audio_quantum_frames * runtime_api.default_target_quanta;
 
 pub fn r4_app_main(app: *r4os.App) i32 {
+    if (containsIgnoreCase(app.args(), "/PERFTEST")) return runPerformanceSelfTest(app);
     if (app.profile != .desktop) return 64;
     const allocator = app.allocator() orelse return r4os.abi.err_no_group;
     const files = app.files() orelse return r4os.abi.err_no_group;
@@ -76,7 +77,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     const surface = host_api.Surface.initIndexed8(view.pixels, view.palette, view.width, view.height) catch return error_host_video;
     var raster_scratch: [host_api.tile_max_pixels]u32 = undefined;
     var window_host = host_api.Host.init(desk, draw, surface, raster_scratch[0..]) catch return error_host_video;
-    var guest_adapter = runtime_adapter.Adapter.init(&machine);
+    var guest_adapter = runtime_adapter.Adapter.initSystem(&machine, &sys);
 
     var audio_sink_storage: runtime_api.R4AudioSink = undefined;
     var sink: ?runtime_api.AudioSink = null;
@@ -133,6 +134,85 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         formatted_exit,
         if (runtime_host.audio_degraded) "Audio war nicht verfuegbar; Grafik und Gastzeit liefen weiter." else "Audio wurde regulaer geschlossen.",
     });
+}
+
+const performance_source =
+    \\DEFINT A-Z
+    \\A = 0
+    \\Work:
+    \\A = A + 1
+    \\IF A >= 30000 THEN A = 0
+    \\GOTO Work
+;
+
+fn runPerformanceSelfTest(app: *r4os.App) i32 {
+    const allocator = app.allocator() orelse return r4os.abi.err_no_group;
+    const sys = app.system();
+    sys.println("R4BASIC performance stage: compile");
+    var program = compiler.compile(allocator, "R4BASIC-PERFTEST.BAS", performance_source) catch return performanceFailure(sys, "compile");
+    defer program.deinit();
+    if (!program.ok()) return performanceFailure(sys, "diagnostic");
+    sys.println("R4BASIC performance stage: vm-init");
+    var machine = vm.Vm.init(allocator, &program, .{}) catch return performanceFailure(sys, "vm-init");
+    defer machine.deinit();
+    var adapter = runtime_adapter.Adapter.initSystem(&machine, &sys);
+    const hz = @max(sys.monotonicHz(), 1);
+    const start_tick = sys.ticks();
+    const benchmark_ticks = @max((@as(u64, hz) * 50 + 999) / 1000, 1);
+    const deadline = start_tick +| benchmark_ticks;
+    var slices: u64 = 0;
+    var no_fixed_sleep = true;
+    sys.println("R4BASIC performance stage: run");
+    while (sys.ticks() < deadline) {
+        const result = adapter.driver().step(runtime_api.default_slice_budget, 0);
+        if (result.status != .progress) return performanceFailure(sys, "unexpected-step");
+        if (result.wake_guest_ns != 0) no_fixed_sleep = false;
+        slices +%= 1;
+        sys.taskYield();
+    }
+    const elapsed = @max(sys.ticks() -| start_tick, 1);
+    const instructions = machine.total_instructions;
+    const ips: u64 = @intCast((@as(u128, instructions) * hz) / elapsed);
+    machine.requestCancel();
+    _ = adapter.driver().step(runtime_api.default_slice_budget, 0);
+    const stats = machine.performanceStats();
+    const ok = machine.status == .cancelled and no_fixed_sleep and ips >= 52_000 and
+        adapter.performance.maximum_instructions <= runtime_api.default_slice_budget and
+        stats.group(.value) != 0 and stats.group(.arithmetic) != 0 and stats.group(.control) != 0;
+
+    sys.print("R4BASIC performance: instructions=");
+    sys.printU64(instructions);
+    sys.print(" ticks=");
+    sys.printU64(elapsed);
+    sys.print(" ips=");
+    sys.printU64(ips);
+    sys.print(" slices=");
+    sys.printU64(slices);
+    sys.print(" maxSlice=");
+    sys.printU64(adapter.performance.maximum_instructions);
+    sys.print(" timeLimited=");
+    sys.printU64(adapter.performance.time_limited_steps);
+    sys.print(" noFixedSleep=");
+    sys.printU64(if (no_fixed_sleep) 1 else 0);
+    sys.print(" result=");
+    sys.println(if (ok) "OK" else "FAILED");
+    return if (ok) 0 else 1;
+}
+
+fn performanceFailure(sys: r4os.r4sys.Context, stage: []const u8) i32 {
+    sys.print("R4BASIC performance: stage=");
+    sys.write(stage);
+    sys.println(" result=FAILED");
+    return 1;
+}
+
+fn containsIgnoreCase(value: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or value.len < needle.len) return false;
+    var offset: usize = 0;
+    while (offset + needle.len <= value.len) : (offset += 1) {
+        if (std.ascii.eqlIgnoreCase(value[offset .. offset + needle.len], needle)) return true;
+    }
+    return false;
 }
 
 const LoadError = error{

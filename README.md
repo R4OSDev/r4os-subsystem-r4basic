@@ -18,7 +18,7 @@ without stopping guest time, input, or graphics.
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.0.0`
+- Module version: `1.1.0`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -50,6 +50,16 @@ updated score. The final 640 by 350 indexed image, palette, and twelve real
 this repository and is read directly from the ignored workspace injection
 tree. The normal test step uses the permanent general BAS fixtures under
 `Tests/Fixtures`, including the standalone audio contract.
+
+R4BASIC 1.1 uses the shared 4,096-instruction runtime budget with an 8-ms
+production time boundary instead of the former 26-instruction/2-ms throttle.
+Runnable code returns without a fixed wake; repeated TIMER polls alone yield
+cooperatively at a 1-ms guest-time boundary. `Tests/performance_test.zig`
+checks budget and time bounds plus opcode-group counters. `/PERFTEST` prints a
+QEMU-readable throughput marker. The verified Standard-QEMU run reached
+2,329,098 instructions per second with 4,096 instructions per maximum slice
+and no fixed sleep; the productive artifact remains the canonical GUI
+subsystem host.
 
 The build starters map the current local R4OS SDK and Contract checkouts from
 `Settings.R4S`. The URL and hash in `build.zig.zon` record the last verified

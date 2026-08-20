@@ -47,6 +47,15 @@ pub fn build(b: *std.Build) void {
     const graphics_tests = b.addTest(.{ .root_module = graphics_tests_module });
     const run_graphics_tests = b.addRunArtifact(graphics_tests);
 
+    const performance_tests_module = b.createModule(.{
+        .root_source_file = b.path("Tests/performance_test.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    performance_tests_module.addImport("core", core_module);
+    const performance_tests = b.addTest(.{ .root_module = performance_tests_module });
+    const run_performance_tests = b.addRunArtifact(performance_tests);
+
     const gorilla_module = b.createModule(.{
         .root_source_file = b.path("Tests/gorilla_acceptance.zig"),
         .target = b.graph.host,
@@ -61,6 +70,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_frontend_tests.step);
     test_step.dependOn(&run_compiler_tests.step);
     test_step.dependOn(&run_graphics_tests.step);
+    test_step.dependOn(&run_performance_tests.step);
 
     const gorilla_step = b.step("gorilla-test", "Parse the local checksum-bound GORILLA.BAS acceptance source");
     gorilla_step.dependOn(&run_gorilla_tests.step);

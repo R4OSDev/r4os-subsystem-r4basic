@@ -1,6 +1,6 @@
 ﻿# R4BASIC v1 core VM contract
 
-Contract version: `1.4.0`
+Contract version: `1.5.0`
 
 This document freezes the executable R4BASIC language layers. The broader
 source syntax accepted by the frontend remains defined in
@@ -243,11 +243,14 @@ guest address can become an R4OS or host pointer.
   inside one slice. No argument or zero waits for a newly arriving key.
   Positive values also wake for a new key. Host input and lifecycle commands
   continue to be polled while the VM waits.
-- The runtime adapter caps a scheduled BASIC slice at 26 instructions and
-  schedules a yielded continuation at least 2 guest milliseconds later.
-  This fixed pacing remains part of the VM contract: it bounds host use and makes
-  the historical `CalcDelay`/`Rest` calibration independent of modern host
-  loop speed.
+- The runtime adapter uses the shared budget of at most 4,096 instructions.
+  It checks the production monotonic clock every 64 instructions and ends a
+  scheduled step after 8 milliseconds. Runnable code returns `progress`
+  without an artificial wake deadline.
+- Scheduled TIMER reads are admitted at most once per guest millisecond. An
+  earlier repeated poll returns a cooperative wait until that deadline. This
+  keeps historical `CalcDelay`/`Rest` loops reproducible without throttling
+  unrelated computation, graphics, input, or audio bytecode.
 - Every VM owns a 24-bit random state and last result. An injected initial
   seed makes tests byte-for-byte reproducible. `RND` with a positive or
   omitted argument advances, zero repeats the last result, and a negative
@@ -298,9 +301,9 @@ guest address can become an R4OS or host pointer.
 ## Cooperative execution and lifecycle
 
 - `runSlice` executes no more than its caller-provided instruction budget and
-  returns `yielded` when work remains. Scheduled execution through the runtime
-  adapter applies the stricter 26-instruction, 2-millisecond pacing contract
-  above even when the shared runtime offers a larger budget.
+  returns `yielded` when work remains. Scheduled execution combines successive
+  64-instruction VM chunks into one GuestDriver step until the shared budget,
+  the 8-ms limit, a guest wait, cancellation, or a terminal state is reached.
 - Cancellation is checked before the first instruction and between every
   instruction, including for a zero budget. Cancellation exits with code
   130.
@@ -389,8 +392,8 @@ The permanent general fixtures below are part of this contract:
   TAB and SPACE$, editable prompts, atomic retry, and typed console input.
 - `vm_time_random.bas`: explicit random seeding, all three RND argument modes,
   TIMER, and cooperative SLEEP deadlines.
-- `vm_pacing.bas`: the public `CalcDelay`/`Rest` pattern under fixed scheduled
-  instruction pacing.
+- `vm_pacing.bas`: the public `CalcDelay`/`Rest` pattern under cooperative
+  TIMER-poll pacing.
 - `vm_sequential_files.bas`: relative and absolute sequential input, output,
   append, quoted fields, whole lines, and EOF.
 - `vm_graphics.bas`: modes, palette, text-compatible drawing, clipping,
