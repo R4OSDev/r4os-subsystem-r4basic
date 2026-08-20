@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const sample_rate: u32 = 48_000;
+pub const sample_rate: u32 = 24_000;
 pub const channels: u16 = 2;
 pub const frame_bytes: usize = channels * @sizeOf(i16);
 pub const maximum_events: usize = 4096;
@@ -38,6 +38,7 @@ pub const Stats = struct {
     notes: u32 = 0,
     rests: u32 = 0,
     rendered_frames: u64 = 0,
+    skipped_frames: u64 = 0,
 };
 
 pub const PlayResult = struct {
@@ -72,6 +73,7 @@ pub const Engine = struct {
     event_head: usize = 0,
     event_frame: u32 = 0,
     phase: u32 = 0,
+    render_cursor_ns: u64 = 0,
     timeline_end_ns: u64 = 0,
     stats: Stats = .{},
 
@@ -90,14 +92,23 @@ pub const Engine = struct {
         self.event_head = 0;
         self.event_frame = 0;
         self.phase = 0;
+        self.render_cursor_ns = 0;
         self.timeline_end_ns = 0;
         self.stats = .{};
     }
 
     pub fn setGuestTime(self: *Engine, guest_now_ns: u64) void {
         if (self.timeline_end_ns != 0 and guest_now_ns >= self.timeline_end_ns) {
+            self.stats.skipped_frames +%= self.pendingFrames();
             self.discardEvents();
+            self.render_cursor_ns = guest_now_ns;
             self.timeline_end_ns = guest_now_ns;
+            return;
+        }
+        if (self.event_head < self.events.items.len and guest_now_ns > self.render_cursor_ns) {
+            const skipped = self.skipFrames(nanosecondsToFramesCeil(guest_now_ns - self.render_cursor_ns));
+            self.stats.skipped_frames +%= skipped;
+            self.render_cursor_ns +|= framesToNanoseconds(skipped);
         }
     }
 
@@ -108,10 +119,12 @@ pub const Engine = struct {
 
         self.compactEvents();
         if (sequence.events.items.len > maximum_events - self.events.items.len) return error.InvalidCommand;
+        const queue_was_empty = self.events.items.len == 0;
         try self.events.ensureUnusedCapacity(self.allocator, sequence.events.items.len);
         for (sequence.events.items) |event| self.events.appendAssumeCapacity(event);
 
         const start_ns = @max(guest_now_ns, self.timeline_end_ns);
+        if (queue_was_empty) self.render_cursor_ns = start_ns;
         self.timeline_end_ns = start_ns +| framesToNanoseconds(sequence.total_frames);
         self.settings = sequence.settings;
         self.stats.play_statements +%= 1;
@@ -128,6 +141,7 @@ pub const Engine = struct {
         self.setGuestTime(guest_now_ns);
         self.compactEvents();
         if (self.events.items.len >= maximum_events) return error.InvalidCommand;
+        const queue_was_empty = self.events.items.len == 0;
         const frames: u32 = @intCast((@as(u64, sample_rate) * beep_duration_ms + 999) / 1000);
         try self.events.append(self.allocator, .{
             .phase_step = phaseStepFromMillihertz(beep_frequency_millihz),
@@ -135,6 +149,7 @@ pub const Engine = struct {
             .tone_frames = frames,
         });
         const start_ns = @max(guest_now_ns, self.timeline_end_ns);
+        if (queue_was_empty) self.render_cursor_ns = start_ns;
         self.timeline_end_ns = start_ns +| framesToNanoseconds(frames);
         self.stats.beep_statements +%= 1;
         self.stats.notes +%= 1;
@@ -168,6 +183,7 @@ pub const Engine = struct {
         }
         if (self.event_head == self.events.items.len) self.discardEvents();
         self.stats.rendered_frames +%= written_frames;
+        self.render_cursor_ns +|= framesToNanoseconds(written_frames);
         return @intCast(written_frames * frame_bytes);
     }
 
@@ -188,6 +204,35 @@ pub const Engine = struct {
         std.mem.copyForwards(Event, self.events.items[0..remaining], self.events.items[self.event_head..]);
         self.events.items.len = remaining;
         self.event_head = 0;
+    }
+
+    fn skipFrames(self: *Engine, requested: u64) u64 {
+        var remaining = requested;
+        var skipped: u64 = 0;
+        while (remaining != 0 and self.event_head < self.events.items.len) {
+            const event = self.events.items[self.event_head];
+            if (self.event_frame >= event.duration_frames) {
+                self.event_head += 1;
+                self.event_frame = 0;
+                self.phase = 0;
+                continue;
+            }
+            const available = event.duration_frames - self.event_frame;
+            const take: u32 = @intCast(@min(remaining, available));
+            if (event.phase_step != 0 and self.event_frame < event.tone_frames) {
+                const tone_take = @min(take, event.tone_frames - self.event_frame);
+                self.phase +%= event.phase_step *% tone_take;
+            }
+            self.event_frame += take;
+            remaining -= take;
+            skipped += take;
+        }
+        if (self.event_head == self.events.items.len or
+            (self.event_head + 1 == self.events.items.len and self.event_frame >= self.events.items[self.event_head].duration_frames))
+        {
+            self.discardEvents();
+        }
+        return skipped;
     }
 
     fn discardEvents(self: *Engine) void {
@@ -395,4 +440,9 @@ fn phaseStepFromMillihertz(frequency_millihz: u32) u32 {
 fn framesToNanoseconds(frames: u64) u64 {
     const numerator = @as(u128, frames) * std.time.ns_per_s;
     return @intCast(@min(@as(u128, std.math.maxInt(u64)), (numerator + sample_rate - 1) / sample_rate));
+}
+
+fn nanosecondsToFramesCeil(nanoseconds: u64) u64 {
+    const numerator = @as(u128, nanoseconds) * sample_rate;
+    return @intCast(@min(@as(u128, std.math.maxInt(u64)), (numerator + std.time.ns_per_s - 1) / std.time.ns_per_s));
 }

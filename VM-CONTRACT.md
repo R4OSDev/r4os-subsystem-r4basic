@@ -226,13 +226,21 @@ guest address can become an R4OS or host pointer.
   waits cooperatively until the complete queued timeline has elapsed. `BEEP`
   queues an 800 Hz, 200 ms foreground tone. Neither wait spins or blocks host
   event polling.
-- The generator emits deterministic 48,000 Hz, stereo, signed 16-bit little-
-  endian square-wave PCM. Hardware timbre is deliberately approximate; note,
-  rest, articulation, and tempo durations follow guest time.
-- `r4os.subsystem_runtime` keeps two audio quanta buffered and submits them
-  through R4AUDIO. A missing or failing sink enters visible degraded mode;
-  samples are discarded while the VM, guest clock, input, and video continue.
-  Stream close and runtime shutdown are idempotent.
+- The generator emits deterministic 24,000 Hz, stereo, signed 16-bit little-
+  endian square-wave PCM. HDA converts the stream to its 48 kHz hardware
+  format. Hardware timbre is deliberately approximate; note, rest,
+  articulation, and tempo durations follow guest time.
+- The productive host keeps four 40 ms source quanta buffered and permits the
+  same bounded catch-up depth. This covers the 160 ms HDA start window, so a
+  delayed graphics or interpreter cycle cannot turn already-generated notes
+  into alternating PCM and silence. Submission remains paced through R4AUDIO
+  rather than being performed by the VM.
+- If a host delay exceeds that complete window, the source queue is discarded
+  before submission and the VM advances note position and oscillator phase to
+  current guest time. Old melody fragments are never replayed late.
+- A missing or failing sink enters visible degraded mode; samples are
+  discarded while the VM, guest clock, input, and video continue. Stream
+  close and runtime shutdown are idempotent.
 
 ## Guest time, pacing, and random state
 

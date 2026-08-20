@@ -14,8 +14,9 @@ const runtime_api = r4os.subsystem_runtime;
 const launch_api = r4os.subsystem_launch;
 const error_host_video: i32 = -9820;
 const title_capacity: usize = 192;
-const audio_quantum_frames: usize = runtime_api.default_quantum_frames;
-const audio_queue_frames: usize = audio_quantum_frames * runtime_api.default_target_quanta;
+const audio_quantum_frames: u32 = runtime_api.default_quantum_frames * 2;
+const audio_target_quanta: u16 = 4;
+const audio_queue_frames: usize = @as(usize, audio_quantum_frames) * audio_target_quanta;
 
 pub fn r4_app_main(app: *r4os.App) i32 {
     if (containsIgnoreCase(app.args(), "/PERFTEST")) return runPerformanceSelfTest(app);
@@ -86,13 +87,20 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         sink = audio_sink_storage.sink();
     }
     var audio_queue: [audio.frame_bytes * audio_queue_frames]u8 = undefined;
-    var audio_scratch: [audio.frame_bytes * audio_quantum_frames]u8 = undefined;
+    var audio_scratch: [audio.frame_bytes * @as(usize, audio_quantum_frames)]u8 = undefined;
     var runtime = runtime_api.Runtime.init(.{
         .slice_budget = runtime_api.default_slice_budget,
         .max_input_events = runtime_api.default_max_input_events,
         .max_wait_ticks = runtime_api.default_max_wait_ticks,
     }, sys.monotonicHz(), sys.ticks(), .{
-        .config = .{ .sample_rate = audio.sample_rate, .channels = audio.channels },
+        .config = .{
+            .sample_rate = audio.sample_rate,
+            .channels = audio.channels,
+            .quantum_frames = audio_quantum_frames,
+            .target_quanta = audio_target_quanta,
+            .max_catchup_quanta = audio_target_quanta,
+            .sink_capacity_prefill = true,
+        },
         .queue_storage = audio_queue[0..],
         .scratch = audio_scratch[0..],
         .sink = sink,

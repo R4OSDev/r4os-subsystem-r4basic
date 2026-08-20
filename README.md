@@ -11,14 +11,18 @@ maximizable window. `SCREEN 0`, `SCREEN 1`, and `SCREEN 9` are presented as
 whole or damaged indexed raster frames through `r4os.subsystem_host`.
 
 `BEEP` and the supported QuickBASIC `PLAY` Music Macro Language generate
-48 kHz stereo PCM through the buffered subsystem runtime. Foreground and
-background playback follow `MF` and `MB`; unavailable audio degrades visibly
-without stopping guest time, input, or graphics.
+24 kHz stereo PCM through the buffered subsystem runtime; HDA converts it to
+the 48 kHz hardware format. Foreground and background playback follow `MF`
+and `MB`. The productive host buffers four 40 ms source quanta, covering the
+160 ms HDA start window so delayed interpreter or presentation cycles do not
+fragment notes. Longer delays resynchronize the source timeline instead of
+replaying old samples. Unavailable audio degrades visibly without stopping
+guest time, input, or graphics.
 
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.1.0`
+- Module version: `1.2.0`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`

@@ -771,6 +771,11 @@ test "PLAY MML parses stateful commands and rejects invalid ranges atomically" {
     try std.testing.expect(engine.pendingFrames() < pending_before);
     try std.testing.expect(std.mem.indexOfNone(u8, &pcm, &[_]u8{0}) != null);
 
+    const pending_after_render = engine.pendingFrames();
+    engine.setGuestTime(std.time.ns_per_s);
+    try std.testing.expect(engine.stats.skipped_frames != 0);
+    try std.testing.expect(engine.pendingFrames() < pending_after_render);
+
     const events_before = engine.pendingFrames();
     const statements_before = engine.stats.play_statements;
     for ([_][]const u8{ "T31C", "T256C", "L0C", "O7C", "N85", "O6B+", "MX" }) |invalid| {
