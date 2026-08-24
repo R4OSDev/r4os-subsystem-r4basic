@@ -16,13 +16,14 @@ the 48 kHz hardware format. Foreground and background playback follow `MF`
 and `MB`. The productive host buffers four 40 ms source quanta, covering the
 160 ms HDA start window so delayed interpreter or presentation cycles do not
 fragment notes. Longer delays resynchronize the source timeline instead of
-replaying old samples. Unavailable audio degrades visibly without stopping
-guest time, input, or graphics.
+replaying old samples. Unavailable audio degrades visibly, clears the queued
+PCM once, and leaves the audio deadline scheduler; guest time, input, and
+graphics retain their normal bounded pacing without repeated scratch work.
 
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.1`
+- Module version: `1.2.2`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`

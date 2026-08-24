@@ -6,7 +6,7 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.66.10
+Stand 0.69.29
 ------------
 
 Diese Ausbaustufe ist der produktive R4BASIC-v1-Subsystemhost. Explorer
@@ -265,9 +265,12 @@ alte Quellpuffer vor der Ausgabe verworfen und die VM setzt Notenposition und
 Oszillatorphase auf die aktuelle Gastzeit. Alte Melodiefragmente werden nicht
 verspaetet nachgespielt. Die Ausgabe bleibt ueber R4AUDIO gepact. Fehlt der Dienst oder faellt
 ein Stream dauerhaft aus, zeigt der Fenstertitel die Degradation. Busy,
-Timeout und ein kurzzeitig noch nicht bereiter Dienst werden dreimal im
-50-ms-Abstand erneut geoeffnet. Gastzeit, Eingabe und Grafik laufen weiter;
-beim Ende oder Schliessen wird der Stream genau einmal abgebaut.
+Timeout und ein kurzzeitig noch nicht bereiter Dienst werden beim Oeffnen
+dreimal im 50-ms-Abstand erneut versucht. Nach dauerhafter Degradation werden
+Queue, Vorfuellzustand und Audiodeadline einmalig entfernt; weitere
+Hostzyklen rendern oder verwerfen kein PCM mehr. Gastzeit, Eingabe und Grafik
+laufen mit ihren normalen begrenzten Wartezeiten weiter; beim Ende oder
+Schliessen wird der Stream genau einmal abgebaut.
 
 Produktiver Fensterhost
 -----------------------
