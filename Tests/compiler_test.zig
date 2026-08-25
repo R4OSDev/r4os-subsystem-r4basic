@@ -545,7 +545,7 @@ const RuntimeHostProbe = struct {
     }
 
     fn present(_: *anyopaque) i32 {
-        return 0;
+        return 1;
     }
 };
 

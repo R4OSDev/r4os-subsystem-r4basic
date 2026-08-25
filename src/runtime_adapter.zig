@@ -11,10 +11,15 @@ pub const slice_clock_check_instructions: u32 = 64;
 pub const SliceClock = struct {
     context: *anyopaque,
     ticks_fn: *const fn (*anyopaque) u64,
+    nanoseconds_fn: ?*const fn (*anyopaque) ?u64 = null,
     frequency_hz: u32,
 
     pub fn ticks(self: SliceClock) u64 {
         return self.ticks_fn(self.context);
+    }
+
+    pub fn nanoseconds(self: SliceClock) ?u64 {
+        return if (self.nanoseconds_fn) |read| read(self.context) else null;
     }
 };
 
@@ -27,6 +32,7 @@ pub const PerformanceStats = struct {
     time_limited_steps: u64 = 0,
     waiting_steps: u64 = 0,
     frame_ready_steps: u64 = 0,
+    first_instruction_ns: u64 = 0,
     last_elapsed_ticks: u64 = 0,
     maximum_elapsed_ticks: u64 = 0,
 };
@@ -54,6 +60,7 @@ pub const Adapter = struct {
         return initTimed(machine, .{
             .context = @ptrCast(@constCast(system)),
             .ticks_fn = systemTicks,
+            .nanoseconds_fn = systemNanoseconds,
             .frequency_hz = system.monotonicHz(),
         });
     }
@@ -109,6 +116,7 @@ fn step(context: *anyopaque, budget: u32, guest_now_ns: u64) runtime.StepResult 
     const allowed = @min(budget, vm.default_instruction_budget);
     const clock = self.slice_clock;
     const start_tick = if (clock) |value| value.ticks() else 0;
+    const start_ns = if (clock) |value| value.nanoseconds() orelse 0 else 0;
     const tick_limit = if (clock) |value| ticksForNanoseconds(value.frequency_hz, slice_time_limit_ns) else 0;
     var result: vm.SliceResult = .{ .status = .yielded, .instructions = 0 };
     var executed: u32 = 0;
@@ -133,19 +141,22 @@ fn step(context: *anyopaque, budget: u32, guest_now_ns: u64) runtime.StepResult 
     self.performance.maximum_instructions = @max(self.performance.maximum_instructions, executed);
     self.performance.last_elapsed_ticks = elapsed_ticks;
     self.performance.maximum_elapsed_ticks = @max(self.performance.maximum_elapsed_ticks, elapsed_ticks);
+    if (executed != 0 and self.performance.first_instruction_ns == 0) {
+        self.performance.first_instruction_ns = start_ns;
+    }
     if (time_limited) self.performance.time_limited_steps +%= 1 else if (result.status == .yielded and executed == allowed) self.performance.budget_limited_steps +%= 1;
     if (result.status == .waiting) self.performance.waiting_steps +%= 1;
     const terminal = result.status == .halted or result.status == .cancelled or result.status == .runtime_error;
     const frame_ready = frameReady(self, guest_now_ns, terminal);
     if (frame_ready) self.performance.frame_ready_steps +%= 1;
     return switch (result.status) {
-        .ready, .yielded => runtime.StepResult.progress(frame_ready),
+        .ready, .yielded => runtime.StepResult.progress(frame_ready).withOperations(executed),
         .waiting => runtime.StepResult.waitUntil(
             if (result.wake_guest_ns == 0) guest_now_ns +| vm.input_poll_interval_ns else result.wake_guest_ns,
             frame_ready,
-        ),
-        .halted, .cancelled => runtime.StepResult.complete(self.machine.exit_code, frame_ready),
-        .runtime_error => runtime.StepResult.fail(self.machine.exit_code),
+        ).withOperations(executed),
+        .halted, .cancelled => runtime.StepResult.complete(self.machine.exit_code, frame_ready).withOperations(executed),
+        .runtime_error => runtime.StepResult.fail(self.machine.exit_code).withOperations(executed),
     };
 }
 
@@ -158,6 +169,11 @@ fn ticksForNanoseconds(frequency_hz: u32, nanoseconds: u64) u64 {
 fn systemTicks(context: *anyopaque) u64 {
     const system: *const r4os.r4sys.Context = @ptrCast(@alignCast(context));
     return system.ticks();
+}
+
+fn systemNanoseconds(context: *anyopaque) ?u64 {
+    const system: *const r4os.r4sys.Context = @ptrCast(@alignCast(context));
+    return system.monotonicNanoseconds();
 }
 
 fn frameReady(self: *Adapter, guest_now_ns: u64, terminal: bool) bool {

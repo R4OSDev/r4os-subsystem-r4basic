@@ -6,7 +6,7 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.69.29
+Stand 0.69.54
 ------------
 
 Diese Ausbaustufe ist der produktive R4BASIC-v1-Subsystemhost. Explorer
@@ -288,6 +288,17 @@ hoechstens etwa 30 Praesentationen pro Gastsekunde begrenzt. Reset leert
 Stapel, Text, Grafik, Audio, Eingabe, Wartezustand, Zufall und offene Dateien;
 Fehler, normales Ende und Fenster-Close verwenden denselben idempotenten
 Ressourcenabbau.
+
+Optionale `T`-, `M`- und `P`-Records im weiterhin erweiterbaren R4SUBSYS1-
+Argument aktivieren eine einmalige Startdiagnose. Sie ordnet Explorer-
+Probe, Handleraufloesung, Desktop-Hostrequest, Kernel-Lader, Source-I/O,
+Kompilierung, VM-/Hostaufbau, erste ausgefuehrte Gastscheibe, lazy Audio-Open
+und ersten gastgetrieben publizierten Frame derselben ID und monotonen
+Nanosekundenachse zu. `RuntimeStats` trennt dabei angebotene Budgets von
+wirklich ausgefuehrten Instruktionen sowie Presentversuche von Publikationen
+und Skips. Im GUI-Modus entsteht einmalig `C:\TEMP\R4BASIC.LAST`; die
+Headless-Abnahme schreibt `C:\TEMP\R4BASIC.BASELINE` und beendet nur diese
+Instanz nach dem ersten produktiven Frame. Es gibt keine Ausgabe pro Frame.
 
 Tests
 -----
