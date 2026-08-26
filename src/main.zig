@@ -129,7 +129,8 @@ pub fn r4_app_main(app: *r4os.App) i32 {
 
     timeline.vm_begin_ns = monotonicNow(sys);
     var services = vm.HostServices{};
-    var storage = storage_adapter.Adapter.init(files);
+    var storage = storage_adapter.Adapter.init(app.resources());
+    defer storage.deinit();
     storage.install(&services);
     var machine = vm.Vm.init(allocator, &program, services) catch |fault| {
         if (trace.baseline) return writeBaselineFailure(&files, trace, @errorName(fault), 70);
@@ -1193,6 +1194,26 @@ const RuntimeHost = struct {
             self.storage.stats.failures,
         }) catch return false;
         report_len += file_host_line.len;
+        const file_io_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC file-io: batch_bytes={d} read_submissions={d} write_submissions={d} status_polls={d} pending_polls={d} completions={d} path_normalizations={d} path_cache_hits={d} max_request_bytes={d} max_active_requests={d} input_refills={d} output_flushes={d} waits={d} input_compaction_bytes={d} output_compaction_bytes={d} input_buffer_peak_bytes={d} output_buffer_peak_bytes={d}\r\n", .{
+            vm.sequential_file_transfer_bytes,
+            self.storage.stats.read_calls,
+            self.storage.stats.write_calls,
+            self.storage.stats.status_polls,
+            self.storage.stats.pending_polls,
+            self.storage.stats.completions,
+            self.storage.stats.path_normalizations,
+            self.storage.stats.path_cache_hits,
+            self.storage.stats.maximum_request_bytes,
+            self.storage.stats.maximum_active_requests,
+            vm_stats.file_input_refills,
+            vm_stats.file_output_flushes,
+            vm_stats.file_io_waits,
+            vm_stats.file_input_compaction_bytes,
+            vm_stats.file_output_compaction_bytes,
+            vm_stats.maximum_file_input_buffer_bytes,
+            vm_stats.maximum_file_output_buffer_bytes,
+        }) catch return false;
+        report_len += file_io_line.len;
         const presenter_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC presenter: published_frames={d} skipped_frames={d} full_frames={d} damage_frames={d} compacted_frames={d} damage_regions={d} indexed8_frames={d} indexed8_blocks={d} indexed8_resource_bytes={d} xrgb_fallback_frames={d} raster_blocks={d} sampled_pixels={d}\r\n", .{
             presenter.published_frames,
             presenter.skipped_frames,

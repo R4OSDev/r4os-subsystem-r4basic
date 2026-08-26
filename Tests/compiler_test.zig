@@ -1638,7 +1638,15 @@ const MemoryFiles = struct {
     absolute_output: std.ArrayList(u8) = .empty,
     reads: u32 = 0,
     writes: u32 = 0,
+    async_like: bool = false,
+    read_ready: bool = false,
+    write_ready: bool = false,
+    maximum_read_bytes: usize = std.math.maxInt(usize),
+    maximum_write_bytes: usize = std.math.maxInt(usize),
+    maximum_read_request: usize = 0,
+    maximum_write_request: usize = 0,
     fail_next_nonempty_write: bool = false,
+    arm_failure_after_partial_write: bool = false,
     failed_writes: u32 = 0,
 
     fn deinit(self: *MemoryFiles) void {
@@ -1649,16 +1657,28 @@ const MemoryFiles = struct {
 
     fn read(context: ?*anyopaque, path: []const u8, offset: u32, out: []u8) core.vm.FileReadResult {
         const self: *MemoryFiles = @ptrCast(@alignCast(context.?));
+        self.maximum_read_request = @max(self.maximum_read_request, out.len);
+        if (self.async_like and !self.read_ready) {
+            self.read_ready = true;
+            return .pending;
+        }
+        self.read_ready = false;
         self.reads += 1;
         if (!std.ascii.eqlIgnoreCase(path, "C:\\GAMES\\input.txt")) return .{ .failure = .not_found };
         if (offset >= self.input.len) return .end;
-        const count = @min(out.len, self.input.len - offset);
+        const count = @min(out.len, self.maximum_read_bytes, self.input.len - offset);
         @memcpy(out[0..count], self.input[offset..][0..count]);
         return .{ .bytes = @intCast(count) };
     }
 
     fn write(context: ?*anyopaque, path: []const u8, bytes: []const u8, append: bool) core.vm.FileWriteResult {
         const self: *MemoryFiles = @ptrCast(@alignCast(context.?));
+        self.maximum_write_request = @max(self.maximum_write_request, bytes.len);
+        if (self.async_like and !self.write_ready) {
+            self.write_ready = true;
+            return .pending;
+        }
+        self.write_ready = false;
         self.writes += 1;
         if (bytes.len != 0 and self.fail_next_nonempty_write) {
             self.fail_next_nonempty_write = false;
@@ -1674,10 +1694,39 @@ const MemoryFiles = struct {
         else
             return .{ .failure = .path_error };
         if (!append) target.clearRetainingCapacity();
-        target.appendSlice(std.testing.allocator, bytes) catch return .{ .failure = .too_large };
-        return .ok;
+        const count = @min(bytes.len, self.maximum_write_bytes);
+        target.appendSlice(std.testing.allocator, bytes[0..count]) catch return .{ .failure = .too_large };
+        if (self.arm_failure_after_partial_write and count < bytes.len) {
+            self.arm_failure_after_partial_write = false;
+            self.fail_next_nonempty_write = true;
+        }
+        return .{ .bytes = @intCast(count) };
     }
 };
+
+test "VM reset and teardown quiesce file bindings before releasing state" {
+    const Probe = struct {
+        calls: u32 = 0,
+
+        fn quiesce(context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+        }
+    };
+
+    var program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\QUIESCE.BAS", "END\n");
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var probe = Probe{};
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{
+        .file_context = &probe,
+        .file_quiesce = Probe.quiesce,
+    });
+    try machine.reset();
+    try std.testing.expectEqual(@as(u32, 1), probe.calls);
+    machine.deinit();
+    try std.testing.expectEqual(@as(u32, 2), probe.calls);
+}
 
 test "sequential files resolve guest paths and preserve INPUT PRINT and EOF" {
     const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, fixture_paths.sequential_files, std.testing.allocator, .limited(256 * 1024));
@@ -1713,6 +1762,105 @@ test "sequential files resolve guest paths and preserve INPUT PRINT and EOF" {
     try std.testing.expect(counters.maximum_open_files != 0);
 }
 
+test "sequential files stream one byte through four MiB with bounded asynchronous batches" {
+    const one_byte_source =
+        \\DEFINT A-Z
+        \\OPEN "input.txt" FOR INPUT AS #1
+        \\LINE INPUT #1, Value$
+        \\AtEnd = EOF(1)
+        \\CLOSE #1
+        \\END
+    ;
+    var one_byte_program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\ONE.BAS", one_byte_source);
+    defer one_byte_program.deinit();
+    try expectProgramOk(&one_byte_program);
+    var one_byte_files = MemoryFiles{ .input = "Z", .async_like = true };
+    defer one_byte_files.deinit();
+    var one_byte_machine = try core.vm.Vm.init(std.testing.allocator, &one_byte_program, .{
+        .file_context = &one_byte_files,
+        .file_read = MemoryFiles.read,
+        .file_write = MemoryFiles.write,
+    });
+    defer one_byte_machine.deinit();
+    try std.testing.expect((try runFileIoCooperatively(&one_byte_machine, 128)) != 0);
+    try expectString(&one_byte_machine, "Value$", "Z");
+    try expectInteger(&one_byte_machine, "AtEnd", -1);
+    try std.testing.expectEqual(@as(u32, 2), one_byte_files.reads);
+
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(std.testing.allocator);
+    var remaining = core.vm.maximum_sequential_file_bytes;
+    var expected_lines: i32 = 0;
+    while (remaining != 0) {
+        const payload = @min(@as(usize, 30_000), remaining - 2);
+        try input.appendNTimes(std.testing.allocator, ' ', payload);
+        try input.appendSlice(std.testing.allocator, "\r\n");
+        remaining -= payload + 2;
+        expected_lines += 1;
+    }
+    try std.testing.expectEqual(core.vm.maximum_sequential_file_bytes, input.items.len);
+
+    const large_source =
+        \\DEFINT A-Z
+        \\OPEN "input.txt" FOR INPUT AS #1
+        \\DO WHILE NOT EOF(1)
+        \\LINE INPUT #1, Row$
+        \\Lines& = Lines& + 1
+        \\Bytes& = Bytes& + LEN(Row$)
+        \\LOOP
+        \\CLOSE #1
+        \\OPEN "output.txt" FOR OUTPUT AS #2
+        \\FOR I = 1 TO 128
+        \\PRINT #2, SPACE$(32766); CHR$(13); CHR$(10);
+        \\NEXT I
+        \\Done = 1
+        \\END
+    ;
+    var large_program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\LARGE.BAS", large_source);
+    defer large_program.deinit();
+    try expectProgramOk(&large_program);
+    var large_files = MemoryFiles{
+        .input = input.items,
+        .async_like = true,
+        .maximum_write_bytes = 4096,
+    };
+    defer large_files.deinit();
+    var large_machine = try core.vm.Vm.init(std.testing.allocator, &large_program, .{
+        .file_context = &large_files,
+        .file_read = MemoryFiles.read,
+        .file_write = MemoryFiles.write,
+    });
+    defer large_machine.deinit();
+    const waiting_cycles = try runFileIoCooperatively(&large_machine, 20_000);
+    try std.testing.expect(waiting_cycles > 1000);
+    try expectInteger(&large_machine, "Done", 1);
+    try expectLong(&large_machine, "Lines&", expected_lines);
+    try expectLong(
+        &large_machine,
+        "Bytes&",
+        @intCast(core.vm.maximum_sequential_file_bytes - @as(usize, @intCast(expected_lines)) * 2),
+    );
+    try std.testing.expectEqual(core.vm.maximum_sequential_file_bytes, large_files.output.items.len);
+    var output_offset: usize = 0;
+    for (0..128) |_| {
+        for (large_files.output.items[output_offset .. output_offset + 32_766]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
+        output_offset += 32_766;
+        try std.testing.expectEqualStrings("\r\n", large_files.output.items[output_offset .. output_offset + 2]);
+        output_offset += 2;
+    }
+    try std.testing.expectEqual(large_files.output.items.len, output_offset);
+    try std.testing.expectEqual(@as(u32, 65), large_files.reads);
+    try std.testing.expectEqual(core.vm.sequential_file_transfer_bytes, large_files.maximum_read_request);
+    try std.testing.expect(large_files.maximum_write_request <= core.vm.sequential_file_transfer_bytes);
+    const stats = large_machine.performanceStats();
+    try std.testing.expectEqual(@as(u64, 64), stats.file_input_refills);
+    try std.testing.expectEqual(@as(u64, 1024), stats.file_output_flushes);
+    try std.testing.expect(stats.file_input_compaction_bytes != 0);
+    try std.testing.expect(stats.maximum_file_input_buffer_bytes <= 2 * core.vm.sequential_file_transfer_bytes);
+    try std.testing.expect(stats.maximum_file_output_buffer_bytes <= core.vm.sequential_file_transfer_bytes);
+    try std.testing.expect(stats.file_io_waits > 1000);
+}
+
 test "failed CLOSE keeps sparse file slots retryable and moved indices valid" {
     const source =
         \\DEFINT A-Z
@@ -1732,7 +1880,10 @@ test "failed CLOSE keeps sparse file slots retryable and moved indices valid" {
     var program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\ATOMIC.BAS", source);
     defer program.deinit();
     try expectProgramOk(&program);
-    var files = MemoryFiles{ .fail_next_nonempty_write = true };
+    var files = MemoryFiles{
+        .maximum_write_bytes = 2,
+        .arm_failure_after_partial_write = true,
+    };
     defer files.deinit();
     var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{
         .file_context = &files,
@@ -1741,7 +1892,7 @@ test "failed CLOSE keeps sparse file slots retryable and moved indices valid" {
     });
     defer machine.deinit();
 
-    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 32));
+    _ = try runFileIoCooperatively(&machine, 128);
     try expectInteger(&machine, "Done", 1);
     try std.testing.expect(machine.global("Failure").?.integer != 0);
     try std.testing.expectEqual(@as(u32, 1), files.failed_writes);
@@ -1785,6 +1936,22 @@ test "file modes numbers devices and missing paths fail visibly" {
     var services = core.vm.HostServices{};
     bridge.install(&services);
     try std.testing.expect(services.file_context != null);
+}
+
+fn runFileIoCooperatively(machine: *core.vm.Vm, maximum_cycles: usize) !u64 {
+    var waiting_cycles: u64 = 0;
+    for (0..maximum_cycles) |cycle| {
+        machine.setGuestTime(@as(u64, @intCast(cycle)) * std.time.ns_per_ms);
+        const result = machine.runSlice(4096);
+        switch (result.status) {
+            .waiting => waiting_cycles += 1,
+            .yielded, .ready => {},
+            .halted => return waiting_cycles,
+            .cancelled => return error.FileIoCancelled,
+            .runtime_error => return error.FileIoRuntimeError,
+        }
+    }
+    return error.FileIoDidNotFinish;
 }
 
 fn feedInput(machine: *core.vm.Vm, bytes: []const u8) !void {

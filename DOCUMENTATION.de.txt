@@ -6,7 +6,7 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.69.65
+Stand 0.69.66
 ------------
 
 Diese Ausbaustufe ist der produktive R4BASIC-v1-Subsystemhost. Explorer
@@ -323,12 +323,23 @@ laufwerkrelative Formen und DOS-Geraetenamen wie CON, COM1 oder LPT1 werden
 sichtbar abgewiesen.
 
 Die VM erreicht keine R4SYS-Dateifunktion direkt. `src/storage_adapter.zig`
-uebersetzt ausschliesslich ueber `r4os.Files` und `AbsoluteFilePath` in die
-normalen Storage-Fassaden. Ein sequentieller Eingabepuffer ist auf vier MiB
-begrenzt; Ausgaben werden pro Slot gesammelt und bei CLOSE oder normalem END
-geschrieben. Fehlende Dateien, falsche Modi, EOF-Ueberlauf und Pfadfehler
-behalten getrennte QBasic-Fehlernummern. RANDOM/BINARY, Drucker, COM-Ports,
-Loeschen und Verzeichnisveraenderungen sind nicht Bestandteil dieses Stands.
+uebersetzt ausschliesslich ueber die asynchrone `r4os.Resources`-Fassade und
+vier zwischengespeicherte `AbsoluteFilePath`-Werte. Pro VM ist hoechstens eine
+Anfrage aktiv; ihr VM-eigener Puffer bleibt bis zum terminalen Status und zum
+Schliessen der Anfrage unveraendert. INPUT liest bedarfsgesteuert in
+hoechstens 64-KiB-Stuecken und verdichtet verbrauchte Praefixe. Ein noch nicht
+abgeschlossenes LINE-INPUT- oder INPUT-Statement kann den rollierenden Puffer
+bis zur Vier-MiB-Dateigrenze wachsen lassen. OUTPUT und APPEND veroeffentlichen
+bestaetigte Praefixe ebenfalls in hoechstens 64-KiB-Stuecken; Teilwrites,
+CLOSE, normales END sowie Fehler und RESUME setzen ohne doppelte Bytes fort.
+Eine offene Anfrage gibt die aktuelle Instruktion bis zur naechsten
+Gastmillisekunde kooperativ ab, sodass Eingabe, Bild, Audio und Lebenszyklus
+zwischen den Polls weiterlaufen. Reset und Abbau warten eine nicht abbrechbare
+Anfrage ab und schliessen ihre Bindung, bevor der VM-Puffer freigegeben wird.
+Fehlende Dateien, falsche Modi, EOF-Ueberlauf und Pfadfehler behalten getrennte
+QBasic-Fehlernummern. RANDOM/BINARY,
+Drucker, COM-Ports, Loeschen und Verzeichnisveraenderungen sind nicht
+Bestandteil dieses Stands.
 Die Dateinummern 0 bis 255 werden ueber einen festen 256-Byte-Index in O(1)
 aufgeloest; nur wirklich offene Dateien besitzen einen dynamischen Slot samt
 Puffer. Dadurch entfallen 256 eingebettete optionale Dateizustaende pro VM.
@@ -424,6 +435,9 @@ gelesene Bytes, Quellgroesse und die 256-KiB-Grenze. Zusammen mit dem
 vorgelagerten `source-probe`-Marker ist damit im Gast nachweisbar, dass eine
 bekannte BAS-Datei vor dem Start nicht vollstaendig und im R4Basic-Host nur
 einmal geladen wird.
+`R4BASIC file-io` nennt die 64-KiB-Stueckgrenze, asynchrone Read-/Write-
+Submissions, Status- und Pending-Polls, Abschluesse, Pfadnormalisierungen und
+Cachetreffer sowie maximale Anfrage-, Aktiv-, Eingabe- und Ausgabegroessen.
 
 R4BASIC verwendet gezielt `OPTIMIZE=speed`; andere R4X-Module bleiben bei
 ihrer jeweiligen Manifestentscheidung. Der identische Standard-QEMU-Lauf mit
@@ -456,6 +470,9 @@ Zusaetzlich werden exakte Laufzeitpositionen und Fehlernummern, Rekursion,
 verschachteltes ByRef, Hostfehler, Reset, Nullbudget-Abbruch, Fokus- und
 Instanztrennung, pausierte Wartezeit, Fensterereignisse waehrend SLEEP,
 absolute und relative Dateipfade sowie Storage-Fehler direkt getestet. Der
+Dateitest deckt ausserdem Ein-Byte- und exakte Vier-MiB-Eingaben, CR/LF ueber
+Stueckgrenzen, exakte Vier-MiB-Ausgabe, asynchrone Wartezyklen, 4-KiB-
+Teilwrites und den unveraenderten Fehler-/RESUME-Pfad ab. Der
 Grafikhosttest prueft pixelidentische Integer- und Fractionalbilder,
 Indexed8-ABI- und XRGB-Fallbackpfad, die 15 Bloecke eines Vollframes, getrennte
 sparse Damage-Regionen, Unterdrueckung unveraenderter Frames, mindestens 20

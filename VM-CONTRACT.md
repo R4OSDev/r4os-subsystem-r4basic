@@ -1,6 +1,6 @@
 ﻿# R4BASIC v1 core VM contract
 
-Contract version: `1.11.0`
+Contract version: `1.12.0`
 
 This document freezes the executable R4BASIC language layers. The broader
 source syntax accepted by the frontend remains defined in
@@ -348,13 +348,27 @@ guest address can become an R4OS or host pointer.
   drive path remains absolute. Empty paths, invalid path bytes, drive-relative
   forms, and DOS device names such as `CON`, `COM1`, and `LPT1` are rejected.
 - Host reads and writes occur only through injected callbacks. The production
-  adapter implements those callbacks with `r4os.Files` and typed
-  `AbsoluteFilePath`; the VM has no direct R4SYS or kernel file path.
-- Sequential input is read into a bounded private buffer of at most 4 MiB.
-  Quoted and unquoted comma fields, CR/LF line endings, whole-line input, and
-  end-of-file state are deterministic. Output and append data are buffered
-  per slot and committed through the host callback at `CLOSE` or normal
-  `END`.
+  adapter uses the asynchronous `r4os.Resources` facade and caches four typed
+  `AbsoluteFilePath` values; the VM has no direct R4SYS, VFS, or kernel file
+  path. Exactly one request may be outstanding, and its VM-owned buffer stays
+  alive until terminal status and request close.
+- Sequential input is fetched on demand in at most 64-KiB transfers. Consumed
+  prefixes are compacted before later refills, so ordinary records retain a
+  rolling buffer instead of the whole file; only the current unfinished INPUT
+  statement or line may retain bytes toward the 4-MiB file limit. Quoted
+  and unquoted comma fields, split CR/LF endings, whole-line input, and exact
+  end-of-file state remain deterministic. Geometric capacity growth is
+  clamped to the input limit; the reported peak is allocated capacity rather
+  than only the logical byte count.
+- `OUTPUT` and `APPEND` publish at most 64 KiB at a time. A partial host result
+  advances only the confirmed prefix, while `CLOSE`, normal `END`, and a
+  resumed error continue with the remaining bytes without duplication.
+  Submission and polling return `waiting` to the subsystem runtime at a
+  one-millisecond guest deadline; input polling, presentation, audio service,
+  and lifecycle work therefore continue between file-I/O progress steps. The
+  output allocation itself is clamped to the 64-KiB transfer limit.
+- Reset and teardown wait for a non-cancellable outstanding request and close
+  its binding before any VM-owned path or transfer buffer is released.
 - Bad numbers, missing files, wrong modes, duplicate slots, input past end,
   bad names, permission failures, and path/I/O failures remain distinct VM
   codes with the BASIC numbers listed below. Random-access and binary records,

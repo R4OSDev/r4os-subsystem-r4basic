@@ -6,7 +6,7 @@ const graphics_screen = @import("graphics_screen.zig");
 const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "1.11.0";
+pub const contract_version = "1.12.0";
 pub const default_instruction_budget: u32 = 262_144;
 pub const timer_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
@@ -18,6 +18,8 @@ pub const array_resize_live_limit_bytes: usize = 192 * 1024 * 1024;
 pub const maximum_keyboard_bytes: usize = 4096;
 pub const maximum_input_line_bytes: usize = 255;
 pub const maximum_sequential_file_bytes: usize = 4 * 1024 * 1024;
+pub const sequential_file_transfer_bytes: usize = 64 * 1024;
+pub const file_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_file_number: usize = 255;
 pub const random_mask: u32 = 0x00FF_FFFF;
 pub const default_random_seed: u32 = 0x0050_0000;
@@ -46,11 +48,13 @@ pub const FileHostError = enum(u8) {
 pub const FileReadResult = union(enum) {
     bytes: u32,
     end,
+    pending,
     failure: FileHostError,
 };
 
 pub const FileWriteResult = union(enum) {
-    ok,
+    bytes: u32,
+    pending,
     failure: FileHostError,
 };
 
@@ -63,6 +67,7 @@ pub const HostServices = struct {
     file_context: ?*anyopaque = null,
     file_read: *const fn (?*anyopaque, []const u8, u32, []u8) FileReadResult = unavailableFileRead,
     file_write: *const fn (?*anyopaque, []const u8, []const u8, bool) FileWriteResult = unavailableFileWrite,
+    file_quiesce: *const fn (?*anyopaque) void = ignoreFileQuiesce,
     guest_directory: []const u8 = "",
     initial_random_seed: u32 = default_random_seed,
 };
@@ -245,6 +250,13 @@ pub const PerformanceStats = struct {
     maximum_array_resize_live_bytes: u64 = 0,
     file_table_capacity_grows: u64 = 0,
     maximum_open_files: u64 = 0,
+    file_input_refills: u64 = 0,
+    file_output_flushes: u64 = 0,
+    file_io_waits: u64 = 0,
+    file_input_compaction_bytes: u64 = 0,
+    file_output_compaction_bytes: u64 = 0,
+    maximum_file_input_buffer_bytes: u64 = 0,
+    maximum_file_output_buffer_bytes: u64 = 0,
     raster: graphics_screen.PerformanceStats = .{},
     input: InputStats = .{},
 
@@ -544,14 +556,18 @@ const ResumeMode = enum {
 const SequentialFile = struct {
     mode: bytecode.FileMode,
     path: []u8,
-    input: []u8,
+    input: std.ArrayList(u8) = .empty,
+    input_head: usize = 0,
+    input_offset: usize = 0,
+    input_eof: bool = false,
     output: std.ArrayList(u8) = .empty,
-    offset: usize = 0,
+    output_head: usize = 0,
+    output_total_bytes: usize = 0,
     print_column: usize = 0,
 
     fn deinit(self: *SequentialFile, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
-        allocator.free(self.input);
+        self.input.deinit(allocator);
         self.output.deinit(allocator);
         self.* = undefined;
     }
@@ -618,6 +634,13 @@ pub const Vm = struct {
     maximum_array_resize_live_bytes: u64 = 0,
     file_table_capacity_grows: u64 = 0,
     maximum_open_files: u64 = 0,
+    file_input_refills: u64 = 0,
+    file_output_flushes: u64 = 0,
+    file_io_waits: u64 = 0,
+    file_input_compaction_bytes: u64 = 0,
+    file_output_compaction_bytes: u64 = 0,
+    maximum_file_input_buffer_bytes: u64 = 0,
+    maximum_file_output_buffer_bytes: u64 = 0,
     status: Status = .ready,
     exit_code: i32 = 0,
     runtime_diagnostic: ?RuntimeDiagnostic = null,
@@ -654,6 +677,8 @@ pub const Vm = struct {
     random_last: f32 = 0,
     open_files: std.ArrayList(FileSlot) = .empty,
     file_slot_indices: [maximum_file_number + 1]u8 = .{0} ** (maximum_file_number + 1),
+    pending_open_file: ?SequentialFile = null,
+    pending_open_number: u8 = 0,
     active_print_file: ?u8 = null,
     statement_stack_base: usize = 0,
     current_statement_start: u32 = bytecode.invalid_index,
@@ -679,6 +704,7 @@ pub const Vm = struct {
     }
 
     pub fn deinit(self: *Vm) void {
+        self.host.file_quiesce(self.fileHostContext());
         self.discardStackFrom(0);
         self.stack.deinit(self.allocator);
         while (self.frames.pop()) |frame_value| {
@@ -883,6 +909,7 @@ pub const Vm = struct {
     }
 
     pub fn reset(self: *Vm) InitError!void {
+        self.host.file_quiesce(self.fileHostContext());
         const replacement = try allocateGlobals(self.allocator, self.program);
         errdefer deinitGlobals(self.allocator, replacement);
 
@@ -939,6 +966,13 @@ pub const Vm = struct {
         self.maximum_array_resize_live_bytes = 0;
         self.file_table_capacity_grows = 0;
         self.maximum_open_files = 0;
+        self.file_input_refills = 0;
+        self.file_output_flushes = 0;
+        self.file_io_waits = 0;
+        self.file_input_compaction_bytes = 0;
+        self.file_output_compaction_bytes = 0;
+        self.maximum_file_input_buffer_bytes = 0;
+        self.maximum_file_output_buffer_bytes = 0;
         self.status = .ready;
         self.exit_code = 0;
         self.runtime_diagnostic = null;
@@ -1114,6 +1148,13 @@ pub const Vm = struct {
             .maximum_array_resize_live_bytes = self.maximum_array_resize_live_bytes,
             .file_table_capacity_grows = self.file_table_capacity_grows,
             .maximum_open_files = self.maximum_open_files,
+            .file_input_refills = self.file_input_refills,
+            .file_output_flushes = self.file_output_flushes,
+            .file_io_waits = self.file_io_waits,
+            .file_input_compaction_bytes = self.file_input_compaction_bytes,
+            .file_output_compaction_bytes = self.file_output_compaction_bytes,
+            .maximum_file_input_buffer_bytes = self.maximum_file_input_buffer_bytes,
+            .maximum_file_output_buffer_bytes = self.maximum_file_output_buffer_bytes,
             .raster = self.graphics.performanceStats(),
             .input = self.input_stats,
         };
@@ -1968,8 +2009,8 @@ pub const Vm = struct {
     }
 
     fn printValue(self: *Vm) ExecutionError!void {
-        var value = try self.popValue();
-        defer value.deinit(self.allocator);
+        if (self.stack.items.len == 0) return error.StackUnderflow;
+        const value = try self.stackValueAt(self.stack.items.len - 1);
         switch (value) {
             .string => |bytes| try self.printBytes(bytes),
             .integer => |number| try self.printNumber(number, number >= 0),
@@ -1977,14 +2018,23 @@ pub const Vm = struct {
             .single => |number| try self.printNumber(number, number >= 0),
             .double => |number| try self.printNumber(number, number >= 0),
         }
+        self.discardStackFrom(self.stack.items.len - 1);
     }
 
     fn printNumber(self: *Vm, number: anytype, positive: bool) ExecutionError!void {
-        var storage: [numeric_format_buffer_bytes]u8 = undefined;
-        const formatted = try self.formatNumber(&storage, number);
-        if (positive) try self.printBytes(" ");
-        try self.printBytes(formatted);
-        try self.printBytes(" ");
+        var number_storage: [numeric_format_buffer_bytes]u8 = undefined;
+        const formatted = try self.formatNumber(&number_storage, number);
+        var output: [numeric_format_buffer_bytes + 2]u8 = undefined;
+        var len: usize = 0;
+        if (positive) {
+            output[len] = ' ';
+            len += 1;
+        }
+        @memcpy(output[len .. len + formatted.len], formatted);
+        len += formatted.len;
+        output[len] = ' ';
+        len += 1;
+        try self.printBytes(output[0..len]);
     }
 
     fn formatNumber(self: *Vm, storage: *[numeric_format_buffer_bytes]u8, number: anytype) ExecutionError![]const u8 {
@@ -1996,27 +2046,32 @@ pub const Vm = struct {
         if (self.active_print_file) |raw_number| {
             const file = try self.fileAt(raw_number);
             if (file.mode == .input) return error.BadFileMode;
-            if (bytes.len > maximum_sequential_file_bytes -| file.output.items.len) return error.OutOfMemory;
-            try file.output.appendSlice(self.allocator, bytes);
-            for (bytes) |byte| switch (byte) {
-                '\r', '\n' => file.print_column = 0,
-                else => file.print_column +|= 1,
-            };
+            try self.appendFileBytes(file, bytes);
             return;
         }
         self.text.write(bytes);
     }
 
     fn printTab(self: *Vm) ExecutionError!void {
-        const requested = try self.popLong();
+        if (self.stack.items.len == 0) return error.StackUnderflow;
+        const requested = try values.asLong(try self.stackValueAt(self.stack.items.len - 1));
         if (requested < 1 or requested > 255) return error.IllegalFunctionCall;
         if (self.active_print_file) |raw_number| {
             const file = try self.fileAt(raw_number);
             const target: usize = @intCast(requested - 1);
-            if (target < file.print_column) try self.printNewline();
-            try self.printSpaces(target -| file.print_column);
+            const newline = target < file.print_column;
+            const spaces = if (newline) target else target - file.print_column;
+            const additional = spaces + if (newline) @as(usize, 2) else 0;
+            try self.ensureFileOutputSpace(file, additional);
+            if (newline) try file.output.appendSlice(self.allocator, "\r\n");
+            try file.output.appendNTimes(self.allocator, ' ', spaces);
+            file.output_total_bytes += additional;
+            file.print_column = target;
+            self.noteFileOutputBuffer(file);
+            self.discardStackFrom(self.stack.items.len - 1);
             return;
         }
+        self.discardStackFrom(self.stack.items.len - 1);
         self.text.printTab(requested) catch return error.IllegalFunctionCall;
     }
 
@@ -2031,11 +2086,20 @@ pub const Vm = struct {
     }
 
     fn printSpaces(self: *Vm, count: usize) ExecutionError!void {
+        if (self.active_print_file) |raw_number| {
+            const file = try self.fileAt(raw_number);
+            try self.ensureFileOutputSpace(file, count);
+            try file.output.appendNTimes(self.allocator, ' ', count);
+            file.output_total_bytes += count;
+            file.print_column +|= count;
+            self.noteFileOutputBuffer(file);
+            return;
+        }
         const spaces = [_]u8{' '} ** text_screen.columns;
         var remaining = count;
         while (remaining != 0) {
             const amount = @min(remaining, spaces.len);
-            try self.printBytes(spaces[0..amount]);
+            self.text.write(spaces[0..amount]);
             remaining -= amount;
         }
     }
@@ -2046,6 +2110,48 @@ pub const Vm = struct {
         } else {
             self.text.newLine();
         }
+    }
+
+    fn appendFileBytes(self: *Vm, file: *SequentialFile, bytes: []const u8) ExecutionError!void {
+        try self.ensureFileOutputSpace(file, bytes.len);
+        try file.output.appendSlice(self.allocator, bytes);
+        file.output_total_bytes += bytes.len;
+        for (bytes) |byte| switch (byte) {
+            '\r', '\n' => file.print_column = 0,
+            else => file.print_column +|= 1,
+        };
+        self.noteFileOutputBuffer(file);
+    }
+
+    fn ensureFileOutputSpace(self: *Vm, file: *SequentialFile, additional: usize) ExecutionError!void {
+        if (additional > sequential_file_transfer_bytes or additional > maximum_sequential_file_bytes -| file.output_total_bytes) {
+            return error.OutOfMemory;
+        }
+        self.compactFileOutput(file);
+        if (file.output.items.len + additional > sequential_file_transfer_bytes) try self.flushFileOutput(file);
+        try self.ensureFileBufferCapacity(
+            &file.output,
+            file.output.items.len + additional,
+            sequential_file_transfer_bytes,
+        );
+    }
+
+    fn compactFileOutput(self: *Vm, file: *SequentialFile) void {
+        if (file.output_head == 0) return;
+        const remaining = file.output.items.len - file.output_head;
+        if (remaining != 0) {
+            std.mem.copyForwards(u8, file.output.items[0..remaining], file.output.items[file.output_head..]);
+            self.file_output_compaction_bytes +|= @intCast(remaining);
+        }
+        file.output.items.len = remaining;
+        file.output_head = 0;
+    }
+
+    fn noteFileOutputBuffer(self: *Vm, file: *const SequentialFile) void {
+        self.maximum_file_output_buffer_bytes = @max(
+            self.maximum_file_output_buffer_bytes,
+            @as(u64, @intCast(file.output.capacity)),
+        );
     }
 
     fn consoleInput(self: *Vm, instruction_index: u32, target_count: u32, flags: u32) ExecutionError!void {
@@ -2203,26 +2309,51 @@ pub const Vm = struct {
             for (parsed[0..initialized]) |*value| value.deinit(self.allocator);
             self.allocator.free(parsed);
         }
-        var cursor = file.offset;
+        var cursor = file.input_head;
         if (line_input) {
             if (target_count != 1 or try self.inputTargetType(statement_base + 1) != .string) return error.TypeMismatch;
-            if (cursor >= file.input.len) return error.InputPastEnd;
+            if (cursor >= file.input.items.len) {
+                if (file.input_eof) return error.InputPastEnd;
+                try self.refillFileInput(file);
+                self.scheduleFilePoll();
+                return error.WouldBlock;
+            }
             const start = cursor;
-            while (cursor < file.input.len and file.input[cursor] != '\r' and file.input[cursor] != '\n') cursor += 1;
-            parsed[0] = .{ .string = try self.allocator.dupe(u8, file.input[start..cursor]) };
+            while (cursor < file.input.items.len and file.input.items[cursor] != '\r' and file.input.items[cursor] != '\n') cursor += 1;
+            if (!file.input_eof and (cursor == file.input.items.len or cursor + 1 == file.input.items.len)) {
+                try self.refillFileInput(file);
+                self.scheduleFilePoll();
+                return error.WouldBlock;
+            }
+            parsed[0] = .{ .string = try self.allocator.dupe(u8, file.input.items[start..cursor]) };
             initialized = 1;
-            consumeLineEnding(file.input, &cursor);
+            consumeLineEnding(file.input.items, &cursor);
         } else {
             var target: usize = 0;
             while (target < target_count) : (target += 1) {
-                const field = nextSequentialField(file.input, &cursor) orelse return error.InputPastEnd;
-                parsed[target] = try self.decodeInputField(field, try self.inputTargetType(statement_base + 1 + target));
+                const field = switch (nextSequentialField(file.input.items, &cursor, file.input_eof)) {
+                    .field => |value| value,
+                    .need_more => {
+                        try self.refillFileInput(file);
+                        self.scheduleFilePoll();
+                        return error.WouldBlock;
+                    },
+                    .end => return error.InputPastEnd,
+                };
+                parsed[target] = try self.decodeInputField(
+                    field,
+                    try self.inputTargetType(statement_base + 1 + target),
+                );
                 initialized += 1;
             }
         }
         self.assignInputValues(statement_base + 1, parsed);
         self.allocator.free(parsed);
-        file.offset = cursor;
+        file.input_head = cursor;
+        if (file.input_head == file.input.items.len) {
+            file.input.clearRetainingCapacity();
+            file.input_head = 0;
+        }
         self.discardStackFrom(statement_base);
     }
 
@@ -2343,94 +2474,132 @@ pub const Vm = struct {
     }
 
     fn openFile(self: *Vm, mode: bytecode.FileMode) ExecutionError!void {
-        const file_number = try self.popFileNumber();
-        var path_value = try self.popValue();
-        defer path_value.deinit(self.allocator);
+        self.openFileStep(mode) catch |fault| {
+            if (fault != error.WouldBlock) self.discardPendingOpen();
+            return fault;
+        };
+    }
+
+    fn openFileStep(self: *Vm, mode: bytecode.FileMode) ExecutionError!void {
+        if (self.stack.items.len < 2) return error.StackUnderflow;
+        const statement_base = self.stack.items.len - 2;
+        const file_number = try self.fileNumberAt(statement_base + 1);
+        const path_value = try self.stackValueAt(statement_base);
         const raw_path = switch (path_value) {
             .string => |value| value,
             else => return error.TypeMismatch,
         };
-        if (self.fileSlotIndex(file_number) != null) return error.FileAlreadyOpen;
-        const resolved_path = try self.resolveGuestPath(raw_path);
-        errdefer self.allocator.free(resolved_path);
+
+        if (self.pending_open_file == null) {
+            if (self.fileSlotIndex(file_number) != null) return error.FileAlreadyOpen;
+            const resolved_path = try self.resolveGuestPath(raw_path);
+            self.pending_open_file = .{
+                .mode = mode,
+                .path = resolved_path,
+            };
+            self.pending_open_number = @intCast(file_number);
+        } else if (self.pending_open_number != file_number or self.pending_open_file.?.mode != mode) {
+            return error.InvalidInstruction;
+        }
+
+        const pending = &self.pending_open_file.?;
+        switch (mode) {
+            .input => if (pending.input_offset == 0 and pending.input.items.len == 0 and !pending.input_eof) {
+                try self.refillFileInput(pending);
+            },
+            .output, .append => switch (self.host.file_write(
+                self.fileHostContext(),
+                pending.path,
+                "",
+                mode == .append,
+            )) {
+                .bytes => |count| if (count != 0) return error.PathFileAccess,
+                .pending => {
+                    self.file_io_waits +%= 1;
+                    self.scheduleFilePoll();
+                    return error.WouldBlock;
+                },
+                .failure => |failure| return fileHostFault(failure),
+            },
+        }
 
         const previous_capacity = self.open_files.capacity;
         try self.open_files.ensureUnusedCapacity(self.allocator, 1);
         if (self.open_files.capacity != previous_capacity) self.file_table_capacity_grows +%= 1;
-
-        var input = try self.allocator.alloc(u8, 0);
-        errdefer self.allocator.free(input);
-        switch (mode) {
-            .input => {
-                self.allocator.free(input);
-                input = try self.readWholeFile(resolved_path);
-            },
-            .output, .append => {
-                const result = self.host.file_write(self.fileHostContext(), resolved_path, "", mode == .append);
-                switch (result) {
-                    .ok => {},
-                    .failure => |failure| return fileHostFault(failure),
-                }
-            },
-        }
+        const opened = self.pending_open_file.?;
+        self.pending_open_file = null;
+        self.pending_open_number = 0;
         self.open_files.appendAssumeCapacity(.{
             .number = @intCast(file_number),
-            .file = .{
-                .mode = mode,
-                .path = resolved_path,
-                .input = input,
-            },
+            .file = opened,
         });
         self.file_slot_indices[file_number] = @intCast(self.open_files.items.len);
         self.maximum_open_files = @max(self.maximum_open_files, @as(u64, @intCast(self.open_files.items.len)));
-    }
-
-    fn readWholeFile(self: *Vm, path: []const u8) ExecutionError![]u8 {
-        var result: std.ArrayList(u8) = .empty;
-        errdefer result.deinit(self.allocator);
-        var scratch: [4096]u8 = undefined;
-        var offset: u32 = 0;
-        while (true) {
-            switch (self.host.file_read(self.fileHostContext(), path, offset, &scratch)) {
-                .bytes => |raw_count| {
-                    const count: usize = @intCast(raw_count);
-                    if (count == 0 or count > scratch.len) return error.PathFileAccess;
-                    if (count > maximum_sequential_file_bytes -| result.items.len) return error.OutOfMemory;
-                    try result.appendSlice(self.allocator, scratch[0..count]);
-                    offset = std.math.add(u32, offset, raw_count) catch return error.PathFileAccess;
-                },
-                .end => return result.toOwnedSlice(self.allocator),
-                .failure => |failure| return fileHostFault(failure),
-            }
-        }
+        self.discardStackFrom(statement_base);
     }
 
     fn closeFiles(self: *Vm, argument_count: u32) ExecutionError!void {
         if (argument_count == 0) return self.closeAllFiles();
         if (argument_count > self.stack.items.len) return error.StackUnderflow;
-        var remaining = argument_count;
-        while (remaining != 0) : (remaining -= 1) {
-            const file_number = try self.popFileNumber();
-            try self.closeFile(file_number);
+        const count: usize = @intCast(argument_count);
+        const first = self.stack.items.len - count;
+
+        var current = count;
+        while (current != 0) {
+            current -= 1;
+            const file_number = try self.fileNumberAt(first + current);
+            try self.flushFileOutput(try self.fileAt(file_number));
         }
+        current = count;
+        while (current != 0) {
+            current -= 1;
+            try self.removeFile(try self.fileNumberAt(first + current));
+        }
+        self.discardStackFrom(first);
     }
 
     fn closeAllFiles(self: *Vm) ExecutionError!void {
-        while (self.open_files.items.len != 0) {
-            try self.closeFile(self.open_files.items[self.open_files.items.len - 1].number);
+        var current = self.open_files.items.len;
+        while (current != 0) {
+            current -= 1;
+            try self.flushFileOutput(&self.open_files.items[current].file);
+        }
+        while (self.open_files.items.len != 0) try self.removeFile(self.open_files.items[self.open_files.items.len - 1].number);
+    }
+
+    fn flushFileOutput(self: *Vm, file: *SequentialFile) ExecutionError!void {
+        if (file.mode == .input or file.output_head == file.output.items.len) {
+            if (file.output_head != 0) {
+                file.output.clearRetainingCapacity();
+                file.output_head = 0;
+            }
+            return;
+        }
+        const remaining = file.output.items[file.output_head..];
+        switch (self.host.file_write(self.fileHostContext(), file.path, remaining, true)) {
+            .bytes => |raw_count| {
+                const count: usize = @intCast(raw_count);
+                if (count == 0 or count > remaining.len) return error.PathFileAccess;
+                file.output_head += count;
+                self.file_output_flushes +%= 1;
+                if (file.output_head != file.output.items.len) {
+                    self.scheduleFilePoll();
+                    return error.WouldBlock;
+                }
+                file.output.clearRetainingCapacity();
+                file.output_head = 0;
+            },
+            .pending => {
+                self.file_io_waits +%= 1;
+                self.scheduleFilePoll();
+                return error.WouldBlock;
+            },
+            .failure => |failure| return fileHostFault(failure),
         }
     }
 
-    fn closeFile(self: *Vm, file_number: usize) ExecutionError!void {
+    fn removeFile(self: *Vm, file_number: usize) ExecutionError!void {
         const slot_index = self.fileSlotIndex(file_number) orelse return error.BadFileNumber;
-        const file = &self.open_files.items[slot_index].file;
-        if (file.mode != .input) {
-            const result = self.host.file_write(self.fileHostContext(), file.path, file.output.items, file.mode == .append);
-            switch (result) {
-                .ok => {},
-                .failure => |failure| return fileHostFault(failure),
-            }
-        }
         var removed = self.open_files.swapRemove(slot_index);
         removed.file.deinit(self.allocator);
         self.file_slot_indices[file_number] = 0;
@@ -2442,9 +2611,85 @@ pub const Vm = struct {
     }
 
     fn discardFiles(self: *Vm) void {
+        self.discardPendingOpen();
         for (self.open_files.items) |*slot| slot.file.deinit(self.allocator);
         self.open_files.clearRetainingCapacity();
         self.file_slot_indices = .{0} ** (maximum_file_number + 1);
+    }
+
+    fn discardPendingOpen(self: *Vm) void {
+        if (self.pending_open_file) |*file| file.deinit(self.allocator);
+        self.pending_open_file = null;
+        self.pending_open_number = 0;
+    }
+
+    fn refillFileInput(self: *Vm, file: *SequentialFile) ExecutionError!void {
+        if (file.input_eof) return;
+        self.compactFileInput(file);
+        if (file.input_offset > maximum_sequential_file_bytes) return error.OutOfMemory;
+        const remaining_limit = maximum_sequential_file_bytes + 1 - file.input_offset;
+        const requested = @min(sequential_file_transfer_bytes, remaining_limit);
+        try self.ensureFileBufferCapacity(
+            &file.input,
+            file.input.items.len + requested,
+            maximum_sequential_file_bytes + 1,
+        );
+        self.maximum_file_input_buffer_bytes = @max(
+            self.maximum_file_input_buffer_bytes,
+            @as(u64, @intCast(file.input.capacity)),
+        );
+        const available = file.input.items.ptr[file.input.items.len..file.input.capacity];
+        const target = available[0..requested];
+        switch (self.host.file_read(
+            self.fileHostContext(),
+            file.path,
+            @intCast(file.input_offset),
+            target,
+        )) {
+            .bytes => |raw_count| {
+                const count: usize = @intCast(raw_count);
+                if (count == 0 or count > requested) return error.PathFileAccess;
+                file.input.items.len += count;
+                file.input_offset += count;
+                self.file_input_refills +%= 1;
+                if (file.input_offset > maximum_sequential_file_bytes) return error.OutOfMemory;
+            },
+            .end => file.input_eof = true,
+            .pending => {
+                self.file_io_waits +%= 1;
+                self.scheduleFilePoll();
+                return error.WouldBlock;
+            },
+            .failure => |failure| return fileHostFault(failure),
+        }
+    }
+
+    fn compactFileInput(self: *Vm, file: *SequentialFile) void {
+        if (file.input_head == 0) return;
+        const remaining = file.input.items.len - file.input_head;
+        if (remaining != 0) {
+            std.mem.copyForwards(u8, file.input.items[0..remaining], file.input.items[file.input_head..]);
+            self.file_input_compaction_bytes +|= @intCast(remaining);
+        }
+        file.input.items.len = remaining;
+        file.input_head = 0;
+    }
+
+    fn scheduleFilePoll(self: *Vm) void {
+        self.wait_wake_ns = self.guest_now_ns +| file_poll_interval_ns;
+    }
+
+    fn ensureFileBufferCapacity(
+        self: *Vm,
+        buffer: *std.ArrayList(u8),
+        required: usize,
+        limit: usize,
+    ) ExecutionError!void {
+        if (required > limit) return error.OutOfMemory;
+        if (required <= buffer.capacity) return;
+        const geometric = buffer.capacity +| buffer.capacity / 2;
+        const target = @min(limit, @max(required, geometric));
+        try buffer.ensureTotalCapacityPrecise(self.allocator, target);
     }
 
     fn fileAt(self: *Vm, file_number: usize) ExecutionError!*SequentialFile {
@@ -2762,27 +3007,28 @@ pub const Vm = struct {
 
     fn callBuiltin(self: *Vm, builtin: bytecode.Builtin, argument_count: u32) ExecutionError!void {
         if (argument_count > 3 or argument_count > self.stack.items.len) return error.InvalidInstruction;
-        var argument_items: [3]StackItem = undefined;
         var arguments: [3]values.Value = undefined;
-        var first_initialized: usize = argument_count;
-        defer for (argument_items[first_initialized..argument_count]) |*argument| argument.deinit(self.allocator);
-        while (first_initialized != 0) {
-            first_initialized -= 1;
-            const item = self.stack.pop().?;
-            argument_items[first_initialized] = item;
-            arguments[first_initialized] = switch (item) {
+        const count: usize = @intCast(argument_count);
+        const first = self.stack.items.len - count;
+        var owned_arguments: u64 = 0;
+        var borrowed_arguments: u64 = 0;
+        for (self.stack.items[first..], 0..) |item, index| {
+            arguments[index] = switch (item) {
                 .value => |value| blk: {
-                    self.builtin_owned_arguments +%= 1;
+                    owned_arguments += 1;
                     break :blk value;
                 },
                 .reference => |cell| blk: {
-                    self.builtin_borrowed_arguments +%= 1;
+                    borrowed_arguments += 1;
                     break :blk try cell.value();
                 },
             };
         }
 
-        const result = try self.evaluateBuiltin(builtin, arguments[0..argument_count]);
+        const result = try self.evaluateBuiltin(builtin, arguments[0..count]);
+        self.builtin_owned_arguments +%= owned_arguments;
+        self.builtin_borrowed_arguments +%= borrowed_arguments;
+        self.discardStackFrom(first);
         try self.pushValue(result);
     }
 
@@ -2822,7 +3068,9 @@ pub const Vm = struct {
         if (raw_number < 1 or raw_number > maximum_file_number) return error.BadFileNumber;
         const file = try self.fileAt(@intCast(raw_number));
         if (file.mode != .input) return error.BadFileMode;
-        return .{ .integer = if (file.offset >= file.input.len) -1 else 0 };
+        if (file.input_head < file.input.items.len) return .{ .integer = 0 };
+        if (!file.input_eof) try self.refillFileInput(file);
+        return .{ .integer = if (file.input_eof and file.input_head >= file.input.items.len) -1 else 0 };
     }
 
     fn inkeyString(self: *Vm) ExecutionError!values.Value {
@@ -3056,6 +3304,14 @@ pub const Vm = struct {
         };
     }
 
+    fn stackValueAt(self: *Vm, index: usize) ExecutionError!values.Value {
+        if (index >= self.stack.items.len) return error.StackUnderflow;
+        return switch (self.stack.items[index]) {
+            .value => |value| value,
+            .reference => |reference| try reference.value(),
+        };
+    }
+
     fn cloneStackItem(self: *Vm, item: StackItem) ExecutionError!values.Value {
         return switch (item) {
             .value => |value| self.cloneValueTracked(&value),
@@ -3171,41 +3427,50 @@ fn skipInputSeparators(bytes: []const u8, cursor: *usize) void {
     while (cursor.* < bytes.len and (bytes[cursor.*] == ' ' or bytes[cursor.*] == '\t')) cursor.* += 1;
 }
 
-fn nextSequentialField(bytes: []const u8, cursor: *usize) ?InputField {
+const SequentialFieldResult = union(enum) {
+    field: InputField,
+    need_more,
+    end,
+};
+
+fn nextSequentialField(bytes: []const u8, cursor: *usize, eof: bool) SequentialFieldResult {
     while (cursor.* < bytes.len) {
         const byte = bytes[cursor.*];
         if (byte != ' ' and byte != '\t' and byte != ',' and byte != '\r' and byte != '\n') break;
         cursor.* += 1;
     }
-    if (cursor.* >= bytes.len) return null;
+    if (cursor.* >= bytes.len) return if (eof) .end else .need_more;
     if (bytes[cursor.*] == '"') {
         cursor.* += 1;
         const start = cursor.*;
         while (cursor.* < bytes.len and bytes[cursor.*] != '"') cursor.* += 1;
-        if (cursor.* >= bytes.len) return null;
+        if (cursor.* >= bytes.len) return if (eof) .end else .need_more;
         const result = bytes[start..cursor.*];
         cursor.* += 1;
         while (cursor.* < bytes.len and bytes[cursor.*] != ',' and bytes[cursor.*] != '\r' and bytes[cursor.*] != '\n') cursor.* += 1;
         if (cursor.* < bytes.len) {
             if (bytes[cursor.*] == '\r' or bytes[cursor.*] == '\n') {
+                if (!eof and cursor.* + 1 == bytes.len) return .need_more;
                 consumeLineEnding(bytes, cursor);
             } else {
                 cursor.* += 1;
             }
         }
-        return .{ .bytes = result };
+        return .{ .field = .{ .bytes = result } };
     }
     const start = cursor.*;
     while (cursor.* < bytes.len and bytes[cursor.*] != ',' and bytes[cursor.*] != '\r' and bytes[cursor.*] != '\n') cursor.* += 1;
+    if (cursor.* == bytes.len and !eof) return .need_more;
     const result = std.mem.trim(u8, bytes[start..cursor.*], " \t");
     if (cursor.* < bytes.len) {
         if (bytes[cursor.*] == '\r' or bytes[cursor.*] == '\n') {
+            if (!eof and cursor.* + 1 == bytes.len) return .need_more;
             consumeLineEnding(bytes, cursor);
         } else {
             cursor.* += 1;
         }
     }
-    return .{ .bytes = result };
+    return .{ .field = .{ .bytes = result } };
 }
 
 fn consumeLineEnding(bytes: []const u8, cursor: *usize) void {
@@ -3382,6 +3647,8 @@ fn unavailableFileRead(_: ?*anyopaque, _: []const u8, _: u32, _: []u8) FileReadR
 fn unavailableFileWrite(_: ?*anyopaque, _: []const u8, _: []const u8, _: bool) FileWriteResult {
     return .{ .failure = .unavailable };
 }
+
+fn ignoreFileQuiesce(_: ?*anyopaque) void {}
 
 fn allocateGlobals(allocator: std.mem.Allocator, program: *const bytecode.Program) InitError![]Cell {
     const globals = try allocator.alloc(Cell, program.globals.len);

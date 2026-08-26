@@ -28,8 +28,8 @@ The compatibility surface is derived in this order:
 4. Permanent general R4BASIC fixtures make the selected subset executable as a
    permanent test contract.
 
-The local acceptance source is expected at
-`D:\R4OS\Artifacts\Distribution\Injection\Temp\gorilla.bas`, with exactly
+The local acceptance source is expected workspace-relatively at
+`Artifacts/Distribution/Injection/Temp/gorilla.bas`, with exactly
 29,434 bytes and SHA-256
 `9926FC1F50C4B489EC4C1B0DA5BD2C497EBF4282B3259C28A835A743E24699F7`.
 It is read directly from the ignored workspace injection tree and is not
@@ -43,7 +43,7 @@ The Microsoft references are the PCjs transcriptions at revision
 - [QuickBASIC 4.5 Programming in BASIC](https://www.pcjs.org/documents/books/mspl13/basic/qbprog/)
 
 Local reference copies and their hashes are inventoried outside all public
-repositories under `D:\R4OS\ExFiles\Reference\Basic\README.txt`.
+repositories under `ExFiles/Reference/Basic/README.txt`.
 
 ## Source and lexical contract
 
