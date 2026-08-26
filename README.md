@@ -27,7 +27,7 @@ input, or graphics.
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.16`
+- Module version: `1.2.19`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -60,7 +60,7 @@ this repository and is read directly from the ignored workspace injection
 tree. The normal test step uses the permanent general BAS fixtures under
 `Tests/Fixtures`, including the standalone audio contract.
 
-R4BASIC 1.2.16 allocates the exact source size once, fills that buffer with
+R4BASIC 1.2.19 allocates the exact source size once, fills that buffer with
 range reads up to the 256 KiB source limit, and transfers the same allocation
 to the compiler. The launch report records metadata calls, range-read calls,
 and bytes so the productive GORILLA acceptance can require one source load
@@ -77,7 +77,7 @@ bytes. Reset and teardown quiesce a non-cancellable request before releasing
 its VM-owned buffer. The `R4BASIC file-io` report makes submissions, polls,
 path work, transfer maxima, compaction, and buffer peaks measurable.
 
-R4BASIC 1.2.16 uses a shared 262,144-instruction ceiling with adaptive bounded
+R4BASIC 1.2.19 uses a shared 262,144-instruction ceiling with adaptive bounded
 clock blocks and an 8-ms production time boundary. Active work requests a
 scheduler yield at most once per 8-ms interval; input-only waits, pause and
 static status windows block on the Desktop activity sequence. The first guest
@@ -91,12 +91,22 @@ separate QEMU-readable numeric, 4-KB assignment, LEN, UCASE$, call and array
 markers plus an exact summary. The productive artifact remains the canonical
 GUI subsystem host and uses its measured module-local `OPTIMIZE=speed` profile.
 
-The 1.2.16 input profile emits each printable key exactly once as text,
-retains Enter and Backspace as keys, and filters pointer traffic before guest
-coordinate mapping. Stable sequence/tick metadata follows accepted bytes to
-consumption; bounded counters distinguish focus, invalid-code, unsupported,
-full-queue and allocation drops and correlate consumed input with the next
-published frame without per-event logging.
+The 1.2.19 input profile emits each printable key exactly once as text,
+retains Enter and Backspace as keys, maps supported extended keys atomically
+to QuickBASIC null/scancode pairs, and filters pointer traffic before guest
+coordinate mapping. Stable sequence/tick metadata follows every accepted byte
+to consumption; bounded counters distinguish focus, invalid-code,
+unsupported, full-queue and allocation drops and correlate consumed input
+with the next published frame without per-event logging. `INPUT$` consumes an
+exact byte count from console or sequential files without blocking the host.
+
+Variable and fixed strings are independent byte owners up to 32,767 bytes.
+Fixed scalar, array and record values pad or truncate on assignment and never
+share mutable storage. `MID$` assignment and the completed string built-ins
+operate on the same bounded representation. Screen and sequential-file
+output share one QuickBASIC formatter for ordinary `PRINT`, `PRINT USING`,
+`PRINT # USING`, `WRITE`, and `WRITE #`; WRITE output round-trips through the
+same `INPUT #` field decoder.
 
 Text rows, lines, filled regions and flood fill now commit one accumulated
 damage region per operation. Same-size `SCREEN` changes clear and reuse their

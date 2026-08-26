@@ -431,7 +431,11 @@ test "R4BASIC v2 conformance catalog is complete stable and machine readable" {
     try expectTargetImplemented(core.conformance.part1_targets[1]);
     try expectTargetImplemented(core.conformance.part1_targets[5]);
     try expectTargetImplemented(core.conformance.metacommand_targets[0]);
-    for ([_]usize{ 0, 2, 11, 15, 18, 26, 27, 29, 30, 51, 55, 72, 90, 97, 99, 130, 140, 151, 154, 159, 171 }) |index| {
+    for ([_]usize{
+        0,   1,   2,   11,  15,  18,  26,  27,  28,  29,  30,  51,  55,  64,  66,  68,  69,  71,  72,  79,
+        80,  84,  87,  90,  94,  95,  96,  97,  99,  101, 122, 124, 125, 130, 138, 140, 142, 145, 151, 154, 157,
+        158, 159, 163, 166, 170, 171, 179, 182, 186, 188, 191,
+    }) |index| {
         try expectTargetImplemented(core.conformance.part2_targets[index]);
     }
     try std.testing.expectEqual(core.conformance.Status.implemented, core.conformance.part1_targets[3].lexer);
@@ -1545,6 +1549,35 @@ test "text screen PRINT and interactive INPUT preserve editing and redo semantic
     try std.testing.expect(machine.textScreen().cursor_visible);
 }
 
+test "INPUT prompt variants redo multi-target assignments atomically" {
+    const source =
+        \\DEFINT A-Z
+        \\DIM Fixed AS STRING * 4
+        \\INPUT; "Pair"; First, Second$, Fixed
+        \\LINE INPUT "Line", Whole$
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "input-prompts.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runToCompletion(128, 32));
+    try feedInput(&machine, "7\r");
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runToCompletion(128, 32));
+    try expectInteger(&machine, "First", 0);
+    try expectString(&machine, "Second$", "");
+    try expectString(&machine, "Fixed", "    ");
+    try feedInput(&machine, "7,\"ok\",\"xy\"\r");
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runToCompletion(128, 32));
+    try expectInteger(&machine, "First", 7);
+    try expectString(&machine, "Second$", "ok");
+    try expectString(&machine, "Fixed", "xy  ");
+    try feedInput(&machine, "a,b,c\r");
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 32));
+    try expectString(&machine, "Whole$", "a,b,c");
+}
+
 test "INKEY is nonblocking focus-aware and isolated per VM" {
     const source = "First$ = INKEY$\nSecond$ = INKEY$\nEND\n";
     var program = try core.compiler.compile(std.testing.allocator, "inkey.bas", source);
@@ -1573,6 +1606,224 @@ test "INKEY is nonblocking focus-aware and isolated per VM" {
     const dropped = adapter.handleInput(.{ .text = .{ .codepoint = 'Z', .modifiers = 0, .tick = 2, .sequence = 2 } });
     try std.testing.expectEqual(core.runtime_adapter.InputDeliveryStatus.dropped, dropped.status);
     try std.testing.expectEqual(core.vm.InputDropReason.unfocused, dropped.reason);
+}
+
+test "fixed and variable byte strings preserve padding truncation arrays records and aliases" {
+    const source =
+        \\DEFINT A-Z
+        \\TYPE Item
+        \\    Code AS STRING * 4
+        \\END TYPE
+        \\DIM Fixed AS STRING * 5
+        \\DIM Names(1 TO 2) AS STRING * 3
+        \\DIM Items(1 TO 1) AS Item
+        \\Source$ = "ABCDEFG"
+        \\Fixed = Source$
+        \\Source$ = "Z"
+        \\Names(1) = "WXYZ"
+        \\Names(2) = "Q"
+        \\Items(1).Code = CHR$(0) + CHR$(255) + "R"
+        \\Same = (Fixed = "ABCDE")
+        \\Joined$ = Fixed + Names(2)
+        \\MID$(Fixed, 2, 2) = "xyzz"
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "fixed-strings.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(256, 32));
+    try expectString(&machine, "Fixed", "AxyDE");
+    try expectString(&machine, "Source$", "Z");
+    try expectInteger(&machine, "Same", -1);
+    try expectString(&machine, "Joined$", "ABCDEQ  ");
+    const first = machine.globalArrayElement("Names", &.{1}) orelse return error.MissingGlobal;
+    try std.testing.expectEqualStrings("WXY", first.string);
+    const second = machine.globalArrayElement("Names", &.{2}) orelse return error.MissingGlobal;
+    try std.testing.expectEqualStrings("Q  ", second.string);
+    const record = machine.globalArrayRecordField("Items", &.{1}, "Code") orelse return error.MissingGlobal;
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 'R', ' ' }, record.string);
+}
+
+test "string functions cover byte edges based numbers and MID assignment errors atomically" {
+    const source =
+        \\DEFINT A-Z
+        \\Ascii = ASC(CHR$(255))
+        \\Lower$ = LCASE$("A" + CHR$(196) + "Z")
+        \\FromRight$ = RIGHT$("ABCDE", 3)
+        \\Trimmed$ = RTRIM$("A  ")
+        \\Repeated$ = STRING$(3, 0)
+        \\RepeatedText$ = STRING$(4, "xy")
+        \\HexValue$ = HEX$(-1)
+        \\OctValue$ = OCT$(-1)
+        \\HexParsed# = VAL("&HFFFF trailing")
+        \\OctParsed# = VAL("&O177777")
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "string-functions.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(256, 32));
+    try expectInteger(&machine, "Ascii", 255);
+    try std.testing.expectEqualSlices(u8, &.{ 'a', 196, 'z' }, machine.global("Lower$").?.string);
+    try expectString(&machine, "FromRight$", "CDE");
+    try expectString(&machine, "Trimmed$", "A");
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, machine.global("Repeated$").?.string);
+    try expectString(&machine, "RepeatedText$", "xxxx");
+    try expectString(&machine, "HexValue$", "FFFF");
+    try expectString(&machine, "OctValue$", "177777");
+    try expectDouble(&machine, "HexParsed#", -1);
+    try expectDouble(&machine, "OctParsed#", -1);
+
+    var invalid_program = try core.compiler.compile(
+        std.testing.allocator,
+        "mid-error.bas",
+        "DIM Fixed AS STRING * 4\nFixed = \"KEEP\"\nMID$(Fixed, 0) = \"X\"\nEND\n",
+    );
+    defer invalid_program.deinit();
+    try expectProgramOk(&invalid_program);
+    var invalid = try core.vm.Vm.init(std.testing.allocator, &invalid_program, .{});
+    defer invalid.deinit();
+    try std.testing.expectEqual(core.vm.Status.runtime_error, invalid.runToCompletion(64, 16));
+    try expectString(&invalid, "Fixed", "KEEP");
+    try std.testing.expectEqual(@as(i32, 5), invalid.exit_code);
+}
+
+test "cursor queries screen reads and extended INPUT dollar preserve exact bytes and sequence" {
+    const source =
+        \\DEFINT A-Z
+        \\CLS
+        \\COLOR 14, 1
+        \\LOCATE 2, 3, 0
+        \\PRINT "A";
+        \\CursorRow = CSRLIN
+        \\CursorColumn = POS(0)
+        \\ScreenByte = SCREEN(2, 3)
+        \\ScreenColor = SCREEN(2, 3, 1)
+        \\Raw$ = INPUT$(3)
+        \\Next$ = INKEY$
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "text-query-input.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runToCompletion(128, 16));
+    const extended = machine.acceptKeyCode(0x88, .{ .sequence = 10, .tick = 20 });
+    try std.testing.expect(extended.accepted);
+    try std.testing.expectEqual(@as(u8, 2), extended.accepted_bytes);
+    try std.testing.expect(machine.acceptTextCodepoint('X', .{ .sequence = 11, .tick = 21 }).accepted);
+    try std.testing.expect(machine.acceptTextCodepoint('Y', .{ .sequence = 12, .tick = 22 }).accepted);
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 16));
+    try expectInteger(&machine, "CursorRow", 2);
+    try expectInteger(&machine, "CursorColumn", 4);
+    try expectInteger(&machine, "ScreenByte", 'A');
+    try expectInteger(&machine, "ScreenColor", 30);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 75, 'X' }, machine.global("Raw$").?.string);
+    try expectString(&machine, "Next$", "Y");
+    const stats = machine.inputStats();
+    try std.testing.expectEqual(@as(u64, 4), stats.accepted_bytes);
+    try std.testing.expectEqual(@as(u64, 4), stats.consumed_bytes);
+    try std.testing.expectEqual(@as(u64, 12), stats.last_consumed_sequence);
+    try std.testing.expectEqual(@as(u64, 22), stats.last_consumed_tick);
+}
+
+test "PRINT USING and WRITE share reference formatting on the text screen" {
+    const source =
+        \\CLS
+        \\PRINT USING "!"; "LOOK"; "OUT"
+        \\PRINT USING "\  \"; "LOOK"; "OUT"
+        \\PRINT USING "##.##"; .78
+        \\PRINT USING "###.##"; 987.654
+        \\PRINT USING "**$##.##"; 2.34
+        \\PRINT USING "####,.##"; 1234.5
+        \\PRINT USING "+.##^^^^"; 123
+        \\PRINT USING "##.##"; 111.22
+        \\WRITE 80, 90, "That's all.", -1E-13
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "formatted-output.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(512, 32));
+    try expectScreenRow(&machine, 0, "LO");
+    try expectScreenRow(&machine, 1, "LOOKOUT");
+    try expectScreenRow(&machine, 2, " 0.78");
+    try expectScreenRow(&machine, 3, "987.65");
+    try expectScreenRow(&machine, 4, "***$2.34");
+    try expectScreenRow(&machine, 5, "1,234.50");
+    try expectScreenRow(&machine, 6, "+.12E+03");
+    try expectScreenRow(&machine, 7, "%111.22");
+    try expectScreenRow(&machine, 8, "80,90,\"That's all.\",-1E-13");
+}
+
+test "PRINT STR and WRITE round SINGLE and DOUBLE to QuickBASIC significant digits" {
+    const source =
+        \\CLS
+        \\PRINT 1.2345678!
+        \\PRINT 1.2345678901234567#
+        \\PRINT 1.1E-7
+        \\PRINT 1.1D-16
+        \\WRITE 1.2345678!, 1.2345678901234567#, 1.1E-7, 1.1D-16
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "quickbasic-number-format.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(256, 32));
+    try expectScreenRow(&machine, 0, " 1.234568");
+    try expectScreenRow(&machine, 1, " 1.234567890123457");
+    try expectScreenRow(&machine, 2, " 1.1E-7");
+    try expectScreenRow(&machine, 3, " 1.1D-16");
+    try expectScreenRow(&machine, 4, "1.234568,1.234567890123457,1.1E-7,1.1D-16");
+}
+
+test "PRINT USING requires at least one formatted value" {
+    var program = try core.compiler.compile(std.testing.allocator, "empty-using.bas", "PRINT USING \"##\";\nEND\n");
+    defer program.deinit();
+    try std.testing.expect(!program.ok());
+    try std.testing.expect(containsCompileDiagnostic(program.diagnostics, .wrong_argument_count));
+}
+
+test "PRINT USING implements every QuickBASIC numeric mask family" {
+    const source =
+        \\CLS
+        \\PRINT USING "+##.##"; -68.95
+        \\PRINT USING "##.##-"; -68.95
+        \\PRINT USING "**#.#"; 12.39
+        \\PRINT USING "$$###.##"; 456.78
+        \\PRINT USING "**$##.##"; 2.34
+        \\PRINT USING "##.##^^^^"; 234.56
+        \\PRINT USING ".####^^^^-"; -888888
+        \\PRINT USING "+.##^^^^^"; 123
+        \\PRINT USING "_!##.##_!"; 12.34
+        \\PRINT USING ".##"; .999
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "using-masks.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(512, 32));
+    try expectScreenRow(&machine, 0, "-68.95");
+    try expectScreenRow(&machine, 1, "68.95-");
+    try expectScreenRow(&machine, 2, "*12.4");
+    try expectScreenRow(&machine, 3, " $456.78");
+    try expectScreenRow(&machine, 4, "***$2.34");
+    try expectScreenRow(&machine, 5, " 2.35E+02");
+    try expectScreenRow(&machine, 6, ".8889E+06-");
+    try expectScreenRow(&machine, 7, "+.12E+003");
+    try expectScreenRow(&machine, 8, "!12.34!");
+    try expectScreenRow(&machine, 9, "%1.00");
 }
 
 test "R4BASIC input policy emits one guest byte and filters pointer mapping" {
@@ -1681,7 +1932,7 @@ test "input adapter preserves every VM drop category without hot logging" {
     );
     try std.testing.expectEqual(
         core.vm.InputDropReason.unsupported_key,
-        adapter.handleInput(.{ .key_down = .{ .code = 27, .modifiers = 0, .tick = 5, .sequence = 5 } }).reason,
+        adapter.handleInput(.{ .key_down = .{ .code = 0x91, .modifiers = 0, .tick = 5, .sequence = 5 } }).reason,
     );
     try std.testing.expectEqual(
         core.vm.InputDropReason.unsupported_event,
@@ -2339,6 +2590,75 @@ test "sequential files resolve guest paths and preserve INPUT PRINT and EOF" {
     try std.testing.expect(counters.maximum_open_files != 0);
 }
 
+test "PRINT USING WRITE and INPUT dollar use one file format and round-trip through INPUT number" {
+    const writer_source =
+        \\OPEN "output.txt" FOR OUTPUT AS #1
+        \\PRINT #1, USING "##.##"; .78
+        \\WRITE #1, "A," + CHR$(34) + "B", -1E-13, 42
+        \\CLOSE #1
+        \\END
+    ;
+    var writer_program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\WRITER.BAS", writer_source);
+    defer writer_program.deinit();
+    try expectProgramOk(&writer_program);
+    var files = MemoryFiles{};
+    defer files.deinit();
+    var writer = try core.vm.Vm.init(std.testing.allocator, &writer_program, .{
+        .file_context = &files,
+        .file_read = MemoryFiles.read,
+        .file_write = MemoryFiles.write,
+    });
+    defer writer.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, writer.runToCompletion(256, 32));
+    try std.testing.expectEqualStrings(" 0.78\r\n\"A,\"\"B\",-1E-13,42\r\n", files.output.items);
+
+    const reader_source =
+        \\DEFINT A-Z
+        \\OPEN "input.txt" FOR INPUT AS #1
+        \\LINE INPUT #1, Formatted$
+        \\INPUT #1, Text$, Tiny!, Whole
+        \\CLOSE #1
+        \\END
+    ;
+    var reader_program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\READER.BAS", reader_source);
+    defer reader_program.deinit();
+    try expectProgramOk(&reader_program);
+    files.input = files.output.items;
+    var reader = try core.vm.Vm.init(std.testing.allocator, &reader_program, .{
+        .file_context = &files,
+        .file_read = MemoryFiles.read,
+        .file_write = MemoryFiles.write,
+    });
+    defer reader.deinit();
+    _ = try runFileIoCooperatively(&reader, 64);
+    try expectString(&reader, "Formatted$", " 0.78");
+    try expectString(&reader, "Text$", "A,\"B");
+    try expectSingle(&reader, "Tiny!", -1.0e-13);
+    try expectInteger(&reader, "Whole", 42);
+
+    var raw_files = MemoryFiles{ .input = "ABCDE" };
+    defer raw_files.deinit();
+    const raw_source =
+        \\OPEN "input.txt" FOR INPUT AS #1
+        \\First$ = INPUT$(3, #1)
+        \\Second$ = INPUT$(2, 1)
+        \\CLOSE #1
+        \\END
+    ;
+    var raw_program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\RAW.BAS", raw_source);
+    defer raw_program.deinit();
+    try expectProgramOk(&raw_program);
+    var raw = try core.vm.Vm.init(std.testing.allocator, &raw_program, .{
+        .file_context = &raw_files,
+        .file_read = MemoryFiles.read,
+        .file_write = MemoryFiles.write,
+    });
+    defer raw.deinit();
+    _ = try runFileIoCooperatively(&raw, 64);
+    try expectString(&raw, "First$", "ABC");
+    try expectString(&raw, "Second$", "DE");
+}
+
 test "sequential files stream one byte through four MiB with bounded asynchronous batches" {
     const one_byte_source =
         \\DEFINT A-Z
@@ -2636,6 +2956,12 @@ fn expectString(machine: *const core.vm.Vm, name: []const u8, expected: []const 
     const actual = machine.global(name) orelse return error.MissingGlobal;
     try std.testing.expectEqual(core.bytecode.ValueType.string, actual.valueType());
     try std.testing.expectEqualStrings(expected, actual.string);
+}
+
+fn expectScreenRow(machine: *const core.vm.Vm, row: usize, expected: []const u8) !void {
+    var bytes: [core.text_screen.columns]u8 = undefined;
+    try std.testing.expect(machine.textScreen().copyRow(row, &bytes));
+    try std.testing.expectEqualStrings(expected, std.mem.trimEnd(u8, &bytes, " "));
 }
 
 fn expectArrayLong(machine: *const core.vm.Vm, name: []const u8, indices: []const i32, expected: i32) !void {

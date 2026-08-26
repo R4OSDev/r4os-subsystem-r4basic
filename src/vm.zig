@@ -173,6 +173,7 @@ pub const InputDropReason = enum {
 
 pub const InputResult = struct {
     accepted: bool,
+    accepted_bytes: u8 = 0,
     reason: InputDropReason = .none,
 };
 
@@ -304,6 +305,7 @@ pub const Dimension = struct {
 const ArrayValue = struct {
     value_type: bytecode.ValueType,
     record_type: u32,
+    fixed_string_length: u16,
     expected_dimensions: u8,
     is_dynamic: bool,
     dimensions: []Dimension,
@@ -365,14 +367,26 @@ const RecordValue = struct {
     }
 };
 
+const FixedString = struct {
+    value: values.Value,
+    length: u16,
+
+    fn deinit(self: *FixedString, allocator: std.mem.Allocator) void {
+        self.value.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 const OwnedValue = union(enum) {
     scalar: values.Value,
+    fixed_string: FixedString,
     array: ArrayValue,
     record: RecordValue,
 
     fn deinit(self: *OwnedValue, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .scalar => |*scalar| scalar.deinit(allocator),
+            .fixed_string => |*string| string.deinit(allocator),
             .array => |*array| array.deinit(allocator),
             .record => |*record| record.deinit(allocator),
         }
@@ -405,6 +419,7 @@ const Reference = union(enum) {
             .cell => |cell| switch (cell.*) {
                 .owned => |*owned| switch (owned.*) {
                     .scalar => |scalar_value| scalar_value,
+                    .fixed_string => |string| string.value,
                     else => error.TypeMismatch,
                 },
                 .alias => error.InvalidInstruction,
@@ -418,6 +433,20 @@ const Reference = union(enum) {
 
     fn valueType(self: Reference) ExecutionError!bytecode.ValueType {
         return (try self.value()).valueType();
+    }
+
+    fn fixedStringLength(self: Reference) ExecutionError!?u16 {
+        return switch (self) {
+            .cell => |cell| switch (cell.*) {
+                .owned => |*owned| switch (owned.*) {
+                    .fixed_string => |string| string.length,
+                    .scalar => null,
+                    else => error.TypeMismatch,
+                },
+                .alias => error.InvalidInstruction,
+            },
+            else => null,
+        };
     }
 
     fn aggregateCell(self: Reference) ExecutionError!*Cell {
@@ -437,6 +466,24 @@ const Reference = union(enum) {
                     .scalar => |*destination| {
                         destination.deinit(allocator);
                         destination.* = incoming;
+                    },
+                    .fixed_string => |*destination| {
+                        const source = switch (incoming) {
+                            .string => |bytes| bytes,
+                            else => return error.TypeMismatch,
+                        };
+                        if (source.len == destination.length) {
+                            destination.value.deinit(allocator);
+                            destination.value = incoming;
+                            return;
+                        }
+                        const replacement = try allocator.alloc(u8, destination.length);
+                        @memset(replacement, ' ');
+                        @memcpy(replacement[0..@min(replacement.len, source.len)], source[0..@min(replacement.len, source.len)]);
+                        destination.value.deinit(allocator);
+                        destination.value = .{ .string = replacement };
+                        var consumed = incoming;
+                        consumed.deinit(allocator);
                     },
                     else => return error.TypeMismatch,
                 },
@@ -663,6 +710,7 @@ pub const Vm = struct {
     input_stats: InputStats = .{},
     input_line: std.ArrayList(u8) = .empty,
     numeric_scratch: std.ArrayList(u8) = .empty,
+    format_scratch: std.ArrayList(u8) = .empty,
     pending_input_instruction: u32 = bytecode.invalid_index,
     guest_now_ns: u64 = 0,
     wait_wake_ns: u64 = 0,
@@ -681,6 +729,8 @@ pub const Vm = struct {
     pending_open_file: ?SequentialFile = null,
     pending_open_number: u8 = 0,
     active_print_file: ?u8 = null,
+    print_using_cursor: usize = 0,
+    write_item_count: usize = 0,
     statement_stack_base: usize = 0,
     current_statement_start: u32 = bytecode.invalid_index,
     current_statement_next: u32 = bytecode.invalid_index,
@@ -721,6 +771,7 @@ pub const Vm = struct {
         self.keyboard.deinit(self.allocator);
         self.input_line.deinit(self.allocator);
         self.numeric_scratch.deinit(self.allocator);
+        self.format_scratch.deinit(self.allocator);
         self.audio_engine.deinit();
         self.discardFiles();
         self.open_files.deinit(self.allocator);
@@ -802,12 +853,28 @@ pub const Vm = struct {
     pub fn acceptKeyCode(self: *Vm, code: u32, stamp: InputStamp) InputResult {
         self.recordInputAttempt(stamp);
         if (!self.input_focused) return self.recordInputDrop(stamp, .unfocused);
-        const byte: u8 = switch (code) {
-            8 => 8,
+        const byte: ?u8 = switch (code) {
+            1, 3, 8, 9, 22, 24, 27 => @intCast(code),
             10, 13 => 13,
+            else => null,
+        };
+        if (byte) |value| return self.appendInput(value, stamp);
+        const scan: u8 = switch (code) {
+            0x7F => 83,
+            0x80 => 72,
+            0x81 => 80,
+            0x82 => 61,
+            0x84 => 15,
+            0x88 => 75,
+            0x89 => 77,
+            0x8A => 71,
+            0x8B => 79,
+            0x8D => 73,
+            0x8E => 81,
+            0x90 => 68,
             else => return self.recordInputDrop(stamp, .unsupported_key),
         };
-        return self.appendInput(byte, stamp);
+        return self.appendExtendedInput(scan, stamp);
     }
 
     pub fn enqueueTextCodepoint(self: *Vm, codepoint: u32) std.mem.Allocator.Error!bool {
@@ -843,7 +910,25 @@ pub const Vm = struct {
             self.input_stats.maximum_queue_depth,
             @as(u64, @intCast(self.keyboard.items.len - self.keyboard_head)),
         );
-        return .{ .accepted = true };
+        return .{ .accepted = true, .accepted_bytes = 1 };
+    }
+
+    fn appendExtendedInput(self: *Vm, scan: u8, stamp: InputStamp) InputResult {
+        if (self.keyboard.items.len - self.keyboard_head > maximum_keyboard_bytes - 2) {
+            return self.recordInputDrop(stamp, .queue_full);
+        }
+        self.keyboard.ensureUnusedCapacity(self.allocator, 2) catch return self.recordInputDrop(stamp, .out_of_memory);
+        self.keyboard.appendAssumeCapacity(.{ .value = 0, .sequence = stamp.sequence, .tick = stamp.tick });
+        self.keyboard.appendAssumeCapacity(.{ .value = scan, .sequence = stamp.sequence, .tick = stamp.tick });
+        self.keyboard_generation +%= 1;
+        self.input_stats.accepted_bytes +%= 2;
+        self.input_stats.last_accepted_sequence = stamp.sequence;
+        self.input_stats.last_accepted_tick = stamp.tick;
+        self.input_stats.maximum_queue_depth = @max(
+            self.input_stats.maximum_queue_depth,
+            @as(u64, @intCast(self.keyboard.items.len - self.keyboard_head)),
+        );
+        return .{ .accepted = true, .accepted_bytes = 2 };
     }
 
     fn recordInputAttempt(self: *Vm, stamp: InputStamp) void {
@@ -997,6 +1082,7 @@ pub const Vm = struct {
         self.input_stats = .{};
         self.input_line.clearRetainingCapacity();
         self.numeric_scratch.clearRetainingCapacity();
+        self.format_scratch.clearRetainingCapacity();
         self.pending_input_instruction = bytecode.invalid_index;
         self.guest_now_ns = 0;
         self.wait_wake_ns = 0;
@@ -1011,6 +1097,8 @@ pub const Vm = struct {
         self.random_last = randomValue(self.random_state);
         self.discardFiles();
         self.active_print_file = null;
+        self.print_using_cursor = 0;
+        self.write_item_count = 0;
         self.statement_stack_base = 0;
         self.current_statement_start = bytecode.invalid_index;
         self.current_statement_next = bytecode.invalid_index;
@@ -1170,6 +1258,7 @@ pub const Vm = struct {
                 const cell = resolveCellConst(&self.globals[index]) orelse return null;
                 return switch (cell.owned) {
                     .scalar => |*scalar| scalar,
+                    .fixed_string => |*string| &string.value,
                     else => null,
                 };
             }
@@ -1229,6 +1318,7 @@ pub const Vm = struct {
                 const field_cell = resolveCellConst(&record.fields[field_index]) orelse return null;
                 return switch (field_cell.owned) {
                     .scalar => |*scalar| scalar,
+                    .fixed_string => |*string| &string.value,
                     else => null,
                 };
             }
@@ -1292,6 +1382,8 @@ pub const Vm = struct {
             metadata.statement_next;
         self.statement_stack_base = self.stack.items.len;
         self.active_print_file = null;
+        self.print_using_cursor = 0;
+        self.write_item_count = 0;
     }
 
     fn readInstructionMetadata(self: *Vm, instruction_index: u32) bytecode.InstructionMetadata {
@@ -1319,6 +1411,7 @@ pub const Vm = struct {
             .redimension,
             .read_data,
             .restore_data,
+            .mid_string_assign,
             .convert,
             .pop,
             => .value,
@@ -1372,10 +1465,16 @@ pub const Vm = struct {
             .text_view_print,
             .print_begin_screen,
             .print_value,
+            .print_using_begin,
+            .print_using_value,
+            .print_using_end,
+            .print_spc,
             .print_tab,
             .print_comma,
             .print_question,
             .print_newline,
+            .write_begin,
+            .write_value,
             .print_end,
             .input_console,
             => .text,
@@ -1385,6 +1484,7 @@ pub const Vm = struct {
             .poke,
             .print_begin_file,
             .input_file,
+            .input_string,
             .randomize,
             .sleep,
             .file_open,
@@ -1439,16 +1539,24 @@ pub const Vm = struct {
             .text_cls => try self.textCls(instruction.a),
             .text_locate => try self.textLocate(instruction.a, instruction.b),
             .text_view_print => try self.textViewPrint(instruction.a),
+            .mid_string_assign => try self.midStringAssign(instruction.a != 0),
             .print_begin_screen => self.active_print_file = null,
             .print_begin_file => try self.printBeginFile(),
             .print_value => try self.printValue(),
+            .print_using_begin => try self.printUsingBegin(),
+            .print_using_value => try self.printUsingValue(),
+            .print_using_end => try self.printUsingEnd(),
+            .print_spc => try self.printSpc(),
             .print_tab => try self.printTab(),
             .print_comma => try self.printComma(),
             .print_question => try self.printBytes("? "),
             .print_newline => try self.printNewline(),
+            .write_begin => self.write_item_count = 0,
+            .write_value => try self.writeValue(),
             .print_end => self.active_print_file = null,
             .input_console => try self.consoleInput(instruction_index, instruction.a, instruction.b),
             .input_file => try self.fileInput(instruction.a, instruction.b != 0),
+            .input_string => try self.inputString(instruction_index, instruction.a, instruction.b != 0),
             .randomize => try self.randomize(instruction_index, instruction.a),
             .sleep => try self.sleep(instruction_index, instruction.a),
             .file_open => try self.openFile(@enumFromInt(@as(u8, @intCast(instruction.a)))),
@@ -1535,6 +1643,31 @@ pub const Vm = struct {
         defer if (converted_owned) converted.deinit(self.allocator);
         try reference.replace(self.allocator, converted);
         converted_owned = false;
+    }
+
+    fn midStringAssign(self: *Vm, has_length: bool) ExecutionError!void {
+        var replacement = try self.popValue();
+        defer replacement.deinit(self.allocator);
+        const replacement_bytes = switch (replacement) {
+            .string => |bytes| bytes,
+            else => return error.TypeMismatch,
+        };
+        const requested_length = if (has_length) try self.popLong() else @as(i32, @intCast(replacement_bytes.len));
+        const start = try self.popLong();
+        const reference = try self.popReference();
+        const target_value = try reference.value();
+        const target = switch (target_value) {
+            .string => |bytes| bytes,
+            else => return error.TypeMismatch,
+        };
+        if (start < 1 or start > values.maximum_string_bytes or start > target.len or
+            requested_length < 1 or requested_length > values.maximum_string_bytes)
+        {
+            return error.IllegalFunctionCall;
+        }
+        const first: usize = @intCast(start - 1);
+        const amount = @min(@as(usize, @intCast(requested_length)), @min(replacement_bytes.len, target.len - first));
+        std.mem.copyForwards(u8, target[first .. first + amount], replacement_bytes[0..amount]);
     }
 
     fn arrayDefaultLower(self: *Vm) ExecutionError!void {
@@ -1624,8 +1757,20 @@ pub const Vm = struct {
             total *= length;
         }
         if (total > maximum_array_elements) return error.OutOfMemory;
-        const old_payload_bytes = try arrayLogicalPayloadBytes(self.program, array.value_type, array.record_type, array.storage.len());
-        const new_payload_bytes = try arrayLogicalPayloadBytes(self.program, array.value_type, array.record_type, total);
+        const old_payload_bytes = try arrayLogicalPayloadBytes(
+            self.program,
+            array.value_type,
+            array.record_type,
+            array.fixed_string_length,
+            array.storage.len(),
+        );
+        const new_payload_bytes = try arrayLogicalPayloadBytes(
+            self.program,
+            array.value_type,
+            array.record_type,
+            array.fixed_string_length,
+            total,
+        );
         const old_dimension_bytes = std.math.mul(usize, array.dimensions.len, @sizeOf(Dimension)) catch return error.OutOfMemory;
         const new_dimension_bytes = std.math.mul(usize, dimensions.len, @sizeOf(Dimension)) catch return error.OutOfMemory;
         const current_live_bytes = std.math.cast(usize, self.array_live_payload_bytes) orelse return error.OutOfMemory;
@@ -1650,7 +1795,13 @@ pub const Vm = struct {
                 self.allocator.free(elements);
             }
             for (elements) |*element| {
-                element.* = try allocateElement(self.allocator, self.program, array.value_type, array.record_type);
+                element.* = try allocateElement(
+                    self.allocator,
+                    self.program,
+                    array.value_type,
+                    array.record_type,
+                    array.fixed_string_length,
+                );
                 initialized += 1;
             }
             array.storage.deinit(self.allocator);
@@ -2021,6 +2172,65 @@ pub const Vm = struct {
         self.discardStackFrom(self.stack.items.len - 1);
     }
 
+    fn printUsingBegin(self: *Vm) ExecutionError!void {
+        if (self.stack.items.len == 0) return error.StackUnderflow;
+        const format = try self.stackValueAt(self.stack.items.len - 1);
+        if (format.valueType() != .string or format.string.len == 0) return error.IllegalFunctionCall;
+        self.print_using_cursor = 0;
+    }
+
+    fn printUsingValue(self: *Vm) ExecutionError!void {
+        if (self.stack.items.len < 2) return error.StackUnderflow;
+        const format = try self.stackValueAt(self.stack.items.len - 2);
+        const value = try self.stackValueAt(self.stack.items.len - 1);
+        if (format.valueType() != .string) return error.InvalidInstruction;
+        self.format_scratch.clearRetainingCapacity();
+        try self.formatUsingValue(format.string, value);
+        try self.printBytes(self.format_scratch.items);
+        self.discardStackFrom(self.stack.items.len - 1);
+    }
+
+    fn printUsingEnd(self: *Vm) ExecutionError!void {
+        if (self.stack.items.len == 0) return error.StackUnderflow;
+        const format = try self.stackValueAt(self.stack.items.len - 1);
+        if (format.valueType() != .string) return error.InvalidInstruction;
+        self.discardStackFrom(self.stack.items.len - 1);
+        self.print_using_cursor = 0;
+    }
+
+    fn printSpc(self: *Vm) ExecutionError!void {
+        const count = try self.popLong();
+        if (count < 0 or count > values.maximum_string_bytes) return error.IllegalFunctionCall;
+        try self.printSpaces(@intCast(count));
+    }
+
+    fn writeValue(self: *Vm) ExecutionError!void {
+        if (self.stack.items.len == 0) return error.StackUnderflow;
+        const value = try self.stackValueAt(self.stack.items.len - 1);
+        if (self.write_item_count != 0) try self.printBytes(",");
+        switch (value) {
+            .string => |bytes| {
+                try self.printBytes("\"");
+                var start: usize = 0;
+                for (bytes, 0..) |byte, index| {
+                    if (byte != '"') continue;
+                    try self.printBytes(bytes[start .. index + 1]);
+                    try self.printBytes("\"");
+                    start = index + 1;
+                }
+                try self.printBytes(bytes[start..]);
+                try self.printBytes("\"");
+            },
+            inline else => |number| {
+                var storage: [numeric_format_buffer_bytes]u8 = undefined;
+                const body = try self.formatNumber(&storage, number);
+                try self.printBytes(body);
+            },
+        }
+        self.write_item_count += 1;
+        self.discardStackFrom(self.stack.items.len - 1);
+    }
+
     fn printNumber(self: *Vm, number: anytype, positive: bool) ExecutionError!void {
         var number_storage: [numeric_format_buffer_bytes]u8 = undefined;
         const formatted = try self.formatNumber(&number_storage, number);
@@ -2039,7 +2249,126 @@ pub const Vm = struct {
 
     fn formatNumber(self: *Vm, storage: *[numeric_format_buffer_bytes]u8, number: anytype) ExecutionError![]const u8 {
         self.numeric_format_stack_uses +%= 1;
-        return std.fmt.bufPrint(storage, "{d}", .{number}) catch return error.Overflow;
+        return switch (@typeInfo(@TypeOf(number))) {
+            .int, .comptime_int => std.fmt.bufPrint(storage, "{d}", .{number}) catch return error.Overflow,
+            .float => |info| switch (info.bits) {
+                32 => formatQuickBasicFloat(storage, @as(f32, number), 7, 'E'),
+                64 => formatQuickBasicFloat(storage, @as(f64, number), 16, 'D'),
+                else => error.InvalidInstruction,
+            },
+            else => error.InvalidInstruction,
+        };
+    }
+
+    fn appendFormatBytes(self: *Vm, bytes: []const u8) ExecutionError!void {
+        if (bytes.len > values.maximum_string_bytes -| self.format_scratch.items.len) return error.IllegalFunctionCall;
+        try self.format_scratch.appendSlice(self.allocator, bytes);
+    }
+
+    fn appendFormatByte(self: *Vm, byte: u8) ExecutionError!void {
+        if (self.format_scratch.items.len >= values.maximum_string_bytes) return error.IllegalFunctionCall;
+        try self.format_scratch.append(self.allocator, byte);
+    }
+
+    fn formatUsingValue(self: *Vm, format: []const u8, value: values.Value) ExecutionError!void {
+        var cursor = if (self.print_using_cursor < format.len) self.print_using_cursor else 0;
+        var wrapped = false;
+        const field = while (true) {
+            if (try self.appendUsingLiteralsUntilField(format, &cursor)) |found| break found;
+            if (wrapped or cursor == 0) return error.IllegalFunctionCall;
+            cursor = 0;
+            wrapped = true;
+        };
+        switch (field.kind) {
+            .first_character => {
+                const bytes = switch (value) {
+                    .string => |string| string,
+                    else => return error.TypeMismatch,
+                };
+                try self.appendFormatByte(if (bytes.len == 0) ' ' else bytes[0]);
+            },
+            .fixed_string => {
+                const bytes = switch (value) {
+                    .string => |string| string,
+                    else => return error.TypeMismatch,
+                };
+                const width = field.end - field.start;
+                const used = @min(width, bytes.len);
+                try self.appendFormatBytes(bytes[0..used]);
+                var remaining = width - used;
+                while (remaining != 0) : (remaining -= 1) try self.appendFormatByte(' ');
+            },
+            .variable_string => {
+                const bytes = switch (value) {
+                    .string => |string| string,
+                    else => return error.TypeMismatch,
+                };
+                try self.appendFormatBytes(bytes);
+            },
+            .number => try self.formatUsingNumber(format[field.start..field.end], value),
+        }
+        cursor = field.end;
+        _ = try self.appendUsingLiteralsUntilField(format, &cursor);
+        self.print_using_cursor = cursor;
+    }
+
+    fn appendUsingLiteralsUntilField(self: *Vm, format: []const u8, cursor: *usize) ExecutionError!?UsingField {
+        while (cursor.* < format.len) {
+            if (format[cursor.*] == '_') {
+                if (cursor.* + 1 >= format.len) return error.IllegalFunctionCall;
+                try self.appendFormatByte(format[cursor.* + 1]);
+                cursor.* += 2;
+                continue;
+            }
+            if (usingFieldAt(format, cursor.*)) |field| return field;
+            try self.appendFormatByte(format[cursor.*]);
+            cursor.* += 1;
+        }
+        return null;
+    }
+
+    fn formatUsingNumber(self: *Vm, spec: []const u8, input: values.Value) ExecutionError!void {
+        if (!input.valueType().isNumeric()) return error.TypeMismatch;
+        const parsed = parseUsingNumberSpec(spec) orelse return error.IllegalFunctionCall;
+        if (parsed.digit_positions > 24) return error.IllegalFunctionCall;
+        const number = try values.asDouble(input);
+        if (!std.math.isFinite(number)) return error.Overflow;
+        var raw_storage: [512]u8 = undefined;
+        const raw = if (parsed.exponent_digits != 0)
+            try formatUsingExponent(&raw_storage, @abs(number), parsed)
+        else
+            try formatUsingFixed(&raw_storage, @abs(number), parsed);
+
+        var decorated_storage: [640]u8 = undefined;
+        var decorated_len: usize = 0;
+        const negative = number < 0;
+        if (parsed.leading_sign) {
+            decorated_storage[decorated_len] = if (negative) '-' else '+';
+            decorated_len += 1;
+        } else if (negative and !parsed.trailing_sign) {
+            decorated_storage[decorated_len] = '-';
+            decorated_len += 1;
+        }
+        if (parsed.currency) {
+            decorated_storage[decorated_len] = '$';
+            decorated_len += 1;
+        }
+        @memcpy(decorated_storage[decorated_len .. decorated_len + raw.len], raw);
+        decorated_len += raw.len;
+        if (parsed.trailing_sign) {
+            decorated_storage[decorated_len] = if (negative) '-' else if (parsed.trailing_plus) '+' else ' ';
+            decorated_len += 1;
+        }
+
+        if (decorated_len > spec.len) {
+            try self.appendFormatByte('%');
+            try self.appendFormatBytes(decorated_storage[0..decorated_len]);
+            return;
+        }
+        const padding = spec.len - decorated_len;
+        var remaining = padding;
+        while (remaining != 0) : (remaining -= 1) try self.appendFormatByte(if (parsed.star_fill) '*' else ' ');
+        try self.appendFormatBytes(decorated_storage[0..decorated_len]);
     }
 
     fn printBytes(self: *Vm, bytes: []const u8) ExecutionError!void {
@@ -2175,11 +2504,60 @@ pub const Vm = struct {
             },
             else => return fault,
         };
-        self.assignInputValues(target_base, parsed);
+        try self.assignInputValues(target_base, parsed);
         self.allocator.free(parsed);
         self.discardStackFrom(target_base);
         self.pending_input_instruction = bytecode.invalid_index;
         self.input_line.clearRetainingCapacity();
+    }
+
+    fn inputString(self: *Vm, instruction_index: u32, argument_count: u32, from_file: bool) ExecutionError!void {
+        const expected: u32 = if (from_file) 2 else 1;
+        if (argument_count != expected or argument_count > self.stack.items.len) return error.InvalidInstruction;
+        const base = self.stack.items.len - argument_count;
+        const requested = try values.asLong(try self.stackValueAt(base));
+        if (requested < 1 or requested > values.maximum_string_bytes) return error.IllegalFunctionCall;
+        const count: usize = @intCast(requested);
+
+        if (from_file) {
+            const raw_file = try values.asLong(try self.stackValueAt(base + 1));
+            if (raw_file < 1 or raw_file > maximum_file_number) return error.BadFileNumber;
+            const file = try self.fileAt(@intCast(raw_file));
+            if (file.mode != .input) return error.BadFileMode;
+            const available = file.input.items.len - file.input_head;
+            if (available < count) {
+                if (file.input_eof) return error.InputPastEnd;
+                try self.refillFileInput(file);
+                self.scheduleFilePoll();
+                return error.WouldBlock;
+            }
+            const result = try self.allocator.dupe(u8, file.input.items[file.input_head .. file.input_head + count]);
+            file.input_head += count;
+            if (file.input_head == file.input.items.len) {
+                file.input.clearRetainingCapacity();
+                file.input_head = 0;
+            }
+            self.discardStackFrom(base);
+            try self.pushValue(.{ .string = result });
+            return;
+        }
+
+        if (self.pending_input_instruction != instruction_index) {
+            self.pending_input_instruction = instruction_index;
+            self.input_line.clearRetainingCapacity();
+        }
+        while (self.input_line.items.len < count) {
+            const byte = self.popKeyboardByte() orelse {
+                self.wait_wake_ns = 0;
+                return error.WouldBlock;
+            };
+            try self.input_line.append(self.allocator, byte);
+        }
+        const result = try self.allocator.dupe(u8, self.input_line.items[0..count]);
+        self.input_line.clearRetainingCapacity();
+        self.pending_input_instruction = bytecode.invalid_index;
+        self.discardStackFrom(base);
+        try self.pushValue(.{ .string = result });
     }
 
     fn acquireInputLine(self: *Vm, instruction_index: u32) ExecutionError!bool {
@@ -2189,6 +2567,7 @@ pub const Vm = struct {
         }
         while (self.popKeyboardByte()) |byte| {
             switch (byte) {
+                0 => _ = self.popKeyboardByte(),
                 13, 10 => return true,
                 8 => {
                     if (self.input_line.items.len != 0) {
@@ -2278,7 +2657,22 @@ pub const Vm = struct {
         return (try self.inputTargetCell(stack_index)).valueType();
     }
 
-    fn assignInputValues(self: *Vm, target_base: usize, parsed: []values.Value) void {
+    fn assignInputValues(self: *Vm, target_base: usize, parsed: []values.Value) ExecutionError!void {
+        for (parsed, 0..) |*value, index| {
+            const reference = try self.inputTargetCell(target_base + index);
+            const fixed_length = try reference.fixedStringLength() orelse continue;
+            const source = switch (value.*) {
+                .string => |bytes| bytes,
+                else => return error.TypeMismatch,
+            };
+            if (source.len == fixed_length) continue;
+            const replacement = try self.allocator.alloc(u8, fixed_length);
+            @memset(replacement, ' ');
+            const used = @min(replacement.len, source.len);
+            @memcpy(replacement[0..used], source[0..used]);
+            value.deinit(self.allocator);
+            value.* = .{ .string = replacement };
+        }
         for (parsed, 0..) |value, index| {
             const reference = self.inputTargetCell(target_base + index) catch unreachable;
             reference.replace(self.allocator, value) catch unreachable;
@@ -2286,7 +2680,27 @@ pub const Vm = struct {
     }
 
     fn decodeInputField(self: *Vm, field: InputField, target: bytecode.ValueType) ExecutionError!values.Value {
-        if (target == .string) return .{ .string = try self.allocator.dupe(u8, field.bytes) };
+        if (target == .string) {
+            if (!field.quoted) return .{ .string = try self.allocator.dupe(u8, field.bytes) };
+            var escaped_quotes: usize = 0;
+            var probe: usize = 0;
+            while (probe + 1 < field.bytes.len) : (probe += 1) {
+                if (field.bytes[probe] == '"' and field.bytes[probe + 1] == '"') {
+                    escaped_quotes += 1;
+                    probe += 1;
+                }
+            }
+            const decoded = try self.allocator.alloc(u8, field.bytes.len - escaped_quotes);
+            var source: usize = 0;
+            var target_index: usize = 0;
+            while (source < field.bytes.len) {
+                decoded[target_index] = field.bytes[source];
+                target_index += 1;
+                if (field.bytes[source] == '"' and source + 1 < field.bytes.len and field.bytes[source + 1] == '"') source += 1;
+                source += 1;
+            }
+            return .{ .string = decoded };
+        }
         const trimmed = std.mem.trim(u8, field.bytes, " \t");
         if (trimmed.len == 0) return error.TypeMismatch;
         const number = std.fmt.parseFloat(f64, trimmed) catch return error.TypeMismatch;
@@ -2347,7 +2761,7 @@ pub const Vm = struct {
                 initialized += 1;
             }
         }
-        self.assignInputValues(statement_base + 1, parsed);
+        try self.assignInputValues(statement_base + 1, parsed);
         self.allocator.free(parsed);
         file.input_head = cursor;
         if (file.input_head == file.input.items.len) {
@@ -2976,7 +3390,13 @@ pub const Vm = struct {
     fn deinitCellTracked(self: *Vm, cell: *Cell) void {
         const payload_bytes = switch (cell.*) {
             .owned => |*owned| switch (owned.*) {
-                .array => |*array| arrayLogicalPayloadBytes(self.program, array.value_type, array.record_type, array.storage.len()) catch 0,
+                .array => |*array| arrayLogicalPayloadBytes(
+                    self.program,
+                    array.value_type,
+                    array.record_type,
+                    array.fixed_string_length,
+                    array.storage.len(),
+                ) catch 0,
                 else => 0,
             },
             .alias => 0,
@@ -3031,9 +3451,11 @@ pub const Vm = struct {
     fn evaluateBuiltin(self: *Vm, builtin: bytecode.Builtin, arguments: []const values.Value) ExecutionError!values.Value {
         return switch (builtin) {
             .abs => absolute(arguments[0]),
+            .asc => asciiValue(arguments[0]),
             .atn => self.hostMath(.atn, arguments[0], .{ .single = 0 }),
             .cdbl => values.convert(self.allocator, arguments[0], .double),
             .cos => self.hostMath(.cos, arguments[0], .{ .single = 0 }),
+            .csrlin => .{ .integer = self.text.cursorRow() },
             .clng => values.convert(self.allocator, arguments[0], .long),
             .csng => values.convert(self.allocator, arguments[0], .single),
             .cvd => decodeIeeeString(arguments[0], .double),
@@ -3044,6 +3466,7 @@ pub const Vm = struct {
             .cvsmbf => decodeMbfString(arguments[0], .single),
             .exp => self.hostMath(.exp, arguments[0], .{ .single = 0 }),
             .fix => truncate(arguments[0]),
+            .hex_string => self.basedString(arguments[0], 16),
             .log => self.hostMath(.log, arguments[0], .{ .single = 0 }),
             .sin => self.hostMath(.sin, arguments[0], .{ .single = 0 }),
             .sqr => self.hostMath(.sqr, arguments[0], .{ .single = 0 }),
@@ -3053,6 +3476,7 @@ pub const Vm = struct {
             .instr => self.instr(arguments),
             .int => integerFloor(arguments[0]),
             .left_string => self.leftString(arguments[0], arguments[1]),
+            .lcase_string => self.lowerString(arguments[0]),
             .len => .{ .integer = @intCast(arguments[0].string.len) },
             .ltrim_string => self.leftTrim(arguments[0]),
             .mid_string => self.midString(arguments),
@@ -3062,9 +3486,15 @@ pub const Vm = struct {
             .mkl_string => self.encodeIeeeString(arguments[0], .long),
             .mks_string => self.encodeIeeeString(arguments[0], .single),
             .mksmbf_string => self.encodeMbfString(arguments[0], .single),
+            .oct_string => self.basedString(arguments[0], 8),
             .peek => error.HostFailure,
+            .pos => .{ .integer = self.text.cursorColumn() },
+            .right_string => self.rightString(arguments[0], arguments[1]),
+            .rtrim_string => self.rightTrim(arguments[0]),
+            .screen => self.screenValue(arguments),
             .space_string => self.spaceString(arguments[0]),
             .str_string => self.numberString(arguments[0]),
+            .string_string => self.repeatString(arguments[0], arguments[1]),
             .ucase_string => self.upperString(arguments[0]),
             .val => self.val(arguments[0]),
             .eof => self.endOfFile(arguments[0]),
@@ -3099,8 +3529,10 @@ pub const Vm = struct {
 
     fn inkeyString(self: *Vm) ExecutionError!values.Value {
         const byte = self.popKeyboardByte() orelse return .{ .string = try self.allocator.alloc(u8, 0) };
-        const result = try self.allocator.alloc(u8, 1);
+        const extended = byte == 0 and self.queuedInputBytes() != 0;
+        const result = try self.allocator.alloc(u8, if (extended) 2 else 1);
         result[0] = byte;
+        if (extended) result[1] = self.popKeyboardByte().?;
         return .{ .string = result };
     }
 
@@ -3218,9 +3650,16 @@ pub const Vm = struct {
 
     fn leftString(self: *Vm, string_value: values.Value, count_value: values.Value) ExecutionError!values.Value {
         const count = try values.asLong(count_value);
-        if (count < 0) return error.IllegalFunctionCall;
+        if (count < 0 or count > values.maximum_string_bytes) return error.IllegalFunctionCall;
         const length = @min(string_value.string.len, @as(usize, @intCast(count)));
         return .{ .string = try self.allocator.dupe(u8, string_value.string[0..length]) };
+    }
+
+    fn rightString(self: *Vm, string_value: values.Value, count_value: values.Value) ExecutionError!values.Value {
+        const count = try values.asLong(count_value);
+        if (count < 0 or count > values.maximum_string_bytes) return error.IllegalFunctionCall;
+        const length = @min(string_value.string.len, @as(usize, @intCast(count)));
+        return .{ .string = try self.allocator.dupe(u8, string_value.string[string_value.string.len - length ..]) };
     }
 
     fn leftTrim(self: *Vm, input: values.Value) ExecutionError!values.Value {
@@ -3229,15 +3668,21 @@ pub const Vm = struct {
         return .{ .string = try self.allocator.dupe(u8, input.string[start..]) };
     }
 
+    fn rightTrim(self: *Vm, input: values.Value) ExecutionError!values.Value {
+        var end = input.string.len;
+        while (end != 0 and input.string[end - 1] == ' ') end -= 1;
+        return .{ .string = try self.allocator.dupe(u8, input.string[0..end]) };
+    }
+
     fn midString(self: *Vm, arguments: []const values.Value) ExecutionError!values.Value {
         const start = try values.asLong(arguments[1]);
-        if (start < 1) return error.IllegalFunctionCall;
+        if (start < 1 or start > values.maximum_string_bytes) return error.IllegalFunctionCall;
         const start_index: usize = @intCast(start - 1);
         if (start_index >= arguments[0].string.len) return .{ .string = try self.allocator.dupe(u8, "") };
         var end = arguments[0].string.len;
         if (arguments.len == 3) {
             const count = try values.asLong(arguments[2]);
-            if (count < 0) return error.IllegalFunctionCall;
+            if (count < 1 or count > values.maximum_string_bytes) return error.IllegalFunctionCall;
             end = @min(end, start_index + @as(usize, @intCast(count)));
         }
         return .{ .string = try self.allocator.dupe(u8, arguments[0].string[start_index..end]) };
@@ -3249,6 +3694,46 @@ pub const Vm = struct {
         const result = try self.allocator.alloc(u8, @intCast(count));
         @memset(result, ' ');
         return .{ .string = result };
+    }
+
+    fn repeatString(self: *Vm, count_value: values.Value, character_value: values.Value) ExecutionError!values.Value {
+        const count = try values.asLong(count_value);
+        if (count < 0 or count > values.maximum_string_bytes) return error.IllegalFunctionCall;
+        const repeated_byte: u8 = switch (character_value) {
+            .string => |bytes| if (bytes.len == 0) return error.IllegalFunctionCall else bytes[0],
+            else => blk: {
+                const number = try values.asLong(character_value);
+                if (number < 0 or number > 255) return error.IllegalFunctionCall;
+                break :blk @intCast(number);
+            },
+        };
+        const result = try self.allocator.alloc(u8, @intCast(count));
+        @memset(result, repeated_byte);
+        return .{ .string = result };
+    }
+
+    fn basedString(self: *Vm, input: values.Value, base: u8) ExecutionError!values.Value {
+        const number = try values.asDouble(input);
+        var storage: [32]u8 = undefined;
+        const formatted = integer: {
+            if (values.roundToInteger(number)) |short| {
+                const bits: u16 = @bitCast(short);
+                break :integer if (base == 16)
+                    std.fmt.bufPrint(&storage, "{X}", .{bits}) catch return error.Overflow
+                else
+                    std.fmt.bufPrint(&storage, "{o}", .{bits}) catch return error.Overflow;
+            } else |fault| switch (fault) {
+                error.Overflow => {},
+                else => return fault,
+            }
+            const long = try values.roundToLong(number);
+            const bits: u32 = @bitCast(long);
+            break :integer if (base == 16)
+                std.fmt.bufPrint(&storage, "{X}", .{bits}) catch return error.Overflow
+            else
+                std.fmt.bufPrint(&storage, "{o}", .{bits}) catch return error.Overflow;
+        };
+        return .{ .string = try self.allocator.dupe(u8, formatted) };
     }
 
     fn numberString(self: *Vm, input: values.Value) ExecutionError!values.Value {
@@ -3274,9 +3759,43 @@ pub const Vm = struct {
         return .{ .string = result };
     }
 
+    fn lowerString(self: *Vm, input: values.Value) ExecutionError!values.Value {
+        const result = try self.allocator.dupe(u8, input.string);
+        for (result) |*byte| byte.* = std.ascii.toLower(byte.*);
+        return .{ .string = result };
+    }
+
+    fn screenValue(self: *Vm, arguments: []const values.Value) ExecutionError!values.Value {
+        if (arguments.len < 2 or arguments.len > 3) return error.InvalidInstruction;
+        const row = try values.asLong(arguments[0]);
+        const column = try values.asLong(arguments[1]);
+        const color = arguments.len == 3 and try values.asLong(arguments[2]) != 0;
+        return .{ .integer = self.text.screenValue(row, column, color) catch return error.IllegalFunctionCall };
+    }
+
     fn val(self: *Vm, input: values.Value) ExecutionError!values.Value {
-        const trimmed = std.mem.trimStart(u8, input.string, " \t");
+        const trimmed = std.mem.trimStart(u8, input.string, " \t\r\n");
         if (trimmed.len == 0) return .{ .double = 0 };
+        if (trimmed.len >= 2 and trimmed[0] == '&' and
+            (trimmed[1] == 'H' or trimmed[1] == 'h' or trimmed[1] == 'O' or trimmed[1] == 'o'))
+        {
+            const base: u8 = if (trimmed[1] == 'H' or trimmed[1] == 'h') 16 else 8;
+            var cursor: usize = 2;
+            var raw: u64 = 0;
+            while (cursor < trimmed.len) : (cursor += 1) {
+                const digit = std.fmt.charToDigit(trimmed[cursor], base) catch break;
+                raw = std.math.mul(u64, raw, base) catch return error.Overflow;
+                raw = std.math.add(u64, raw, digit) catch return error.Overflow;
+                if (raw > std.math.maxInt(u32)) return error.Overflow;
+            }
+            if (cursor == 2) return .{ .double = 0 };
+            if (raw <= std.math.maxInt(u16)) {
+                const signed: i16 = @bitCast(@as(u16, @intCast(raw)));
+                return .{ .double = @floatFromInt(signed) };
+            }
+            const signed: i32 = @bitCast(@as(u32, @intCast(raw)));
+            return .{ .double = @floatFromInt(signed) };
+        }
         var length: usize = 0;
         if (trimmed[length] == '+' or trimmed[length] == '-') length += 1;
         var exponent_seen = false;
@@ -3455,8 +3974,245 @@ pub const Vm = struct {
     }
 };
 
+const UsingFieldKind = enum {
+    first_character,
+    fixed_string,
+    variable_string,
+    number,
+};
+
+fn formatQuickBasicFloat(
+    storage: *[numeric_format_buffer_bytes]u8,
+    number: anytype,
+    significant_digits: u8,
+    exponent_marker: u8,
+) ExecutionError![]const u8 {
+    if (!std.math.isFinite(number)) return error.Overflow;
+    if (number == 0) return std.fmt.bufPrint(storage, "0", .{}) catch return error.Overflow;
+
+    var scientific_storage: [numeric_format_buffer_bytes]u8 = undefined;
+    const scientific = std.fmt.bufPrint(
+        &scientific_storage,
+        "{e:.[1]}",
+        .{ number, significant_digits - 1 },
+    ) catch return error.Overflow;
+    const scientific_marker = std.mem.indexOfAny(u8, scientific, "eE") orelse return error.Overflow;
+    const exponent = std.fmt.parseInt(i32, scientific[scientific_marker + 1 ..], 10) catch return error.Overflow;
+
+    const magnitude = @abs(number);
+    const lower: @TypeOf(number) = if (significant_digits == 7) 1.0e-6 else 1.0e-15;
+    const upper: @TypeOf(number) = if (significant_digits == 7) 1.0e7 else 1.0e16;
+    if (magnitude >= lower and magnitude < upper) {
+        const decimal_places: usize = @intCast(@max(0, @as(i32, significant_digits - 1) - exponent));
+        var result = std.fmt.bufPrint(storage, "{d:.[1]}", .{ number, decimal_places }) catch return error.Overflow;
+        if (std.mem.indexOfScalar(u8, result, '.')) |decimal| {
+            var end = result.len;
+            while (end > decimal + 1 and result[end - 1] == '0') end -= 1;
+            if (end == decimal + 1) end = decimal;
+            result = result[0..end];
+        }
+        const zero = if (result.len >= 2 and result[0] == '0' and result[1] == '.')
+            @as(?usize, 0)
+        else if (result.len >= 3 and result[0] == '-' and result[1] == '0' and result[2] == '.')
+            @as(?usize, 1)
+        else
+            null;
+        if (zero) |index| {
+            std.mem.copyForwards(u8, storage[index .. result.len - 1], storage[index + 1 .. result.len]);
+            result = storage[0 .. result.len - 1];
+        }
+        return result;
+    }
+
+    var mantissa_end = scientific_marker;
+    while (mantissa_end != 0 and scientific[mantissa_end - 1] == '0') mantissa_end -= 1;
+    if (mantissa_end != 0 and scientific[mantissa_end - 1] == '.') mantissa_end -= 1;
+    @memcpy(storage[0..mantissa_end], scientific[0..mantissa_end]);
+    var output = mantissa_end;
+    storage[output] = exponent_marker;
+    output += 1;
+    storage[output] = if (exponent < 0) '-' else '+';
+    output += 1;
+    const absolute_exponent: u32 = @intCast(@abs(exponent));
+    const exponent_text = std.fmt.bufPrint(storage[output..], "{d}", .{absolute_exponent}) catch return error.Overflow;
+    output += exponent_text.len;
+    return storage[0..output];
+}
+
+const UsingField = struct {
+    kind: UsingFieldKind,
+    start: usize,
+    end: usize,
+};
+
+const UsingNumberSpec = struct {
+    end: usize,
+    integer_positions: usize = 0,
+    fraction_positions: usize = 0,
+    digit_positions: usize = 0,
+    exponent_digits: usize = 0,
+    leading_sign: bool = false,
+    trailing_sign: bool = false,
+    trailing_plus: bool = false,
+    star_fill: bool = false,
+    currency: bool = false,
+    grouping: bool = false,
+};
+
+fn usingFieldAt(format: []const u8, start: usize) ?UsingField {
+    if (start >= format.len) return null;
+    if (format[start] == '!') return .{ .kind = .first_character, .start = start, .end = start + 1 };
+    if (format[start] == '&') return .{ .kind = .variable_string, .start = start, .end = start + 1 };
+    if (format[start] == '\\') {
+        var end = start + 1;
+        while (end < format.len and format[end] == ' ') end += 1;
+        if (end < format.len and format[end] == '\\') {
+            return .{ .kind = .fixed_string, .start = start, .end = end + 1 };
+        }
+    }
+    const number = parseUsingNumberAt(format, start) orelse return null;
+    return .{ .kind = .number, .start = start, .end = number.end };
+}
+
+fn parseUsingNumberSpec(spec: []const u8) ?UsingNumberSpec {
+    const result = parseUsingNumberAt(spec, 0) orelse return null;
+    return if (result.end == spec.len) result else null;
+}
+
+fn parseUsingNumberAt(format: []const u8, start: usize) ?UsingNumberSpec {
+    if (start >= format.len) return null;
+    var result = UsingNumberSpec{ .end = start };
+    var cursor = start;
+    if (format[cursor] == '+') {
+        result.leading_sign = true;
+        cursor += 1;
+    }
+    if (cursor + 2 < format.len and format[cursor] == '*' and format[cursor + 1] == '*' and format[cursor + 2] == '$') {
+        result.star_fill = true;
+        result.currency = true;
+        result.digit_positions += 3;
+        cursor += 3;
+    } else if (cursor + 1 < format.len and format[cursor] == '*' and format[cursor + 1] == '*') {
+        result.star_fill = true;
+        result.digit_positions += 2;
+        cursor += 2;
+    } else if (cursor + 1 < format.len and format[cursor] == '$' and format[cursor + 1] == '$') {
+        result.currency = true;
+        result.digit_positions += 2;
+        cursor += 2;
+    }
+
+    var decimal_seen = false;
+    var actual_digits: usize = 0;
+    while (cursor < format.len) {
+        switch (format[cursor]) {
+            '#' => {
+                actual_digits += 1;
+                result.digit_positions += 1;
+                if (decimal_seen) result.fraction_positions += 1 else result.integer_positions += 1;
+                cursor += 1;
+            },
+            '.' => {
+                if (decimal_seen) break;
+                decimal_seen = true;
+                cursor += 1;
+            },
+            ',' => {
+                if (decimal_seen or cursor + 1 >= format.len or
+                    (format[cursor + 1] != '#' and format[cursor + 1] != '.')) break;
+                result.grouping = true;
+                result.digit_positions += 1;
+                cursor += 1;
+            },
+            else => break,
+        }
+    }
+    if (actual_digits == 0) return null;
+    if (cursor < format.len and format[cursor] == '^') {
+        const first = cursor;
+        while (cursor < format.len and format[cursor] == '^' and cursor - first < 5) cursor += 1;
+        const count = cursor - first;
+        if (count < 4) cursor = first else result.exponent_digits = if (count == 5) 3 else 2;
+    }
+    if (cursor < format.len and (format[cursor] == '+' or format[cursor] == '-')) {
+        result.trailing_sign = true;
+        result.trailing_plus = format[cursor] == '+';
+        cursor += 1;
+    }
+    result.end = cursor;
+    return result;
+}
+
+fn formatUsingFixed(storage: *[512]u8, magnitude: f64, spec: UsingNumberSpec) ExecutionError![]const u8 {
+    var plain_storage: [512]u8 = undefined;
+    const plain = std.fmt.bufPrint(&plain_storage, "{d:.[1]}", .{ magnitude, spec.fraction_positions }) catch return error.Overflow;
+    const decimal = std.mem.indexOfScalar(u8, plain, '.') orelse plain.len;
+    const skip_zero: usize = @intFromBool(spec.integer_positions == 0 and decimal == 1 and plain[0] == '0');
+    if (!spec.grouping) {
+        const result = plain[skip_zero..];
+        @memcpy(storage[0..result.len], result);
+        return storage[0..result.len];
+    }
+
+    const integer_start = skip_zero;
+    const integer_length = decimal - integer_start;
+    var output: usize = 0;
+    for (plain[integer_start..decimal], 0..) |byte, index| {
+        if (index != 0 and (integer_length - index) % 3 == 0) {
+            storage[output] = ',';
+            output += 1;
+        }
+        storage[output] = byte;
+        output += 1;
+    }
+    if (decimal < plain.len) {
+        @memcpy(storage[output .. output + plain.len - decimal], plain[decimal..]);
+        output += plain.len - decimal;
+    }
+    return storage[0..output];
+}
+
+fn formatUsingExponent(storage: *[512]u8, magnitude: f64, spec: UsingNumberSpec) ExecutionError![]const u8 {
+    var scientific_storage: [512]u8 = undefined;
+    const precision = if (spec.integer_positions == 0 and spec.fraction_positions != 0)
+        spec.fraction_positions - 1
+    else
+        spec.fraction_positions;
+    const scientific = std.fmt.bufPrint(&scientific_storage, "{e:.[1]}", .{ magnitude, precision }) catch return error.Overflow;
+    const marker = std.mem.indexOfAny(u8, scientific, "eE") orelse return error.Overflow;
+    var exponent = std.fmt.parseInt(i32, scientific[marker + 1 ..], 10) catch return error.Overflow;
+    var output: usize = 0;
+    if (spec.integer_positions == 0) {
+        storage[output] = '.';
+        output += 1;
+        exponent += 1;
+        for (scientific[0..marker]) |byte| {
+            if (byte == '.') continue;
+            storage[output] = byte;
+            output += 1;
+        }
+    } else {
+        @memcpy(storage[0..marker], scientific[0..marker]);
+        output = marker;
+    }
+    storage[output] = 'E';
+    output += 1;
+    storage[output] = if (exponent < 0) '-' else '+';
+    output += 1;
+    const absolute_exponent: u32 = @intCast(@abs(exponent));
+    var exponent_storage: [16]u8 = undefined;
+    const exponent_text = std.fmt.bufPrint(&exponent_storage, "{d}", .{absolute_exponent}) catch return error.Overflow;
+    const padding = spec.exponent_digits -| exponent_text.len;
+    @memset(storage[output .. output + padding], '0');
+    output += padding;
+    @memcpy(storage[output .. output + exponent_text.len], exponent_text);
+    output += exponent_text.len;
+    return storage[0..output];
+}
+
 const InputField = struct {
     bytes: []const u8,
+    quoted: bool = false,
 };
 
 fn nextInputField(bytes: []const u8, cursor: *usize) ?InputField {
@@ -3469,7 +4225,17 @@ fn nextInputField(bytes: []const u8, cursor: *usize) ?InputField {
     if (bytes[cursor.*] == '"') {
         cursor.* += 1;
         const start = cursor.*;
-        while (cursor.* < bytes.len and bytes[cursor.*] != '"') cursor.* += 1;
+        while (cursor.* < bytes.len) {
+            if (bytes[cursor.*] != '"') {
+                cursor.* += 1;
+                continue;
+            }
+            if (cursor.* + 1 < bytes.len and bytes[cursor.* + 1] == '"') {
+                cursor.* += 2;
+                continue;
+            }
+            break;
+        }
         if (cursor.* >= bytes.len) return null;
         const result = bytes[start..cursor.*];
         cursor.* += 1;
@@ -3478,7 +4244,7 @@ fn nextInputField(bytes: []const u8, cursor: *usize) ?InputField {
             if (bytes[cursor.*] != ',') return null;
             cursor.* += 1;
         }
-        return .{ .bytes = result };
+        return .{ .bytes = result, .quoted = true };
     }
     const start = cursor.*;
     while (cursor.* < bytes.len and bytes[cursor.*] != ',') cursor.* += 1;
@@ -3507,7 +4273,17 @@ fn nextSequentialField(bytes: []const u8, cursor: *usize, eof: bool) SequentialF
     if (bytes[cursor.*] == '"') {
         cursor.* += 1;
         const start = cursor.*;
-        while (cursor.* < bytes.len and bytes[cursor.*] != '"') cursor.* += 1;
+        while (cursor.* < bytes.len) {
+            if (bytes[cursor.*] != '"') {
+                cursor.* += 1;
+                continue;
+            }
+            if (cursor.* + 1 < bytes.len and bytes[cursor.* + 1] == '"') {
+                cursor.* += 2;
+                continue;
+            }
+            break;
+        }
         if (cursor.* >= bytes.len) return if (eof) .end else .need_more;
         const result = bytes[start..cursor.*];
         cursor.* += 1;
@@ -3520,7 +4296,7 @@ fn nextSequentialField(bytes: []const u8, cursor: *usize, eof: bool) SequentialF
                 cursor.* += 1;
             }
         }
-        return .{ .field = .{ .bytes = result } };
+        return .{ .field = .{ .bytes = result, .quoted = true } };
     }
     const start = cursor.*;
     while (cursor.* < bytes.len and bytes[cursor.*] != ',' and bytes[cursor.*] != '\r' and bytes[cursor.*] != '\n') cursor.* += 1;
@@ -3770,6 +4546,15 @@ fn absolute(input: values.Value) ExecutionError!values.Value {
     };
 }
 
+fn asciiValue(input: values.Value) ExecutionError!values.Value {
+    const bytes = switch (input) {
+        .string => |value| value,
+        else => return error.TypeMismatch,
+    };
+    if (bytes.len == 0) return error.IllegalFunctionCall;
+    return .{ .integer = bytes[0] };
+}
+
 fn integerFloor(input: values.Value) ExecutionError!values.Value {
     return switch (input) {
         .integer => |number| .{ .integer = number },
@@ -3922,13 +4707,20 @@ fn allocateVariable(
         return .{ .owned = .{ .array = .{
             .value_type = variable.value_type,
             .record_type = variable.record_type,
+            .fixed_string_length = variable.fixed_string_length,
             .expected_dimensions = variable.dimensions,
             .is_dynamic = variable.is_dynamic,
             .dimensions = dimensions,
             .storage = storage,
         } } };
     }
-    return allocateElement(allocator, program, variable.value_type, variable.record_type);
+    return allocateElement(
+        allocator,
+        program,
+        variable.value_type,
+        variable.record_type,
+        variable.fixed_string_length,
+    );
 }
 
 fn allocateEmptyArrayStorage(
@@ -3950,6 +4742,7 @@ fn arrayLogicalPayloadBytes(
     program: *const bytecode.Program,
     value_type: bytecode.ValueType,
     record_type: u32,
+    fixed_string_length: u16,
     element_count: usize,
 ) ExecutionError!usize {
     const bytes_per_element: usize = if (record_type == bytecode.invalid_index)
@@ -3958,11 +4751,15 @@ fn arrayLogicalPayloadBytes(
             .long => @sizeOf(i32),
             .single => @sizeOf(f32),
             .double => @sizeOf(f64),
-            .string => @sizeOf(Cell),
+            .string => std.math.add(usize, @sizeOf(Cell), fixed_string_length) catch return error.OutOfMemory,
         }
     else record: {
         if (record_type >= program.record_types.len) return error.InvalidInstruction;
-        const field_bytes = std.math.mul(usize, program.record_types[record_type].fields.len, @sizeOf(Cell)) catch return error.OutOfMemory;
+        var field_bytes: usize = 0;
+        for (program.record_types[record_type].fields) |field| {
+            field_bytes = std.math.add(usize, field_bytes, @sizeOf(Cell)) catch return error.OutOfMemory;
+            field_bytes = std.math.add(usize, field_bytes, field.fixed_string_length) catch return error.OutOfMemory;
+        }
         break :record std.math.add(usize, @sizeOf(Cell), field_bytes) catch return error.OutOfMemory;
     };
     return std.math.mul(usize, element_count, bytes_per_element) catch return error.OutOfMemory;
@@ -4008,8 +4805,17 @@ fn allocateElement(
     program: *const bytecode.Program,
     value_type: bytecode.ValueType,
     record_type: u32,
+    fixed_string_length: u16,
 ) ExecutionError!Cell {
     if (record_type == bytecode.invalid_index) {
+        if (value_type == .string and fixed_string_length != 0) {
+            const bytes = try allocator.alloc(u8, fixed_string_length);
+            @memset(bytes, ' ');
+            return .{ .owned = .{ .fixed_string = .{
+                .value = .{ .string = bytes },
+                .length = fixed_string_length,
+            } } };
+        }
         return .{ .owned = .{ .scalar = try values.defaultValue(allocator, value_type) } };
     }
     if (record_type >= program.record_types.len) return error.InvalidInstruction;
@@ -4021,7 +4827,13 @@ fn allocateElement(
         allocator.free(fields);
     }
     for (definition.fields, 0..) |field, index| {
-        fields[index] = .{ .owned = .{ .scalar = try values.defaultValue(allocator, field.value_type) } };
+        fields[index] = try allocateElement(
+            allocator,
+            program,
+            field.value_type,
+            bytecode.invalid_index,
+            field.fixed_string_length,
+        );
         initialized += 1;
     }
     return .{ .owned = .{ .record = .{ .record_type = record_type, .fields = fields } } };
@@ -4061,6 +4873,7 @@ fn scalarAt(cell: *const Cell) ExecutionError!*const values.Value {
     const resolved = resolveCellConst(cell) orelse return error.InvalidInstruction;
     return switch (resolved.owned) {
         .scalar => |*scalar| scalar,
+        .fixed_string => |*string| &string.value,
         else => error.TypeMismatch,
     };
 }
@@ -4069,6 +4882,7 @@ fn scalarAtMutable(cell: *Cell) ExecutionError!*values.Value {
     const resolved = resolveCell(cell) orelse return error.InvalidInstruction;
     return switch (resolved.owned) {
         .scalar => |*scalar| scalar,
+        .fixed_string => |*string| &string.value,
         else => error.TypeMismatch,
     };
 }

@@ -211,14 +211,13 @@ test "all known keywords use bounded case-insensitive lexical lookup" {
     try std.testing.expectEqual(frontend.TokenKind.identifier, tokens[token_index].kind);
 }
 
-test "QuickBASIC appendix-E reserved words missing from v1 are all reserved" {
+test "remaining QuickBASIC appendix-E words are reserved" {
     const reference_words = [_][]const u8{
         "SEEK",   "ACCESS",   "ALIAS",   "ENDIF",  "LSET",     "SETMEM", "SIGNAL",
         "ERDEV",  "ERDEV$",   "BINARY",  "CALLS",  "FILEATTR", "OFF",    "STOP",
-        "CDECL",  "FREEFILE", "STRING$", "CLEAR",  "PEN",      "COM",    "PMAP",
-        "TROFF",  "TRON",     "CSRLIN",  "UEVENT", "VARPTR$",  "RESET",  "DEFDBL",
-        "LIST",   "DEFLNG",   "DEFSNG",  "LOCAL",  "WINDOW",   "DEFSTR", "RSET",
-        "RTRIM$",
+        "CDECL",  "FREEFILE", "CLEAR",   "PEN",    "COM",      "PMAP",   "TROFF",
+        "TRON",   "UEVENT",   "VARPTR$", "RESET",  "DEFDBL",   "LIST",   "DEFLNG",
+        "DEFSNG", "LOCAL",    "WINDOW",  "DEFSTR", "RSET",
     };
     for (reference_words) |word| {
         const result = frontend.tokenizeNamed("appendix-e.bas", word, tokens[0..], diagnostics[0..]);

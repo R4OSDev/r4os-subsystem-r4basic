@@ -248,6 +248,25 @@ pub const Screen = struct {
         return self.cells[row * columns + column];
     }
 
+    pub fn cursorRow(self: *const Screen) i16 {
+        return @intCast(self.cursor_row + 1);
+    }
+
+    pub fn cursorColumn(self: *const Screen) i16 {
+        return @intCast(self.cursor_column + 1);
+    }
+
+    pub fn screenValue(self: *const Screen, requested_row: i32, requested_column: i32, color: bool) Error!i16 {
+        if (requested_row < 1 or requested_row > rows or requested_column < 1 or requested_column > self.active_columns) {
+            return error.IllegalFunctionCall;
+        }
+        const value = self.cells[@as(usize, @intCast(requested_row - 1)) * columns + @as(usize, @intCast(requested_column - 1))];
+        return if (color)
+            @as(i16, value.foreground & 0x0f) | (@as(i16, value.background) << 4)
+        else
+            value.character;
+    }
+
     pub fn copyRow(self: *const Screen, row: usize, out: *[columns]u8) bool {
         if (row >= rows) return false;
         for (0..columns) |column| out[column] = self.cells[row * columns + column].character;

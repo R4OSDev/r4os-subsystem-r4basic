@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 execution foundation
 
-Contract version: `2.0.0`
+Contract version: `2.1.0`
 
 This document freezes the executable R4BASIC foundation and its non-regression
 invariants while the complete v2 target in `COMPATIBILITY.md` and
@@ -79,14 +79,17 @@ aliases, and error-handler state belong to each VM instance.
   `REDIM` reallocates a dynamic array with the same rank and element type and
   resets every element. A VM limits one array to 16,777,216 elements before
   attempting allocation. INTEGER, LONG, SINGLE, and DOUBLE arrays use exact
-  2-, 4-, 4-, and 8-byte typed payloads; strings and records retain generic
-  Cells. The logical payload of all live arrays is limited to 128 MiB and an
+  2-, 4-, 4-, and 8-byte typed payloads; variable strings, fixed strings and
+  records retain generic Cells. Fixed-string elements additionally charge
+  their exact declared byte length to the logical payload. The logical
+  payload of all live arrays is limited to 128 MiB and an
   atomic resize transition, including old/new dimensions, to 192 MiB. A
   rejected `DIM` or `REDIM` reports out-of-memory before replacing the old
   dimensions or payload.
-- `TYPE` layouts contain named scalar fields. Scalar records and arrays of
-  records initialize every field independently. Qualified field access is
-  bound to a field index; arbitrary byte offsets do not exist.
+- `TYPE` layouts contain named scalar and fixed-string fields. Scalar records
+  and arrays of records initialize every field independently; fixed fields
+  begin as exact-length spaces. Qualified field access is bound to a field
+  index; arbitrary byte offsets do not exist.
 - Array and record references use storage aliases, including scalar array
   elements and record fields. Alias targets stay inside VM-owned global,
   frame, array, or record cells.
@@ -107,6 +110,11 @@ aliases, and error-handler state belong to each VM instance.
 - Strings are owned byte strings with a maximum length of 32,767 bytes. They
   are not Unicode-decoded and may contain bytes above ASCII. Concatenation or
   a literal beyond the limit reports overflow.
+- A declaration `AS STRING * n` fixes `n` at compile time. Each scalar,
+  array element, and record field owns exactly `n` bytes. Assignment pads on
+  the right with spaces or truncates on the right; the replacement is fully
+  allocated and converted before the old value is released. Fixed and
+  variable strings compare and concatenate by their stored bytes.
 - Loading a string variable for assignment creates one distinct owner. A
   same-type store moves that owner into the target and does not clone it a
   second time; source and destination never share mutable ownership.
@@ -157,7 +165,10 @@ The VM executes:
 - `SCREEN 0`, 80-column `WIDTH`, `COLOR`, `CLS`, `LOCATE`, and
   `VIEW PRINT` on the private text screen;
 - screen and sequential-file `PRINT` including the `?` shorthand, console and file `INPUT`, and
-  `LINE INPUT`;
+  `LINE INPUT`; `PRINT USING`, `PRINT # USING`, `WRITE`, `WRITE #`, and
+  console/file `INPUT$` use the same bounded output/input machinery;
+- in-place `MID$` assignment to variable or fixed strings without changing
+  their length;
 - `SCREEN 1`, `SCREEN 9`, `PALETTE`, `PSET`, coordinate `POINT`, `LINE`
   including `B` and `BF`, `CIRCLE`, `PAINT`, and packed `GET`/`PUT` with
   `PSET` and `XOR`;
@@ -195,12 +206,14 @@ partially changing the queue or persistent music settings.
 
 ## Built-in functions and host services
 
-The executable built-ins include `ABS`, `ATN`, `CDBL`, `CHR$`, `CINT`,
-`CLNG`, `COS`, `CSNG`, all IEEE/MBF `CV*` and `MK*` conversions, `EOF`,
-`ERL`, `EXP`, `FIX`, `INKEY$`, `INSTR`, `INT`, `LEFT$`, `LEN`, `LOG`,
-`LTRIM$`, `MID$`, coordinate `POINT`, `RND`, `SGN`, `SIN`, `SPACE$`, `SQR`,
-`STR$`, `TAN`, `TIMER`, `UCASE$`, and `VAL` with the arities and type
-categories defined by the source contract.
+The executable built-ins include `ABS`, `ASC`, `ATN`, `CDBL`, `CHR$`,
+`CINT`, `CLNG`, `COS`, `CSNG`, `CSRLIN`, all IEEE/MBF `CV*` and `MK*`
+conversions, `EOF`, `ERL`, `EXP`, `FIX`, `HEX$`, `INKEY$`, `INPUT$`,
+`INSTR`, `INT`, `LCASE$`, `LEFT$`, `LEN`, `LOG`, `LTRIM$`, `MID$`, `OCT$`,
+coordinate `POINT`, `POS`, `RIGHT$`, `RND`, `RTRIM$`, text-query `SCREEN`,
+`SGN`, `SIN`, `SPACE$`, `SQR`, `STR$`, `STRING$`, `TAN`, `TIMER`, `UCASE$`,
+and `VAL` with the arities and type categories defined by the source
+contract.
 
 `ERL` returns the latest numbered line preceding the trapped instruction, or
 zero when no numbered line precedes it. Its identity comes from immutable
@@ -209,9 +222,12 @@ instruction metadata and therefore also survives nested `$INCLUDE` sources.
 Simple scalar string lvalues are passed to read-only built-ins as non-owning
 Cell references. Numeric and expression arguments remain owned stack values,
 and every string result owns independent storage. Numeric PRINT and STR$ use
-a bounded 128-byte format buffer; STR$ allocates only its final result. VAL parses
-ordinary E/e text directly, normalizes short D/d text on the stack and reuses
-one VM-owned scratch buffer only for longer D/d input.
+the same bounded QuickBASIC formatter; it selects ordinary or E/D exponent
+notation by source type and magnitude. `PRINT USING` owns one VM scratch
+buffer capped at 32,767 bytes and cycles only through validated mask fields.
+STR$ allocates only its final result. VAL parses ordinary E/e text directly,
+normalizes short D/d text on the stack, accepts signed `&H`/`&O` bit patterns,
+and reuses one VM-owned scratch buffer only for longer D/d input.
 
 `ATN`, `COS`, `EXP`, `LOG`, `SIN`, `SQR`, `TAN`, and power call an injected
 math service. Domain checks happen before that call; non-finite results and
@@ -243,10 +259,18 @@ guest address can become an R4OS or host pointer.
   inclusive scrolling region; bare `VIEW PRINT` restores rows 1 through 25.
   Output outside that region can be positioned with `LOCATE`, while newline
   scrolling remains confined to the region.
+- `CSRLIN`, `POS`, and `SCREEN(row,column[,color])` query the same live cell
+  state. SCREEN returns either the stored byte or its combined foreground and
+  background attribute; all coordinates are validated before access.
 - `PRINT` preserves a trailing semicolon, advances commas through 14-column
-  zones, applies one-based `TAB`, and emits a newline only without a trailing
-  separator. Positive numbers carry leading and trailing spaces; negative
-  numbers carry the sign and trailing space.
+  zones, applies one-based `TAB` and bounded `SPC`, and emits a newline only
+  without a trailing separator. Positive numbers carry leading and trailing
+  spaces; negative numbers carry the sign and trailing space.
+- `PRINT USING` implements `!`, `\   \`, `&`, numeric `#` fields, decimal
+  points, leading/trailing signs, `**`, `$$`, `**$`, comma groups, `^^^^` and
+  `^^^^^`, `_` escapes and `%` overflow. Screen and sequential-file output
+  share this formatter. `WRITE` quotes strings, doubles embedded quotes, and
+  emits comma-separated values that the INPUT # decoder can read back.
 - Each VM owns a focused keyboard byte queue of at most 4,096 bytes. Every
   queued byte retains the stable host-input sequence and raw tick until it is
   consumed. Printable text, Enter, and Backspace are accepted only while
@@ -258,13 +282,20 @@ guest address can become an R4OS or host pointer.
   distinct bounded drop results. Passive counters preserve raw/logical/
   accepted/consumed counts, queue high water and the last accepted, dropped,
   consumed and visibly presented input stamps without a hot-path log.
-  `INKEY$` consumes at most one byte and returns an allocated empty string
-  immediately when the queue is empty.
+  `INKEY$` consumes one printable/control byte or one complete two-byte
+  extended-key pair and returns an allocated empty string immediately when
+  the queue is empty. The pair is admitted and removed atomically so queue
+  pressure cannot expose a lone prefix or scan byte.
 - Console `INPUT` and `LINE INPUT` retry the same instruction without
   blocking the host. Editing echoes printable bytes, erases one byte on
   Backspace, and completes on Enter. A line is limited to 255 bytes. All
   target values are parsed before any assignment; invalid or overflowing
   input prints `Redo from start` and leaves every target unchanged.
+- Prompt strings, the comma/semicolon question-mark rule, and the leading
+  semicolon line-continuation rule are bound before waiting. Extended key
+  pairs do not leak scan bytes into line editing. Console `INPUT$(n)` reads
+  exactly `n` queued bytes without echo and keeps partial progress while the
+  host remains cooperative.
 
 ## Indexed graphics screen
 
@@ -393,8 +424,8 @@ guest address can become an R4OS or host pointer.
 
 - File numbers 1 through 255 address VM-owned slots. `OPEN` supports only
   `INPUT`, `OUTPUT`, and `APPEND`; `CLOSE` accepts selected numbers or all
-  slots. `PRINT #`, `INPUT #`, `LINE INPUT #`, and `EOF` require a compatible
-  open mode.
+  slots. `PRINT #`, `PRINT # USING`, `WRITE #`, `INPUT$`, `INPUT #`,
+  `LINE INPUT #`, and `EOF` require a compatible open mode.
 - A relative path is resolved against the explicit guest directory or,
   when absent, the directory of the absolute BAS file name. An absolute
   drive path remains absolute. Empty paths, invalid path bytes, drive-relative
@@ -408,8 +439,9 @@ guest address can become an R4OS or host pointer.
   prefixes are compacted before later refills, so ordinary records retain a
   rolling buffer instead of the whole file; only the current unfinished INPUT
   statement or line may retain bytes toward the 4-MiB file limit. Quoted
-  and unquoted comma fields, split CR/LF endings, whole-line input, and exact
-  end-of-file state remain deterministic. Geometric capacity growth is
+  and unquoted comma fields, doubled quotes, split CR/LF endings, whole-line
+  input, exact-count `INPUT$`, and exact end-of-file state remain
+  deterministic. Geometric capacity growth is
   clamped to the input limit; the reported peak is allocated capacity rather
   than only the logical byte count.
 - `OUTPUT` and `APPEND` publish at most 64 KiB at a time. A partial host result
@@ -538,13 +570,14 @@ The permanent general fixtures below are part of this contract:
   selection, exits, labels, GOTO, GOSUB, and targeted RETURN.
 - `vm_procedures.bas`: declarations, explicit and implicit calls, ByRef alias
   chains, ByVal, shared globals, early exits, recursion, and DEF FN.
-- `vm_builtins.bas`: every executable math and byte-string built-in through
-  an injected math probe.
+- `vm_builtins.bas` and inline vectors: every executable math and byte-string
+  built-in, fixed-string edge cases, text queries, and injected math probes.
 - `vm_infinite.bas`: an intentional infinite procedure for instruction
   budgets, cancellation, reset, and runtime Close ordering.
 - `vm_isolation.bas`: two simultaneous VMs with different stack, pointer,
   variable, diagnostic, and exit states.
-- `vm_arrays_records_data.bas`: fixed and dynamic multidimensional arrays,
+- `vm_arrays_records_data.bas` and inline ownership vectors: fixed and dynamic
+  multidimensional arrays, fixed strings and fixed-string record fields,
   signed LONG DATA, UDT arrays, SHARED state, scalar/array/record ByRef,
   declaration-side `AS ANY`, REDIM, READ, RESTORE, and two-instance isolation.
 - `vm_error_resume.bas`: whole-statement retry and next-statement continuation

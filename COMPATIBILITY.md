@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 QuickBASIC 4.5 target contract
 
-Contract version: `2.0.0`
+Contract version: `2.1.0`
 
 R4BASIC v2 targets the complete Microsoft QuickBASIC 4.5 interpreter language
 and runtime. The target is not limited by GORILLA.BAS or by the historical v1
@@ -111,8 +111,8 @@ the same grammar family. All fixture paths are below `Tests/Fixtures/`.
 | SRC-01 | CRLF/LF/CR, ASCII case folding, byte-preserving spans, 40-byte names, type suffixes, decimal literals, 8-bit string bytes | yes | `positive_source_contract.bas` plus inline span tests | `negative_lexical.bas` |
 | SRC-02 | Apostrophe and `REM` comments; `DYNAMIC` and `STATIC` metacommands | `DYNAMIC` | `positive_source_contract.bas` | `negative_lexical.bas` |
 | SRC-03 | Colon-separated statements and explicitly omitted comma arguments | yes | `positive_source_contract.bas`, `positive_io_graphics.bas` | `negative_statements.bas` |
-| DECL-01 | `CONST`, `DEFINT`, `DIM`, `DIM SHARED`, `REDIM`, scalar and multidimensional array bounds | yes | `positive_declarations.bas` | `negative_structure.bas` |
-| DECL-02 | `TYPE` blocks, elementary fields, user types, `AS ANY`, and empty array parameter dimensions | yes | `positive_declarations.bas` | `negative_structure.bas` |
+| DECL-01 | `CONST`, `DEFINT`, `DIM`, `DIM SHARED`, `REDIM`, fixed strings, scalar and multidimensional array bounds | yes | `positive_declarations.bas` plus inline fixed-string vectors | `negative_structure.bas` |
+| DECL-02 | `TYPE` blocks, elementary and fixed-string fields, user types, `AS ANY`, and empty array parameter dimensions | yes | `positive_declarations.bas` plus inline record ownership vectors | `negative_structure.bas` |
 | PROC-01 | `DECLARE SUB`, `DECLARE FUNCTION`, `SUB`, `FUNCTION`, `STATIC`, `EXIT`, explicit `CALL`, and implicit calls | yes | `positive_declarations.bas` | `negative_structure.bas`, `negative_statements.bas` |
 | PROC-02 | One-line `DEF FN` and the selected `DEF SEG` compatibility form | yes | `positive_declarations.bas`, `positive_io_graphics.bas` | `negative_structure.bas` |
 | DATA-01 | Numeric/string `DATA`, named data labels, `READ`, and `RESTORE` | yes | `positive_declarations.bas` | `negative_expressions.bas` |
@@ -121,12 +121,12 @@ the same grammar family. All fixture paths are below `Tests/Fixtures/`.
 | FLOW-03 | `FOR`/`NEXT`, `WHILE`/`WEND`, `DO`/`LOOP`, leading conditions, trailing conditions, and `EXIT FOR`/`EXIT DO` | yes | `positive_control_flow.bas` | `negative_structure.bas`, `negative_statements.bas` |
 | EXPR-01 | Parentheses; unary `+`, `-`, `NOT`; power, multiply, divide, integer divide, `MOD`, add, subtract, comparisons, `AND`, `OR`, `XOR`, `EQV`, and `IMP` with reference precedence and signed-LONG logic | yes | all positive fixtures and inline numeric vectors | `negative_expressions.bas` |
 | EXPR-02 | Numeric conversion, IEEE/MBF byte conversion, math, string, time, graphics and host-query built-ins currently marked implemented in `src/conformance.zig` | yes | `positive_io_graphics.bas` and inline numeric/byte/error vectors | `negative_expressions.bas` |
-| TEXT-01 | `SCREEN 0`, `WIDTH`, `COLOR`, `CLS`, `LOCATE`, `VIEW PRINT`, `PRINT`, `INPUT`, and `LINE INPUT` | yes | `positive_io_graphics.bas` | `negative_statements.bas` |
-| TIME-01 | `RANDOMIZE`, `RND`, `TIMER`, `INKEY$`, and `SLEEP` syntax | yes | `positive_io_graphics.bas` | `negative_expressions.bas`, `negative_statements.bas` |
+| TEXT-01 | Text `SCREEN`, `WIDTH`, `COLOR`, `CLS`, `LOCATE`, `VIEW PRINT`, `PRINT`, `PRINT USING`, `WRITE`, `INPUT`, `LINE INPUT`, and `INPUT$` | yes | `positive_io_graphics.bas` plus inline formatting/input vectors | `negative_statements.bas` |
+| TIME-01 | `RANDOMIZE`, `RND`, `TIMER`, extended two-byte `INKEY$`, and `SLEEP` syntax | yes | `positive_io_graphics.bas` plus inline queue vectors | `negative_expressions.bas`, `negative_statements.bas` |
 | GFX-01 | `SCREEN 1`/`9`, `PALETTE`, `PSET`, coordinate `POINT`, `LINE` including `B`/`BF`, `CIRCLE`, and `PAINT` | yes | `positive_io_graphics.bas` | `negative_statements.bas`, `negative_expressions.bas` |
 | GFX-02 | Graphics `GET` and `PUT` with `PSET` and `XOR` actions | yes | `positive_io_graphics.bas` | `negative_statements.bas` |
 | AUDIO-01 | `BEEP` and `PLAY` expression syntax | yes | `positive_io_graphics.bas`, `vm_audio.bas` | `negative_statements.bas` |
-| FILE-01 | Sequential `OPEN` for `INPUT`, `OUTPUT`, or `APPEND`; `CLOSE`, `PRINT #`, `INPUT #`, `LINE INPUT #`, and `EOF` | no, but v1 platform scope | `positive_io_graphics.bas` | `negative_statements.bas`, `negative_expressions.bas` |
+| FILE-01 | Sequential `OPEN` for `INPUT`, `OUTPUT`, or `APPEND`; `CLOSE`, `PRINT #`, `PRINT # USING`, `WRITE #`, `INPUT$`, `INPUT #`, `LINE INPUT #`, and `EOF` | no, but v1 platform scope | `positive_io_graphics.bas` plus inline round-trip vectors | `negative_statements.bas`, `negative_expressions.bas` |
 | HW-01 | Selected `DEF SEG`, `PEEK`, and `POKE` syntax for a later private compatibility device | yes | `positive_io_graphics.bas` | `negative_expressions.bas` |
 
 The optional `Tests/gorilla_acceptance.zig` step additionally verifies the
@@ -142,15 +142,22 @@ source does not select a separate production path.
 
 ## Built-in function arities
 
-- One argument: `ABS`, `ATN`, `CDBL`, `CHR$`, `CINT`, `CLNG`, `COS`, `CSNG`,
+- One argument: `ABS`, `ASC`, `ATN`, `CDBL`, `CHR$`, `CINT`, `CLNG`, `COS`, `CSNG`,
   `CVD`, `CVDMBF`, `CVI`, `CVL`, `CVS`, `CVSMBF`, `EOF`, `EXP`, `FIX`,
-  `INT`, `LEN`, `LOG`, `LTRIM$`, `MKD$`, `MKDMBF$`, `MKI$`, `MKL$`,
-  `MKS$`, `MKSMBF$`, `PEEK`, `SGN`, `SIN`, `SPACE$`, `SQR`, `STR$`, `TAN`,
-  `TAB`, `UCASE$`, `VAL`.
-- Two arguments: `LEFT$`, coordinate `POINT`.
+  `HEX$`, `INT`, `LCASE$`, `LEN`, `LOG`, `LTRIM$`, `MKD$`, `MKDMBF$`,
+  `MKI$`, `MKL$`, `MKS$`, `MKSMBF$`, `OCT$`, `PEEK`, `POS`, `RTRIM$`,
+  `SGN`, `SIN`, `SPACE$`, `SQR`, `STR$`, `TAN`, `UCASE$`, `VAL`.
+- Two arguments: `LEFT$`, `RIGHT$`, `STRING$`, coordinate `POINT`.
 - Two or three arguments: `INSTR`, `MID$`.
+- Two or three arguments: text `SCREEN`.
+- One or two arguments: `INPUT$` accepts a count and an optional sequential
+  file number.
 - Zero or one argument: `RND`; the bare form is accepted.
-- Bare and without parentheses: `INKEY$`, `TIMER`.
+- Bare and without parentheses: `CSRLIN`, `INKEY$`, `TIMER`.
+
+`SPC` and `TAB` are PRINT-only positioning forms rather than ordinary
+expression built-ins. `MID$` additionally has the reference in-place
+assignment statement form.
 
 Wrong arities are syntax diagnostics rather than deferred runtime behavior.
 User-defined functions and array references remain syntactically
@@ -183,8 +190,7 @@ the typed-program phase.
 - `COMMON`, `CHAIN`, `RUN`, `SHELL`, `SYSTEM`, printer/COM/device I/O,
   random/binary file records, directory mutation, and unrestricted hardware
   access.
-- Fixed-length strings, `MID$` assignment, `PRINT USING`, `DRAW`, `PCOPY`,
-  `BLOAD`, `BSAVE`, and general memory or port access.
+- `DRAW`, `PCOPY`, `BLOAD`, `BSAVE`, and general memory or port access.
 - Runtime correctness merely from parse or bind success. Only the subset in
   `VM-CONTRACT.md` has executable semantics.
 

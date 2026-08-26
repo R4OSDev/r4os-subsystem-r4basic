@@ -31,6 +31,7 @@ pub const InputDeliveryStatus = enum {
 pub const InputDelivery = struct {
     status: InputDeliveryStatus,
     reason: vm.InputDropReason = .none,
+    accepted_bytes: u8 = 0,
     sequence: u64,
     tick: u64,
     queued_bytes: usize,
@@ -185,7 +186,7 @@ pub const Adapter = struct {
             .mouse => self.deliveryFromVm(self.machine.noteInputDrop(stamp, .unsupported_event), stamp),
         };
         switch (delivery.status) {
-            .accepted => self.performance.input_accepted_bytes +%= 1,
+            .accepted => self.performance.input_accepted_bytes +%= delivery.accepted_bytes,
             .control => self.performance.input_control_events +%= 1,
             .dropped => self.performance.input_dropped_events +%= 1,
         }
@@ -193,7 +194,9 @@ pub const Adapter = struct {
     }
 
     fn deliveryFromVm(self: *Adapter, result: vm.InputResult, stamp: vm.InputStamp) InputDelivery {
-        return self.makeDelivery(if (result.accepted) .accepted else .dropped, result.reason, stamp);
+        var delivery = self.makeDelivery(if (result.accepted) .accepted else .dropped, result.reason, stamp);
+        delivery.accepted_bytes = result.accepted_bytes;
+        return delivery;
     }
 
     fn makeDelivery(self: *Adapter, status: InputDeliveryStatus, reason: vm.InputDropReason, stamp: vm.InputStamp) InputDelivery {

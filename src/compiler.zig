@@ -139,6 +139,7 @@ const VariableReference = struct {
     index: u32,
     value_type: bytecode.ValueType,
     record_type: u32,
+    fixed_string_length: u16,
     dimensions: u8,
     is_dynamic: bool,
     is_constant: bool,
@@ -157,6 +158,7 @@ const ScalarAlias = struct {
 const BoundType = struct {
     value_type: bytecode.ValueType = .single,
     record_type: u32 = bytecode.invalid_index,
+    fixed_string_length: u16 = 0,
     accepts_any: bool = false,
 
     fn isRecord(self: BoundType) bool {
@@ -773,8 +775,10 @@ const Builder = struct {
             .locate => self.parseTextLocate(),
             .view => self.parseTextView(),
             .print => self.parsePrintStatement(),
+            .write => self.parseWriteStatement(),
             .input => self.parseInputStatement(false),
             .line => self.parseLineStatement(),
+            .mid_string => self.parseMidStringAssignment(),
             .palette => self.parseGraphicsPalette(),
             .pset => self.parseGraphicsPset(),
             .circle => self.parseGraphicsCircle(),
@@ -842,7 +846,7 @@ const Builder = struct {
             _ = try self.fail(.expected_identifier);
             return null;
         }
-        const result: BoundType = switch (self.current().keyword) {
+        var result: BoundType = switch (self.current().keyword) {
             .integer => .{ .value_type = .integer },
             .long => .{ .value_type = .long },
             .single => .{ .value_type = .single },
@@ -855,6 +859,30 @@ const Builder = struct {
             },
         };
         _ = self.advance();
+        if (result.value_type == .string and self.consume(.multiply)) {
+            if (!self.at(.number)) {
+                _ = try self.fail(.expected_token);
+                return null;
+            }
+            const length_token = self.advance();
+            const parsed = parseNumericConstant(self.mutableTokenText(length_token)) catch {
+                try self.addDiagnostic(.invalid_number, length_token.span);
+                return null;
+            };
+            const length: i64 = switch (parsed) {
+                .integer => |value| value,
+                .long => |value| value,
+                else => {
+                    try self.addDiagnostic(.invalid_number, length_token.span);
+                    return null;
+                },
+            };
+            if (length < 1 or length > values.maximum_string_bytes) {
+                try self.addDiagnostic(.invalid_number, length_token.span);
+                return null;
+            }
+            result.fixed_string_length = @intCast(length);
+        }
         return result;
     }
 
@@ -886,6 +914,7 @@ const Builder = struct {
             .index = index,
             .value_type = variable.value_type,
             .record_type = variable.record_type,
+            .fixed_string_length = variable.fixed_string_length,
             .dimensions = variable.dimensions,
             .is_dynamic = variable.is_dynamic,
             .is_constant = variable.is_constant,
@@ -1227,7 +1256,9 @@ const Builder = struct {
         if (self.current_procedure == bytecode.invalid_index or shared) {
             if (self.findGlobal(name)) |index| {
                 var variable = &self.globals.items[index];
-                if (variable.value_type != bound_type.value_type or variable.record_type != bound_type.record_type) {
+                if (variable.value_type != bound_type.value_type or variable.record_type != bound_type.record_type or
+                    variable.fixed_string_length != bound_type.fixed_string_length)
+                {
                     try self.addDiagnostic(.type_mismatch, name);
                 }
                 if (variable.dimensions != dimensions) try self.addDiagnostic(.wrong_dimension_count, name);
@@ -1239,6 +1270,7 @@ const Builder = struct {
                 .name = name,
                 .value_type = bound_type.value_type,
                 .record_type = bound_type.record_type,
+                .fixed_string_length = bound_type.fixed_string_length,
                 .dimensions = dimensions,
                 .is_dynamic = is_dynamic,
                 .is_shared = shared,
@@ -1248,7 +1280,9 @@ const Builder = struct {
 
         if (self.findLocal(self.current_procedure, name)) |index| {
             const variable = &self.procedures.items[self.current_procedure].locals.items[index];
-            if (variable.value_type != bound_type.value_type or variable.record_type != bound_type.record_type) {
+            if (variable.value_type != bound_type.value_type or variable.record_type != bound_type.record_type or
+                variable.fixed_string_length != bound_type.fixed_string_length)
+            {
                 try self.addDiagnostic(.type_mismatch, name);
             }
             if (variable.dimensions != dimensions) try self.addDiagnostic(.wrong_dimension_count, name);
@@ -1259,6 +1293,7 @@ const Builder = struct {
             .name = name,
             .value_type = bound_type.value_type,
             .record_type = bound_type.record_type,
+            .fixed_string_length = bound_type.fixed_string_length,
             .dimensions = dimensions,
             .is_dynamic = is_dynamic,
         });
@@ -1274,7 +1309,11 @@ const Builder = struct {
             const dimensions = (try self.parseArrayBounds()) orelse return false;
             const existing = try self.resolveVariable(name.span, false);
             var bound_type = if (existing) |reference|
-                BoundType{ .value_type = reference.value_type, .record_type = reference.record_type }
+                BoundType{
+                    .value_type = reference.value_type,
+                    .record_type = reference.record_type,
+                    .fixed_string_length = reference.fixed_string_length,
+                }
             else
                 BoundType{ .value_type = self.inferredType(name.span) };
             if (self.consumeKeyword(.as)) bound_type = (try self.parseBoundType()) orelse return false;
@@ -1284,7 +1323,9 @@ const Builder = struct {
             if (reference.dimensions != bytecode.unknown_dimensions and reference.dimensions != dimensions) {
                 try self.addDiagnostic(.wrong_dimension_count, name.span);
             }
-            if (reference.value_type != bound_type.value_type or reference.record_type != bound_type.record_type) {
+            if (reference.value_type != bound_type.value_type or reference.record_type != bound_type.record_type or
+                reference.fixed_string_length != bound_type.fixed_string_length)
+            {
                 try self.addDiagnostic(.type_mismatch, name.span);
             }
             reference.is_dynamic = true;
@@ -1334,6 +1375,10 @@ const Builder = struct {
             if (field_type.accepts_any or field_type.isRecord()) {
                 try self.addDiagnostic(.unsupported_core_feature, field_name.span);
             }
+            if (field_type.value_type == .string and field_type.fixed_string_length == 0) {
+                try self.addDiagnostic(.type_mismatch, field_name.span);
+                return false;
+            }
             var record_type = &self.record_types.items[record_index];
             if (record_type.fields.items.len >= maximum_record_fields) {
                 try self.addDiagnostic(.capacity_exceeded, field_name.span);
@@ -1342,7 +1387,11 @@ const Builder = struct {
             if (record_type.field_names.lookup(self.source, 0, field_name.span, &self.stats) != null)
                 try self.addDiagnostic(.duplicate_symbol, field_name.span);
             const field_index: u32 = @intCast(record_type.fields.items.len);
-            try record_type.fields.append(self.allocator, .{ .name = field_name.span, .value_type = field_type.value_type });
+            try record_type.fields.append(self.allocator, .{
+                .name = field_name.span,
+                .value_type = field_type.value_type,
+                .fixed_string_length = field_type.fixed_string_length,
+            });
             try record_type.field_names.insert(self.allocator, self.source, 0, field_name.span, field_index, &self.stats);
             if (!self.atBoundary()) return self.fail(.unexpected_token);
             while (self.consume(.newline) or self.consume(.colon)) {}
@@ -1570,6 +1619,38 @@ const Builder = struct {
             _ = try self.emit(.print_begin_screen, 0, 0, statement.span);
         }
 
+        if (self.consumeKeyword(.using)) {
+            const format_type = (try self.parseExpression()) orelse return false;
+            if (format_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+            if (!try self.expect(.semicolon)) return false;
+            _ = try self.emit(.print_using_begin, 0, 0, statement.span);
+            var trailing_separator = false;
+            var value_count: u32 = 0;
+            while (!self.atBoundary() and !self.atKeyword(.else_)) {
+                if (self.consume(.semicolon)) {
+                    trailing_separator = true;
+                    continue;
+                }
+                if (self.consume(.comma)) {
+                    _ = try self.emit(.print_comma, 0, 0, statement.span);
+                    trailing_separator = true;
+                    continue;
+                }
+                _ = (try self.parseExpression()) orelse return false;
+                _ = try self.emit(.print_using_value, 0, 0, statement.span);
+                value_count += 1;
+                trailing_separator = false;
+            }
+            if (value_count == 0) {
+                try self.addDiagnostic(.wrong_argument_count, statement.span);
+                return false;
+            }
+            _ = try self.emit(.print_using_end, 0, 0, statement.span);
+            if (!trailing_separator) _ = try self.emit(.print_newline, 0, 0, statement.span);
+            _ = try self.emit(.print_end, 0, 0, statement.span);
+            return true;
+        }
+
         var trailing_separator = false;
         while (!self.atBoundary() and !self.atKeyword(.else_)) {
             if (self.consume(.semicolon)) {
@@ -1590,6 +1671,15 @@ const Builder = struct {
                 trailing_separator = false;
                 continue;
             }
+            if (self.consumeKeyword(.spc)) {
+                if (!try self.expect(.left_paren)) return false;
+                const count_type = (try self.parseExpression()) orelse return false;
+                if (!count_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+                if (!try self.expect(.right_paren)) return false;
+                _ = try self.emit(.print_spc, 0, 0, statement.span);
+                trailing_separator = true;
+                continue;
+            }
             const value_type = (try self.parseExpression()) orelse return false;
             _ = value_type;
             _ = try self.emit(.print_value, 0, 0, statement.span);
@@ -1597,6 +1687,54 @@ const Builder = struct {
         }
         if (!trailing_separator) _ = try self.emit(.print_newline, 0, 0, statement.span);
         _ = try self.emit(.print_end, 0, 0, statement.span);
+        return true;
+    }
+
+    fn parseWriteStatement(self: *Builder) !bool {
+        const statement = self.advance();
+        if (self.consume(.hash)) {
+            const file_type = (try self.parseExpression()) orelse return false;
+            if (!file_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            if (!try self.expect(.comma)) return false;
+            _ = try self.emit(.print_begin_file, 0, 0, statement.span);
+        } else {
+            _ = try self.emit(.print_begin_screen, 0, 0, statement.span);
+        }
+        _ = try self.emit(.write_begin, 0, 0, statement.span);
+        while (!self.atBoundary() and !self.atKeyword(.else_)) {
+            _ = (try self.parseExpression()) orelse return false;
+            _ = try self.emit(.write_value, 0, 0, statement.span);
+            if (!self.consume(.comma)) break;
+            if (self.atBoundary() or self.atKeyword(.else_)) return self.fail(.expected_expression);
+        }
+        _ = try self.emit(.print_newline, 0, 0, statement.span);
+        _ = try self.emit(.print_end, 0, 0, statement.span);
+        return true;
+    }
+
+    fn parseMidStringAssignment(self: *Builder) !bool {
+        const statement = self.advance();
+        if (!try self.expect(.left_paren)) return false;
+        const name = (try self.expectIdentifier()) orelse return false;
+        const target = (try self.parseLvalueReference(name, true)) orelse return false;
+        if (target.is_whole_array or target.record_type != bytecode.invalid_index or target.value_type != .string) {
+            try self.addDiagnostic(.type_mismatch, name.span);
+            return false;
+        }
+        if (target.is_constant) try self.addDiagnostic(.constant_assignment, name.span);
+        if (!try self.expect(.comma)) return false;
+        const start_type = (try self.parseExpression()) orelse return false;
+        if (!start_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        var has_length = false;
+        if (self.consume(.comma)) {
+            const length_type = (try self.parseExpression()) orelse return false;
+            if (!length_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            has_length = true;
+        }
+        if (!try self.expect(.right_paren) or !try self.expect(.equal)) return false;
+        const replacement_type = (try self.parseExpression()) orelse return false;
+        if (replacement_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+        _ = try self.emit(.mid_string_assign, @intFromBool(has_length), 0, statement.span);
         return true;
     }
 
@@ -2032,6 +2170,10 @@ const Builder = struct {
             }
             var bound_type = BoundType{ .value_type = self.inferredType(name.span) };
             if (self.consumeKeyword(.as)) bound_type = (try self.parseBoundType()) orelse return false;
+            if (bound_type.fixed_string_length != 0) {
+                try self.addDiagnostic(.type_mismatch, name.span);
+                return false;
+            }
             if (bound_type.accepts_any and (!is_array or mode == .by_value)) {
                 try self.addDiagnostic(.type_mismatch, name.span);
             }
@@ -2545,6 +2687,7 @@ const Builder = struct {
             return target.value_type;
         }
         if (self.at(.keyword)) {
+            if (self.atKeyword(.input_string)) return self.parseInputStringFunction();
             if (builtinForKeyword(self.current().keyword)) |builtin| return self.parseBuiltin(builtin);
         }
         if (self.consume(.left_paren)) {
@@ -2554,6 +2697,23 @@ const Builder = struct {
         }
         _ = try self.fail(.expected_expression);
         return null;
+    }
+
+    fn parseInputStringFunction(self: *Builder) !?bytecode.ValueType {
+        const function_token = self.advance();
+        if (!try self.expect(.left_paren)) return null;
+        const count_type = (try self.parseExpression()) orelse return null;
+        if (!count_type.isNumeric()) try self.addDiagnostic(.type_mismatch, function_token.span);
+        var from_file = false;
+        if (self.consume(.comma)) {
+            _ = self.consume(.hash);
+            const file_type = (try self.parseExpression()) orelse return null;
+            if (!file_type.isNumeric()) try self.addDiagnostic(.type_mismatch, function_token.span);
+            from_file = true;
+        }
+        if (!try self.expect(.right_paren)) return null;
+        _ = try self.emit(.input_string, if (from_file) 2 else 1, @intFromBool(from_file), function_token.span);
+        return .string;
     }
 
     fn parseNumber(self: *Builder) !?bytecode.ValueType {
@@ -2589,7 +2749,7 @@ const Builder = struct {
         const function_token = self.advance();
         var argument_types: [3]bytecode.ValueType = undefined;
         var argument_count: usize = 0;
-        const allows_bare = builtin == .inkey_string or builtin == .timer or builtin == .rnd or builtin == .erl;
+        const allows_bare = builtin == .inkey_string or builtin == .timer or builtin == .rnd or builtin == .erl or builtin == .csrlin;
         if (self.consume(.left_paren)) {
             if (!self.consume(.right_paren)) {
                 while (true) {
@@ -2623,13 +2783,13 @@ const Builder = struct {
     ) !?bytecode.ValueType {
         const expected_min: usize = switch (builtin) {
             .instr, .mid_string => 2,
-            .left_string => 2,
+            .left_string, .right_string, .string_string, .screen => 2,
             .point => 2,
-            .rnd, .inkey_string, .timer, .erl => 0,
+            .rnd, .inkey_string, .timer, .erl, .csrlin => 0,
             else => 1,
         };
         const expected_max: usize = switch (builtin) {
-            .instr, .mid_string => 3,
+            .instr, .mid_string, .screen => 3,
             .rnd => 1,
             else => expected_min,
         };
@@ -2648,7 +2808,9 @@ const Builder = struct {
             .clng, .cvl => .long,
             .csng, .cvs, .cvsmbf => .single,
             .chr_string,
+            .hex_string,
             .left_string,
+            .lcase_string,
             .ltrim_string,
             .mid_string,
             .mkd_string,
@@ -2657,12 +2819,16 @@ const Builder = struct {
             .mkl_string,
             .mks_string,
             .mksmbf_string,
+            .oct_string,
+            .right_string,
+            .rtrim_string,
             .space_string,
             .str_string,
+            .string_string,
             .ucase_string,
             => .string,
             .inkey_string => .string,
-            .cint, .cvi, .instr, .len, .eof, .peek, .point, .sgn => .integer,
+            .asc, .cint, .cvi, .csrlin, .instr, .len, .eof, .peek, .point, .pos, .screen, .sgn => .integer,
             .erl => .long,
             .fix, .int => arguments[0],
             .val => .double,
@@ -2676,6 +2842,8 @@ const Builder = struct {
             .csng,
             .cdbl,
             .space_string,
+            .hex_string,
+            .oct_string,
             .peek,
             .eof,
             .atn,
@@ -2697,8 +2865,8 @@ const Builder = struct {
             .mks_string,
             .mksmbf_string,
             => if (!arguments[0].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
-            .cvd, .cvdmbf, .cvi, .cvl, .cvs, .cvsmbf, .ltrim_string, .len, .ucase_string, .val => if (arguments[0] != .string) try self.addDiagnostic(.type_mismatch, span),
-            .left_string => if (arguments[0] != .string or !arguments[1].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
+            .asc, .cvd, .cvdmbf, .cvi, .cvl, .cvs, .cvsmbf, .lcase_string, .ltrim_string, .len, .rtrim_string, .ucase_string, .val => if (arguments[0] != .string) try self.addDiagnostic(.type_mismatch, span),
+            .left_string, .right_string => if (arguments[0] != .string or !arguments[1].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
             .instr => {
                 const offset: usize = if (arguments.len == 3) 1 else 0;
                 if (offset == 1 and !arguments[0].isNumeric()) try self.addDiagnostic(.type_mismatch, span);
@@ -2710,8 +2878,18 @@ const Builder = struct {
                 }
             },
             .point => if (!arguments[0].isNumeric() or !arguments[1].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
+            .pos => if (!arguments[0].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
+            .screen => {
+                if (!arguments[0].isNumeric() or !arguments[1].isNumeric() or
+                    (arguments.len == 3 and !arguments[2].isNumeric())) try self.addDiagnostic(.type_mismatch, span);
+            },
+            .string_string => {
+                if (!arguments[0].isNumeric() or (arguments[1] != .string and !arguments[1].isNumeric())) {
+                    try self.addDiagnostic(.type_mismatch, span);
+                }
+            },
             .rnd => if (arguments.len == 1 and !arguments[0].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
-            .inkey_string, .timer, .erl => {},
+            .inkey_string, .timer, .erl, .csrlin => {},
         }
         return result;
     }
@@ -3647,12 +3825,14 @@ fn typesCompatible(target: bytecode.ValueType, source: bytecode.ValueType) bool 
 fn builtinForKeyword(keyword: frontend.Keyword) ?bytecode.Builtin {
     return switch (keyword) {
         .abs => .abs,
+        .asc => .asc,
         .atn => .atn,
         .cdbl => .cdbl,
         .chr_string => .chr_string,
         .cint => .cint,
         .clng => .clng,
         .cos => .cos,
+        .csrlin => .csrlin,
         .csng => .csng,
         .cvd => .cvd,
         .cvdmbf => .cvdmbf,
@@ -3662,9 +3842,11 @@ fn builtinForKeyword(keyword: frontend.Keyword) ?bytecode.Builtin {
         .cvsmbf => .cvsmbf,
         .exp => .exp,
         .fix => .fix,
+        .hex_string => .hex_string,
         .instr => .instr,
         .int => .int,
         .left_string => .left_string,
+        .lcase_string => .lcase_string,
         .len => .len,
         .log => .log,
         .ltrim_string => .ltrim_string,
@@ -3675,10 +3857,16 @@ fn builtinForKeyword(keyword: frontend.Keyword) ?bytecode.Builtin {
         .mkl_string => .mkl_string,
         .mks_string => .mks_string,
         .mksmbf_string => .mksmbf_string,
+        .oct_string => .oct_string,
         .peek => .peek,
+        .pos => .pos,
+        .right_string => .right_string,
+        .rtrim_string => .rtrim_string,
+        .screen => .screen,
         .sin => .sin,
         .space_string => .space_string,
         .str_string => .str_string,
+        .string_string => .string_string,
         .ucase_string => .ucase_string,
         .val => .val,
         .eof => .eof,
