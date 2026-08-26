@@ -6,7 +6,7 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.69.55
+Stand 0.69.56
 ------------
 
 Diese Ausbaustufe ist der produktive R4BASIC-v1-Subsystemhost. Explorer
@@ -66,11 +66,16 @@ Compiler und VM
 ---------------
 
 `src/compiler.zig` fuehrt Parser, Binder und Emitter in einem kontrollierten
-Durchlauf ueber den einmal erzeugten Tokenstrom. Das Ergebnis besitzt eigene
-Kopien von Dateiname und Quellbytes sowie Tabellen fuer Konstanten, globale
-Variablen, Prozeduren und Instruktionen. Jede Instruktion verweist auf ihren
-stabilen Quellspan. Labels werden pro Modul- oder Prozedurscope auf feste
-Instruktionsindizes aufgeloest; unbekannte Ziele sind Compile-Diagnosen.
+Durchlauf ueber den einmal erzeugten Tokenstrom. Das Ergebnis besitzt eine
+eigene Dateinamenkopie, eigene Quellbytes sowie Tabellen fuer Konstanten,
+globale Variablen, Prozeduren und Instruktionen. Die bisherigen geliehenen
+Compile-Einstiege kopieren den Quelltext weiterhin. `compileOwned` und
+`compileOwnedObserved` uebernehmen dagegen die uebergebene Allokation auf
+jedem Erfolgs-, Fehler- und Abbruchpfad; der produktive Host uebergibt damit
+seinen eingelesenen Quellpuffer ohne zweite Quelltextkopie an das Programm.
+Jede Instruktion verweist auf ihren stabilen Quellspan. Labels werden pro
+Modul- oder Prozedurscope auf feste Instruktionsindizes aufgeloest; unbekannte
+Ziele sind Compile-Diagnosen.
 
 Die 103 unterstuetzten und 84 bewusst reservierten Schluesselwoerter liegen in
 einer zur Compilezeit erzeugten, case-insensitiven Hashtabelle. Die aktuelle
@@ -83,11 +88,48 @@ entschieden. Label- und RESTORE-Fixups greifen direkt auf denselben Labelindex
 zu. Bereits fuer die Statemententscheidung gebundene Array-, Record- und
 ByRef-Namen werden an den Lvalue-Pfad weitergereicht und nicht erneut gesucht.
 
-`Program.compile_stats` zaehlt Tokens, Keyword- und Namenslookups, Tabellen-
-proben, maximale Suchtiefe, Indexaufbauten, Fixups, wiederverwendete Bindungen
-und Fortschrittsaufrufe. Damit pruefen Stress- und Gasttests neben der
-Semantik auch die Sucharbeit. Die Grenzen von Quellspans und Diagnosen bleiben
-identisch zum bisherigen QBasic-kompatiblen Vertrag.
+`Program.compile_stats` zaehlt Tokens, Keyword-, Namens- und
+Konstantenlookups, Tabellenproben, maximale Suchtiefe, Indexaufbauten, Fixups,
+wiederverwendete Bindungen, Ausdruckstiefe, Diagnosen, Allokationen,
+Reallokationen, Kopierbytes, angeforderten Peak- und Programmzustand sowie
+Fortschrittsaufrufe. Der produktive Bericht stellt daneben die realen
+VM-Allocatorwerte vor und nach dem Compiler dar. Damit pruefen Stress- und
+Gasttests neben der Semantik auch Sucharbeit, Speicheraufwand und Ownership.
+
+Begrenzter Compilerzustand
+-------------------------
+
+Vor dem eigentlichen Lexerlauf zaehlt ein allokationsfreier Lexerpfad die
+Tokens exakt. Der temporaere Tokenpuffer besitzt deshalb genau so viele
+Eintraege wie der spaetere Lauf erzeugt. Bei maximal dichtem 256-KiB-Quelltext
+sind das 262.145 Eintraege zu je 20 Byte, also 5.242.900 Byte. Ein
+Token-Vorlauf leitet ausserdem praezise Anfangskapazitaeten fuer elf
+Compilerlisten aus dem echten Quellbedarf ab; die Listen reservieren diese
+Kapazitaeten ohne geometrische Anfangsreserve.
+
+Ein offener, inhaltsbasierter Konstantenindex verwendet Integerwerte,
+bitgenaue SINGLE-/DOUBLE-Werte und Stringbytes als Identitaet. Wiederholte
+Literale verweisen auf denselben Programmeintrag. Das Parsen normaler und mit
+D/d-Exponent geschriebener Gleitkommaliterale arbeitet kurzzeitig im
+uebernommenen Quellpuffer und benoetigt keine Heapkopie je Literal; die
+Originalbytes werden vor der Rueckkehr wiederhergestellt.
+
+Der Compiler speichert hoechstens die ersten 20 Diagnosen, zaehlt aber alle
+weiteren Fehler und markiert die Ausgabe als gekuerzt. Frontend und Compiler
+akzeptieren hoechstens 128 gleichzeitig verschachtelte Ausdrucksebenen und
+melden die naechste Ebene deterministisch als `expression_too_deep`.
+
+Die Hostabnahme verwendet einen spitzenarmen und einen maximal dichten,
+gueltigen 256-KiB-Quelltext. Fuer den spitzenarmen Fall gilt ein angeforderter
+Peak von hoechstens 512 KiB. Der dichte Fall `A=1:` x 65.536 misst mit dem
+Host-Page-Allocator 12.605.977 Byte Peak, 7.340.137 Byte verbleibenden
+Programmzustand, 7.095.028 Byte Anfangslisten, 16 Allokationen, drei
+Reallokationen und null Kopierbytes. Seine 65.536 identischen Integerliterale
+belegen genau eine Konstante. Die Abnahme begrenzt diesen Fall auf 20 MB Peak,
+8 MB Programmzustand, 128 Allokationen und 8 MB Kopierarbeit. Der produktive
+GORILLA-Gastmarker verlangt zusaetzlich exakte Tokenkapazitaet, uebernommene
+29.434 Quellbytes, begrenzte Ausdruckstiefe, keine Diagnosen sowie konsistente
+angeforderte und reale VM-Allocatorwerte.
 
 Der ausfuehrbare Kern umfasst INTEGER, LONG, SINGLE, DOUBLE und dynamische
 Byte-Strings, DEFINT und Typsuffixe, skalare sowie mehrdimensionale

@@ -27,6 +27,17 @@ pub const Constant = union(ValueType) {
     pub fn valueType(self: Constant) ValueType {
         return std.meta.activeTag(self);
     }
+
+    pub fn eql(self: Constant, source: []const u8, other: Constant) bool {
+        if (self.valueType() != other.valueType()) return false;
+        return switch (self) {
+            .integer => |value| value == other.integer,
+            .long => |value| value == other.long,
+            .single => |value| @as(u32, @bitCast(value)) == @as(u32, @bitCast(other.single)),
+            .double => |value| @as(u64, @bitCast(value)) == @as(u64, @bitCast(other.double)),
+            .string => |span| std.mem.eql(u8, span.bytes(source), other.string.bytes(source)),
+        };
+    }
 };
 
 pub const Variable = struct {
@@ -271,6 +282,7 @@ pub const DiagnosticCode = enum(u8) {
     invalid_data_item,
     block_mismatch,
     block_not_closed,
+    expression_too_deep,
     capacity_exceeded,
 };
 
@@ -307,6 +319,7 @@ pub const Diagnostic = struct {
             .invalid_data_item => "DATA item is not a supported constant",
             .block_mismatch => "block terminator does not match the active block",
             .block_not_closed => "block is not closed before end of source",
+            .expression_too_deep => "BASIC expression nesting exceeds the deterministic compiler limit",
             .capacity_exceeded => "compiled program exceeds a deterministic v1 capacity",
         };
     }
@@ -315,6 +328,8 @@ pub const Diagnostic = struct {
 pub const CompileStats = struct {
     source_bytes: u32 = 0,
     tokens: u32 = 0,
+    token_capacity: u32 = 0,
+    token_bytes: u64 = 0,
     keyword_lookups: u64 = 0,
     keyword_probes: u64 = 0,
     keyword_max_probe: u16 = 0,
@@ -326,6 +341,22 @@ pub const CompileStats = struct {
     label_fixups: u32 = 0,
     data_fixups: u32 = 0,
     reused_statement_bindings: u32 = 0,
+    constant_lookups: u32 = 0,
+    constant_reuses: u32 = 0,
+    constant_probes: u64 = 0,
+    constant_max_probe: u16 = 0,
+    diagnostics_total: u32 = 0,
+    diagnostics_stored: u16 = 0,
+    diagnostics_truncated: bool = false,
+    maximum_expression_depth: u16 = 0,
+    list_reservations: u16 = 0,
+    initial_list_bytes: u64 = 0,
+    allocator_allocations: u64 = 0,
+    allocator_reallocations: u64 = 0,
+    allocator_copy_bytes: u64 = 0,
+    compiler_peak_bytes: u64 = 0,
+    program_bytes: u64 = 0,
+    adopted_source_bytes: u32 = 0,
     progress_updates: u32 = 0,
 };
 
@@ -340,13 +371,15 @@ pub const Program = struct {
     record_types: []RecordType,
     data_items: []DataItem,
     diagnostics: []Diagnostic,
+    diagnostics_total: u32 = 0,
+    diagnostics_truncated: bool = false,
     module_entry: u32,
     parse_passes: u32 = 1,
     bind_passes: u32 = 1,
     compile_stats: CompileStats = .{},
 
     pub fn ok(self: Program) bool {
-        return self.diagnostics.len == 0;
+        return self.diagnostics_total == 0;
     }
 
     pub fn sourceBytes(self: Program, span: frontend.Span) []const u8 {

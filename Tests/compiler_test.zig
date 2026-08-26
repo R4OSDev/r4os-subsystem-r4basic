@@ -155,10 +155,154 @@ test "maximum source compilation remains cooperatively cancellable" {
     try std.testing.expect(probe.calls >= 3);
     try std.testing.expect(probe.last_completed >= 4096);
 
+    const owned_source = try allocator.dupe(u8, source);
+    var owned_probe: Probe = .{};
+    try std.testing.expectError(error.Cancelled, core.compiler.compileOwnedObserved(allocator, "maximum-owned.bas", owned_source, .{
+        .context = &owned_probe,
+        .update_fn = Probe.update,
+    }));
+    try std.testing.expect(owned_probe.last_completed >= 4096);
+
     var completed = try core.compiler.compile(allocator, "maximum.bas", source);
     defer completed.deinit();
     try expectProgramOk(&completed);
     try std.testing.expectEqual(@as(u32, core.frontend.maximum_source_bytes), completed.compile_stats.source_bytes);
+}
+
+test "compiler storage follows token demand and bounds the dense 256 KiB case" {
+    const allocator = std.testing.allocator;
+
+    const sparse = try allocator.alloc(u8, core.frontend.maximum_source_bytes);
+    @memset(sparse, 'A');
+    @memcpy(sparse[0..4], "REM ");
+    const sparse_pointer = sparse.ptr;
+    var sparse_program = try core.compiler.compileOwned(allocator, "sparse-maximum.bas", sparse);
+    defer sparse_program.deinit();
+    try expectProgramOk(&sparse_program);
+    try std.testing.expect(sparse_program.source.ptr == sparse_pointer);
+    try std.testing.expectEqual(@as(u32, 1), sparse_program.compile_stats.token_capacity);
+    try std.testing.expectEqual(@as(u64, @sizeOf(core.frontend.Token)), sparse_program.compile_stats.token_bytes);
+    try std.testing.expectEqual(
+        @as(u32, core.frontend.maximum_source_bytes),
+        sparse_program.compile_stats.adopted_source_bytes,
+    );
+    try std.testing.expect(sparse_program.compile_stats.compiler_peak_bytes <= 512 * 1024);
+
+    const dense = try allocator.alloc(u8, core.frontend.maximum_source_bytes);
+    for (0..dense.len / 4) |index| @memcpy(dense[index * 4 ..][0..4], "A=1:");
+    const dense_pointer = dense.ptr;
+    var dense_program = try core.compiler.compileOwned(allocator, "dense-maximum.bas", dense);
+    defer dense_program.deinit();
+    try expectProgramOk(&dense_program);
+    try std.testing.expect(dense_program.source.ptr == dense_pointer);
+    try std.testing.expectEqual(
+        @as(u32, core.frontend.maximum_source_bytes + 1),
+        dense_program.compile_stats.token_capacity,
+    );
+    try std.testing.expectEqual(@as(usize, 196_609), dense_program.instructions.len);
+    try std.testing.expectEqual(@as(usize, 1), dense_program.constants.len);
+    try std.testing.expectEqual(@as(u32, 65_536), dense_program.compile_stats.constant_lookups);
+    try std.testing.expectEqual(@as(u32, 65_535), dense_program.compile_stats.constant_reuses);
+    try std.testing.expect(dense_program.compile_stats.allocator_allocations <= 128);
+    try std.testing.expect(dense_program.compile_stats.allocator_copy_bytes <= 8 * 1024 * 1024);
+    try std.testing.expect(dense_program.compile_stats.compiler_peak_bytes <= 20 * 1024 * 1024);
+    try std.testing.expect(dense_program.compile_stats.program_bytes <= 8 * 1024 * 1024);
+}
+
+test "constant interning is bit exact and floating parsing leaves source unchanged" {
+    const source =
+        "A%=1\n" ++
+        "B%=1\n" ++
+        "C!=1.5\n" ++
+        "D!=1.5\n" ++
+        "E#=1D2\n" ++
+        "F#=1d2\n" ++
+        "S$=\"same\"\n" ++
+        "T$=\"same\"\n" ++
+        "END\n";
+    var program = try core.compiler.compile(std.testing.allocator, "intern.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    try std.testing.expectEqualStrings(source, program.source);
+    try std.testing.expectEqual(@as(usize, 4), program.constants.len);
+    try std.testing.expectEqual(@as(u32, 8), program.compile_stats.constant_lookups);
+    try std.testing.expectEqual(@as(u32, 4), program.compile_stats.constant_reuses);
+    try std.testing.expect(program.compile_stats.constant_max_probe <= 16);
+
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(64, 16));
+    try expectInteger(&machine, "A%", 1);
+    try expectInteger(&machine, "B%", 1);
+    try expectSingle(&machine, "C!", 1.5);
+    try expectSingle(&machine, "D!", 1.5);
+    try expectDouble(&machine, "E#", 100.0);
+    try expectDouble(&machine, "F#", 100.0);
+    try expectString(&machine, "S$", "same");
+    try expectString(&machine, "T$", "same");
+}
+
+test "compiler diagnostics retain twenty details and count the truncated remainder" {
+    const allocator = std.testing.allocator;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(allocator);
+    for (0..1_000) |_| try source.appendSlice(allocator, "A=\n");
+
+    var program = try core.compiler.compile(allocator, "diagnostics.bas", source.items);
+    defer program.deinit();
+    try std.testing.expect(!program.ok());
+    try std.testing.expectEqual(core.compiler.maximum_stored_diagnostics, program.diagnostics.len);
+    try std.testing.expect(program.diagnostics_total > program.diagnostics.len);
+    try std.testing.expect(program.diagnostics_truncated);
+    try std.testing.expectEqual(program.diagnostics_total, program.compile_stats.diagnostics_total);
+    try std.testing.expectEqual(
+        @as(u16, @intCast(program.diagnostics.len)),
+        program.compile_stats.diagnostics_stored,
+    );
+    try std.testing.expect(program.compile_stats.diagnostics_truncated);
+    for (program.diagnostics) |diagnostic| try std.testing.expectEqual(core.bytecode.DiagnosticCode.expected_expression, diagnostic.code);
+}
+
+test "compiler expression depth is deterministic for parentheses unary and power" {
+    const allocator = std.testing.allocator;
+    const Shape = enum { parentheses, unary, power };
+    for ([_]Shape{ .parentheses, .unary, .power }) |shape| {
+        for ([_]bool{ true, false }) |accepted| {
+            const nested = core.frontend.maximum_expression_depth - 1 + @intFromBool(!accepted);
+            var source: std.ArrayList(u8) = .empty;
+            defer source.deinit(allocator);
+            try source.appendSlice(allocator, "A%=");
+            switch (shape) {
+                .parentheses => {
+                    try source.appendNTimes(allocator, '(', nested);
+                    try source.append(allocator, '1');
+                    try source.appendNTimes(allocator, ')', nested);
+                },
+                .unary => {
+                    try source.appendNTimes(allocator, '+', nested);
+                    try source.append(allocator, '1');
+                },
+                .power => {
+                    try source.append(allocator, '1');
+                    for (0..nested) |_| try source.appendSlice(allocator, "^1");
+                },
+            }
+            try source.append(allocator, '\n');
+
+            var program = try core.compiler.compile(allocator, "depth.bas", source.items);
+            defer program.deinit();
+            if (accepted) {
+                try expectProgramOk(&program);
+                try std.testing.expectEqual(
+                    @as(u16, @intCast(core.frontend.maximum_expression_depth)),
+                    program.compile_stats.maximum_expression_depth,
+                );
+            } else {
+                try std.testing.expect(!program.ok());
+                try std.testing.expect(containsCompileDiagnostic(program.diagnostics, .expression_too_deep));
+            }
+        }
+    }
 }
 
 test "core VM executes the prepared instruction program" {

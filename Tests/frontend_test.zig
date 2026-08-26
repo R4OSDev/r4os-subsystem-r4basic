@@ -159,6 +159,61 @@ test "keyword matching preserves the original source spelling" {
     try std.testing.expectEqualStrings("DeFiNt", tokens[0].text(source));
 }
 
+test "token census follows lexical demand instead of source bytes" {
+    const allocator = std.testing.allocator;
+    const sparse = try allocator.alloc(u8, frontend.maximum_source_bytes);
+    defer allocator.free(sparse);
+    @memset(sparse, 'A');
+    @memcpy(sparse[0..4], "REM ");
+    try std.testing.expectEqual(@as(usize, 1), frontend.countTokens(sparse));
+
+    const dense = try allocator.alloc(u8, frontend.maximum_source_bytes);
+    defer allocator.free(dense);
+    for (0..dense.len / 4) |index| @memcpy(dense[index * 4 ..][0..4], "A=1:");
+    try std.testing.expectEqual(frontend.maximum_source_bytes + 1, frontend.countTokens(dense));
+}
+
+test "expression depth accepts its boundary and rejects the next recursive level" {
+    const allocator = std.testing.allocator;
+    const Shape = enum { parentheses, unary, power };
+    for ([_]Shape{ .parentheses, .unary, .power }) |shape| {
+        for ([_]bool{ true, false }) |accepted| {
+            const nested = frontend.maximum_expression_depth - 1 + @intFromBool(!accepted);
+            var source: std.ArrayList(u8) = .empty;
+            defer source.deinit(allocator);
+            try source.appendSlice(allocator, "A=");
+            switch (shape) {
+                .parentheses => {
+                    try source.appendNTimes(allocator, '(', nested);
+                    try source.append(allocator, '1');
+                    try source.appendNTimes(allocator, ')', nested);
+                },
+                .unary => {
+                    try source.appendNTimes(allocator, '+', nested);
+                    try source.append(allocator, '1');
+                },
+                .power => {
+                    try source.append(allocator, '1');
+                    for (0..nested) |_| try source.appendSlice(allocator, "^1");
+                },
+            }
+            try source.append(allocator, '\n');
+            const result = frontend.analyzeNamed("depth.bas", source.items, tokens[0..], diagnostics[0..]);
+            if (accepted) {
+                if (!result.ok()) dumpDiagnostics(source.items, result);
+                try std.testing.expect(result.ok());
+                try std.testing.expectEqual(
+                    @as(u16, @intCast(frontend.maximum_expression_depth)),
+                    result.summary.maximum_expression_depth,
+                );
+            } else {
+                try std.testing.expect(!result.ok());
+                try std.testing.expect(containsCode(result, .expression_too_deep));
+            }
+        }
+    }
+}
+
 test "all supported and unsupported keywords use bounded case-insensitive lookup" {
     const allocator = std.testing.allocator;
     var source: std.ArrayList(u8) = .empty;

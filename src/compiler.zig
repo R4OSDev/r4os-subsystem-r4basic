@@ -11,6 +11,7 @@ pub const maximum_block_depth: usize = 128;
 pub const maximum_array_dimensions: usize = 60;
 pub const maximum_record_types: usize = 4_096;
 pub const maximum_record_fields: usize = 4_096;
+pub const maximum_stored_diagnostics: usize = 20;
 
 pub const CompilePhase = enum(u8) {
     lexical,
@@ -30,6 +31,99 @@ pub const CompileObserver = struct {
 
     fn update(self: CompileObserver, progress: CompileProgress) bool {
         return self.update_fn(self.context, progress);
+    }
+};
+
+const AllocationTracker = struct {
+    backing: std.mem.Allocator,
+    active_bytes: u64 = 0,
+    peak_bytes: u64 = 0,
+    allocation_calls: u64 = 0,
+    reallocation_calls: u64 = 0,
+    copy_bytes: u64 = 0,
+    adopted_source_bytes: u32 = 0,
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = allocate,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn allocator(self: *AllocationTracker) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn adoptSource(self: *AllocationTracker, byte_count: usize) void {
+        self.adopted_source_bytes = @intCast(byte_count);
+        self.addActive(byte_count);
+    }
+
+    fn populate(self: AllocationTracker, stats: *bytecode.CompileStats) void {
+        stats.allocator_allocations = self.allocation_calls;
+        stats.allocator_reallocations = self.reallocation_calls;
+        stats.allocator_copy_bytes = self.copy_bytes;
+        stats.compiler_peak_bytes = self.peak_bytes;
+        stats.program_bytes = self.active_bytes;
+        stats.adopted_source_bytes = self.adopted_source_bytes;
+    }
+
+    fn allocate(raw_context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *AllocationTracker = @ptrCast(@alignCast(raw_context));
+        const memory = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.allocation_calls +|= 1;
+        self.addActive(len);
+        return memory;
+    }
+
+    fn resize(
+        raw_context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
+        const self: *AllocationTracker = @ptrCast(@alignCast(raw_context));
+        self.reallocation_calls +|= 1;
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.replaceActive(memory.len, new_len, false);
+        return true;
+    }
+
+    fn remap(
+        raw_context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        const self: *AllocationTracker = @ptrCast(@alignCast(raw_context));
+        self.reallocation_calls +|= 1;
+        const replacement = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse {
+            self.copy_bytes +|= @intCast(@min(memory.len, new_len));
+            return null;
+        };
+        const moved = replacement != memory.ptr;
+        if (moved) self.copy_bytes +|= @intCast(@min(memory.len, new_len));
+        self.replaceActive(memory.len, new_len, moved);
+        return replacement;
+    }
+
+    fn free(raw_context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *AllocationTracker = @ptrCast(@alignCast(raw_context));
+        self.backing.rawFree(memory, alignment, ret_addr);
+        self.active_bytes -|= @intCast(memory.len);
+    }
+
+    fn addActive(self: *AllocationTracker, byte_count: usize) void {
+        self.active_bytes +|= @intCast(byte_count);
+        self.peak_bytes = @max(self.peak_bytes, self.active_bytes);
+    }
+
+    fn replaceActive(self: *AllocationTracker, old_len: usize, new_len: usize, moved: bool) void {
+        if (moved) self.peak_bytes = @max(self.peak_bytes, self.active_bytes +| @as(u64, @intCast(new_len)));
+        self.active_bytes -|= @intCast(old_len);
+        self.addActive(new_len);
     }
 };
 
@@ -187,6 +281,103 @@ const NameIndex = struct {
     }
 };
 
+const ConstantIndex = struct {
+    const Slot = struct {
+        hash: u32 = 0,
+        index_plus_one: u32 = 0,
+    };
+
+    slots: []Slot = &.{},
+    count: usize = 0,
+
+    fn deinit(self: *ConstantIndex, allocator: std.mem.Allocator) void {
+        if (self.slots.len != 0) allocator.free(self.slots);
+        self.* = .{};
+    }
+
+    fn find(
+        self: *const ConstantIndex,
+        source: []const u8,
+        constants: []const bytecode.Constant,
+        constant: bytecode.Constant,
+        stats: *bytecode.CompileStats,
+    ) ?u32 {
+        stats.constant_lookups +%= 1;
+        if (self.slots.len == 0) return null;
+        const hash = constantHash(source, constant);
+        var slot_index: usize = @intCast(hash & @as(u32, @intCast(self.slots.len - 1)));
+        var probe: usize = 1;
+        while (probe <= self.slots.len) : (probe += 1) {
+            recordConstantProbe(stats, probe);
+            const slot = self.slots[slot_index];
+            if (slot.index_plus_one == 0) return null;
+            const constant_index = slot.index_plus_one - 1;
+            if (slot.hash == hash and constants[constant_index].eql(source, constant)) return constant_index;
+            slot_index = (slot_index + 1) & (self.slots.len - 1);
+        }
+        return null;
+    }
+
+    fn insert(
+        self: *ConstantIndex,
+        allocator: std.mem.Allocator,
+        source: []const u8,
+        constant: bytecode.Constant,
+        constant_index: u32,
+    ) !void {
+        try self.ensureCapacity(allocator);
+        const entry = Slot{
+            .hash = constantHash(source, constant),
+            .index_plus_one = constant_index + 1,
+        };
+        insertRehashed(self.slots, entry);
+        self.count += 1;
+    }
+
+    fn ensureCapacity(self: *ConstantIndex, allocator: std.mem.Allocator) !void {
+        if (self.slots.len != 0 and (self.count + 1) * 10 <= self.slots.len * 7) return;
+        const new_capacity: usize = if (self.slots.len == 0) 16 else self.slots.len * 2;
+        const replacement = try allocator.alloc(Slot, new_capacity);
+        @memset(replacement, .{});
+        for (self.slots) |slot| if (slot.index_plus_one != 0) insertRehashed(replacement, slot);
+        if (self.slots.len != 0) allocator.free(self.slots);
+        self.slots = replacement;
+    }
+
+    fn insertRehashed(slots: []Slot, entry: Slot) void {
+        var slot_index: usize = @intCast(entry.hash & @as(u32, @intCast(slots.len - 1)));
+        while (slots[slot_index].index_plus_one != 0) slot_index = (slot_index + 1) & (slots.len - 1);
+        slots[slot_index] = entry;
+    }
+};
+
+fn constantHash(source: []const u8, constant: bytecode.Constant) u32 {
+    var hash: u32 = 2_166_136_261;
+    hashByte(&hash, @intFromEnum(std.meta.activeTag(constant)));
+    switch (constant) {
+        .integer => |value| hashInteger(&hash, @as(u16, @bitCast(value))),
+        .long => |value| hashInteger(&hash, @as(u32, @bitCast(value))),
+        .single => |value| hashInteger(&hash, @as(u32, @bitCast(value))),
+        .double => |value| hashInteger(&hash, @as(u64, @bitCast(value))),
+        .string => |span| for (span.bytes(source)) |byte| hashByte(&hash, byte),
+    }
+    return hash;
+}
+
+fn hashInteger(hash: *u32, value: anytype) void {
+    inline for (0..@sizeOf(@TypeOf(value))) |shift| hashByte(hash, @truncate(value >> @intCast(shift * 8)));
+}
+
+fn hashByte(hash: *u32, value: u8) void {
+    hash.* ^= value;
+    hash.* *%= 16_777_619;
+}
+
+fn recordConstantProbe(stats: *bytecode.CompileStats, probe: usize) void {
+    stats.constant_probes +%= 1;
+    stats.constant_max_probe = @max(stats.constant_max_probe, @as(u16, @intCast(@min(probe, std.math.maxInt(u16)))));
+}
+
 fn nameHash(source: []const u8, scope: u32, name: frontend.Span) u64 {
     var hash: u64 = 14_695_981_039_346_656_037 ^ @as(u64, scope);
     for (name.bytes(source)) |byte| {
@@ -285,8 +476,89 @@ const Block = struct {
     }
 };
 
+const CapacityHints = struct {
+    instructions: usize = 16,
+    constants: usize = 8,
+    globals: usize = 8,
+    procedures: usize = 4,
+    record_types: usize = 4,
+    data_items: usize = 8,
+    labels: usize = 8,
+    label_fixups: usize = 8,
+    data_fixups: usize = 4,
+    blocks: usize = 8,
+
+    fn fromTokens(tokens: []const frontend.Token) CapacityHints {
+        var active_tokens: usize = 0;
+        var literal_count: usize = 0;
+        var identifier_count: usize = 0;
+        var procedure_count: usize = 0;
+        var record_count: usize = 0;
+        var data_count: usize = 0;
+        var label_count: usize = 0;
+        var label_fixup_count: usize = 0;
+        var data_fixup_count: usize = 0;
+        var in_data = false;
+        var expect_data_item = false;
+
+        for (tokens, 0..) |token, index| {
+            if (token.kind == .newline or token.kind == .colon or token.kind == .eof) {
+                in_data = false;
+                expect_data_item = false;
+                continue;
+            }
+            if (in_data) {
+                if (token.kind == .comma) {
+                    expect_data_item = true;
+                } else if (expect_data_item) {
+                    data_count += 1;
+                    expect_data_item = false;
+                }
+                continue;
+            }
+
+            active_tokens += 1;
+            if (token.kind == .number or token.kind == .string) literal_count += 1;
+            if (token.kind == .identifier) {
+                identifier_count += 1;
+                if (index + 1 < tokens.len and tokens[index + 1].kind == .colon) label_count += 1;
+            }
+            if (token.kind != .keyword) continue;
+            switch (token.keyword) {
+                .data => {
+                    in_data = true;
+                    expect_data_item = true;
+                },
+                .declare, .def, .sub, .function => procedure_count += 1,
+                .type => record_count += 1,
+                .goto_, .gosub => label_fixup_count += 1,
+                .restore => data_fixup_count += 1,
+                else => {},
+            }
+        }
+
+        const instruction_hint = @min(
+            maximum_instructions,
+            @max(@as(usize, 16), active_tokens + 1),
+        );
+        return .{
+            .instructions = instruction_hint,
+            .constants = @max(@as(usize, 8), @min(literal_count, 256)),
+            .globals = @max(@as(usize, 8), @min(identifier_count / 8 + 1, 256)),
+            .procedures = @max(@as(usize, 4), @min(procedure_count, maximum_procedures)),
+            .record_types = @max(@as(usize, 4), @min(record_count, maximum_record_types)),
+            .data_items = @max(@as(usize, 8), data_count),
+            .labels = @max(@as(usize, 8), label_count),
+            .label_fixups = @max(@as(usize, 8), label_fixup_count),
+            .data_fixups = @max(@as(usize, 4), data_fixup_count),
+            .blocks = 8,
+        };
+    }
+};
+
 const Builder = struct {
     allocator: std.mem.Allocator,
+    program_allocator: std.mem.Allocator,
     file_name: []u8,
     source: []u8,
     tokens: []const frontend.Token,
@@ -302,6 +574,7 @@ const Builder = struct {
     label_fixups: std.ArrayList(LabelFixup) = .empty,
     data_fixups: std.ArrayList(DataFixup) = .empty,
     blocks: std.ArrayList(Block) = .empty,
+    constant_index: ConstantIndex = .{},
     global_names: NameIndex = .{},
     procedure_names: NameIndex = .{},
     record_names: NameIndex = .{},
@@ -315,6 +588,9 @@ const Builder = struct {
     current_procedure_skip: u32 = bytecode.invalid_index,
     arrays_dynamic: bool = false,
     stopped: bool = false,
+    diagnostics_total: u32 = 0,
+    diagnostics_truncated: bool = false,
+    expression_depth: usize = 0,
 
     fn deinit(self: *Builder) void {
         for (self.procedures.items) |*procedure| procedure.deinit(self.allocator);
@@ -331,12 +607,41 @@ const Builder = struct {
         self.label_fixups.deinit(self.allocator);
         self.data_fixups.deinit(self.allocator);
         self.blocks.deinit(self.allocator);
+        self.constant_index.deinit(self.allocator);
         self.global_names.deinit(self.allocator);
         self.procedure_names.deinit(self.allocator);
         self.record_names.deinit(self.allocator);
         self.label_names.deinit(self.allocator);
         self.allocator.free(self.source);
         self.allocator.free(self.file_name);
+    }
+
+    fn reserve(self: *Builder, hints: CapacityHints) !void {
+        try self.instructions.ensureTotalCapacityPrecise(self.allocator, hints.instructions);
+        try self.constants.ensureTotalCapacityPrecise(self.allocator, hints.constants);
+        try self.globals.ensureTotalCapacityPrecise(self.allocator, hints.globals);
+        try self.procedures.ensureTotalCapacityPrecise(self.allocator, hints.procedures);
+        try self.record_types.ensureTotalCapacityPrecise(self.allocator, hints.record_types);
+        try self.data_items.ensureTotalCapacityPrecise(self.allocator, hints.data_items);
+        try self.diagnostics.ensureTotalCapacityPrecise(self.allocator, maximum_stored_diagnostics);
+        try self.labels.ensureTotalCapacityPrecise(self.allocator, hints.labels);
+        try self.label_fixups.ensureTotalCapacityPrecise(self.allocator, hints.label_fixups);
+        try self.data_fixups.ensureTotalCapacityPrecise(self.allocator, hints.data_fixups);
+        try self.blocks.ensureTotalCapacityPrecise(self.allocator, hints.blocks);
+        self.stats.list_reservations = 11;
+        self.stats.initial_list_bytes = @intCast(
+            self.instructions.capacity * @sizeOf(bytecode.Instruction) +
+                self.constants.capacity * @sizeOf(bytecode.Constant) +
+                self.globals.capacity * @sizeOf(bytecode.Variable) +
+                self.procedures.capacity * @sizeOf(ProcedureBuilder) +
+                self.record_types.capacity * @sizeOf(RecordTypeBuilder) +
+                self.data_items.capacity * @sizeOf(bytecode.DataItem) +
+                self.diagnostics.capacity * @sizeOf(bytecode.Diagnostic) +
+                self.labels.capacity * @sizeOf(Label) +
+                self.label_fixups.capacity * @sizeOf(LabelFixup) +
+                self.data_fixups.capacity * @sizeOf(DataFixup) +
+                self.blocks.capacity * @sizeOf(Block),
+        );
     }
 
     fn parse(self: *Builder) !void {
@@ -466,6 +771,12 @@ const Builder = struct {
 
     fn tokenText(self: Builder, token: frontend.Token) []const u8 {
         return token.text(self.source);
+    }
+
+    fn mutableTokenText(self: *Builder, token: frontend.Token) []u8 {
+        const first: usize = @min(self.source.len, @as(usize, token.span.start));
+        const last: usize = @min(self.source.len, @as(usize, token.span.end));
+        return self.source[first..@max(first, last)];
     }
 
     fn namesEqual(self: Builder, first: frontend.Span, second: frontend.Span) bool {
@@ -996,7 +1307,7 @@ const Builder = struct {
             }
             if (self.at(.number)) {
                 const token = self.advance();
-                const constant = parseSignedNumericConstant(self.allocator, self.tokenText(token), negative) catch {
+                const constant = parseSignedNumericConstant(self.mutableTokenText(token), negative) catch {
                     try self.addDiagnostic(.invalid_number, token.span);
                     return false;
                 };
@@ -1933,6 +2244,8 @@ const Builder = struct {
     }
 
     fn parseExpression(self: *Builder) std.mem.Allocator.Error!?bytecode.ValueType {
+        if (!try self.enterExpression(self.current().span)) return null;
+        defer self.leaveExpression();
         return self.parseLogicalOr();
     }
 
@@ -1975,7 +2288,10 @@ const Builder = struct {
     fn parseLogicalNot(self: *Builder) !?bytecode.ValueType {
         if (self.consumeKeyword(.not)) {
             const operator = self.tokens[self.index - 1];
-            const operand = (try self.parseLogicalNot()) orelse return null;
+            if (!try self.enterExpression(operator.span)) return null;
+            const nested = try self.parseLogicalNot();
+            self.leaveExpression();
+            const operand = nested orelse return null;
             if (!operand.isNumeric()) try self.addDiagnostic(.type_mismatch, operator.span);
             _ = try self.emit(.logical_not, bytecode.encodeValueType(.long), 0, operator.span);
             return .long;
@@ -2058,10 +2374,19 @@ const Builder = struct {
     }
 
     fn parseArithmeticUnary(self: *Builder) std.mem.Allocator.Error!?bytecode.ValueType {
-        if (self.consume(.plus)) return self.parseArithmeticUnary();
+        if (self.consume(.plus)) {
+            const operator = self.tokens[self.index - 1];
+            if (!try self.enterExpression(operator.span)) return null;
+            const nested = try self.parseArithmeticUnary();
+            self.leaveExpression();
+            return nested;
+        }
         if (self.consume(.minus)) {
             const operator = self.tokens[self.index - 1];
-            const operand = (try self.parseArithmeticUnary()) orelse return null;
+            if (!try self.enterExpression(operator.span)) return null;
+            const nested = try self.parseArithmeticUnary();
+            self.leaveExpression();
+            const operand = nested orelse return null;
             if (!operand.isNumeric()) try self.addDiagnostic(.type_mismatch, operator.span);
             _ = try self.emit(.negate, bytecode.encodeValueType(operand), 0, operator.span);
             return operand;
@@ -2073,13 +2398,34 @@ const Builder = struct {
         var left = (try self.parsePrimary()) orelse return null;
         if (self.consume(.power)) {
             const operator = self.tokens[self.index - 1];
-            const right = (try self.parseArithmeticUnary()) orelse return null;
+            if (!try self.enterExpression(operator.span)) return null;
+            const nested = try self.parseArithmeticUnary();
+            self.leaveExpression();
+            const right = nested orelse return null;
             if (!left.isNumeric() or !right.isNumeric()) try self.addDiagnostic(.type_mismatch, operator.span);
             const result_type: bytecode.ValueType = if (left == .double or right == .double) .double else .single;
             _ = try self.emit(.power, bytecode.encodeValueType(result_type), 0, operator.span);
             left = result_type;
         }
         return left;
+    }
+
+    fn enterExpression(self: *Builder, span: frontend.Span) !bool {
+        if (self.expression_depth >= frontend.maximum_expression_depth) {
+            try self.addDiagnostic(.expression_too_deep, span);
+            return false;
+        }
+        self.expression_depth += 1;
+        self.stats.maximum_expression_depth = @max(
+            self.stats.maximum_expression_depth,
+            @as(u16, @intCast(self.expression_depth)),
+        );
+        return true;
+    }
+
+    fn leaveExpression(self: *Builder) void {
+        std.debug.assert(self.expression_depth != 0);
+        self.expression_depth -= 1;
     }
 
     fn parsePrimary(self: *Builder) !?bytecode.ValueType {
@@ -2120,8 +2466,8 @@ const Builder = struct {
 
     fn parseNumber(self: *Builder) !?bytecode.ValueType {
         const token = self.advance();
-        const text = self.tokenText(token);
-        const constant = parseNumericConstant(self.allocator, text) catch {
+        const text = self.mutableTokenText(token);
+        const constant = parseNumericConstant(text) catch {
             try self.addDiagnostic(.invalid_number, token.span);
             return null;
         };
@@ -2132,6 +2478,10 @@ const Builder = struct {
     }
 
     fn addConstant(self: *Builder, constant: bytecode.Constant) !u32 {
+        if (self.constant_index.find(self.source, self.constants.items, constant, &self.stats)) |existing| {
+            self.stats.constant_reuses +%= 1;
+            return existing;
+        }
         if (self.constants.items.len >= maximum_constants) {
             try self.addDiagnostic(.capacity_exceeded, self.current().span);
             self.stopped = true;
@@ -2139,6 +2489,7 @@ const Builder = struct {
         }
         const index: u32 = @intCast(self.constants.items.len);
         try self.constants.append(self.allocator, constant);
+        try self.constant_index.insert(self.allocator, self.source, constant, index);
         return index;
     }
 
@@ -2651,6 +3002,9 @@ const Builder = struct {
     fn finish(self: *Builder) !bytecode.Program {
         self.stats.label_fixups = @intCast(self.label_fixups.items.len);
         self.stats.data_fixups = @intCast(self.data_fixups.items.len);
+        self.stats.diagnostics_total = self.diagnostics_total;
+        self.stats.diagnostics_stored = @intCast(self.diagnostics.items.len);
+        self.stats.diagnostics_truncated = self.diagnostics_truncated;
         var owned_procedures: std.ArrayList(bytecode.Procedure) = .empty;
         var owned_record_types: std.ArrayList(bytecode.RecordType) = .empty;
         errdefer {
@@ -2724,9 +3078,10 @@ const Builder = struct {
         self.procedure_names.deinit(self.allocator);
         self.record_names.deinit(self.allocator);
         self.label_names.deinit(self.allocator);
+        self.constant_index.deinit(self.allocator);
 
         return .{
-            .allocator = self.allocator,
+            .allocator = self.program_allocator,
             .file_name = self.file_name,
             .source = self.source,
             .instructions = instructions,
@@ -2736,16 +3091,37 @@ const Builder = struct {
             .record_types = record_types,
             .data_items = data_items,
             .diagnostics = diagnostics,
+            .diagnostics_total = self.diagnostics_total,
+            .diagnostics_truncated = self.diagnostics_truncated,
             .module_entry = 0,
             .compile_stats = self.stats,
         };
     }
 
     fn addDiagnostic(self: *Builder, code: bytecode.DiagnosticCode, span: frontend.Span) !void {
+        self.diagnostics_total +|= 1;
+        if (self.diagnostics.items.len >= maximum_stored_diagnostics) {
+            self.diagnostics_truncated = true;
+            return;
+        }
         try self.diagnostics.append(self.allocator, .{
             .code = code,
             .span = span,
             .file_name = self.file_name,
+        });
+    }
+
+    fn addFrontendDiagnostic(self: *Builder, diagnostic: frontend.Diagnostic) !void {
+        self.diagnostics_total +|= 1;
+        if (self.diagnostics.items.len >= maximum_stored_diagnostics) {
+            self.diagnostics_truncated = true;
+            return;
+        }
+        try self.diagnostics.append(self.allocator, .{
+            .code = .lexical_error,
+            .span = diagnostic.span,
+            .file_name = self.file_name,
+            .frontend_code = diagnostic.code,
         });
     }
 
@@ -2863,7 +3239,7 @@ const FrontendObserverBridge = struct {
 };
 
 pub fn compile(allocator: std.mem.Allocator, file_name: []const u8, source: []const u8) !bytecode.Program {
-    return compileObserved(allocator, file_name, source, null);
+    return compileInternal(allocator, file_name, .{ .borrowed = source }, null);
 }
 
 pub fn compileObserved(
@@ -2872,56 +3248,111 @@ pub fn compileObserved(
     source: []const u8,
     observer: ?CompileObserver,
 ) !bytecode.Program {
-    const owned_file_name = try allocator.dupe(u8, file_name);
-    var builder_owns_source = false;
-    errdefer if (!builder_owns_source) allocator.free(owned_file_name);
-    const owned_source = try allocator.dupe(u8, source);
-    errdefer if (!builder_owns_source) allocator.free(owned_source);
+    return compileInternal(allocator, file_name, .{ .borrowed = source }, observer);
+}
 
-    const token_capacity = @max(@as(usize, 1), owned_source.len + 1);
-    const tokens = try allocator.alloc(frontend.Token, token_capacity);
-    defer allocator.free(tokens);
-    const lexical_diagnostics = try allocator.alloc(frontend.Diagnostic, frontend.recommended_diagnostic_capacity);
-    defer allocator.free(lexical_diagnostics);
+pub fn compileOwned(allocator: std.mem.Allocator, file_name: []const u8, source: []u8) !bytecode.Program {
+    return compileInternal(allocator, file_name, .{ .owned = source }, null);
+}
 
-    var bridge: FrontendObserverBridge = undefined;
-    const frontend_observer: ?frontend.TokenizeObserver = if (observer) |value| blk: {
-        bridge = .{ .observer = value };
-        break :blk .{ .context = &bridge, .update_fn = FrontendObserverBridge.update };
-    } else null;
-    const lexed = frontend.tokenizeNamedObserved(owned_file_name, owned_source, tokens, lexical_diagnostics, frontend_observer);
-    if (lexed.cancelled) return error.Cancelled;
-    var builder = Builder{
-        .allocator = allocator,
-        .file_name = owned_file_name,
-        .source = owned_source,
-        .tokens = tokens[0..lexed.token_count],
-        .observer = observer,
-        .stats = .{
-            .source_bytes = @intCast(owned_source.len),
-            .tokens = @intCast(lexed.token_count),
-            .keyword_lookups = lexed.keyword_lookups,
-            .keyword_probes = lexed.keyword_probes,
-            .keyword_max_probe = lexed.keyword_max_probe,
-            .progress_updates = lexed.progress_updates,
+pub fn compileOwnedObserved(
+    allocator: std.mem.Allocator,
+    file_name: []const u8,
+    source: []u8,
+    observer: ?CompileObserver,
+) !bytecode.Program {
+    return compileInternal(allocator, file_name, .{ .owned = source }, observer);
+}
+
+const SourceInput = union(enum) {
+    borrowed: []const u8,
+    owned: []u8,
+};
+
+fn compileInternal(
+    allocator: std.mem.Allocator,
+    file_name: []const u8,
+    input: SourceInput,
+    observer: ?CompileObserver,
+) !bytecode.Program {
+    var tracker = AllocationTracker{ .backing = allocator };
+    const compile_allocator = tracker.allocator();
+    var unclaimed_source: ?[]u8 = switch (input) {
+        .borrowed => null,
+        .owned => |source| source,
+    };
+    errdefer if (unclaimed_source) |source| allocator.free(source);
+
+    const owned_file_name = try compile_allocator.dupe(u8, file_name);
+    var builder_owns_file = false;
+    errdefer if (!builder_owns_file) compile_allocator.free(owned_file_name);
+    const owned_source = switch (input) {
+        .borrowed => |source| try compile_allocator.dupe(u8, source),
+        .owned => blk: {
+            const source = unclaimed_source.?;
+            tracker.adoptSource(source.len);
+            unclaimed_source = null;
+            break :blk source;
         },
     };
-    builder_owns_source = true;
-    errdefer builder.deinit();
+    var builder_owns_source = false;
+    errdefer if (!builder_owns_source) compile_allocator.free(owned_source);
 
-    for (lexical_diagnostics[0..lexed.diagnostic_count]) |diagnostic| {
-        try builder.diagnostics.append(allocator, .{
-            .code = .lexical_error,
-            .span = diagnostic.span,
+    var program: bytecode.Program = undefined;
+    {
+        const token_capacity = frontend.countTokens(owned_source);
+        const tokens = try compile_allocator.alloc(frontend.Token, token_capacity);
+        defer compile_allocator.free(tokens);
+        const lexical_diagnostics = try compile_allocator.alloc(frontend.Diagnostic, frontend.recommended_diagnostic_capacity);
+        defer compile_allocator.free(lexical_diagnostics);
+
+        var bridge: FrontendObserverBridge = undefined;
+        const frontend_observer: ?frontend.TokenizeObserver = if (observer) |value| blk: {
+            bridge = .{ .observer = value };
+            break :blk .{ .context = &bridge, .update_fn = FrontendObserverBridge.update };
+        } else null;
+        const lexed = frontend.tokenizeNamedObserved(
+            owned_file_name,
+            owned_source,
+            tokens,
+            lexical_diagnostics,
+            frontend_observer,
+        );
+        if (lexed.cancelled) return error.Cancelled;
+        var builder = Builder{
+            .allocator = compile_allocator,
+            .program_allocator = allocator,
             .file_name = owned_file_name,
-            .frontend_code = diagnostic.code,
-        });
+            .source = owned_source,
+            .tokens = tokens[0..lexed.token_count],
+            .observer = observer,
+            .stats = .{
+                .source_bytes = @intCast(owned_source.len),
+                .tokens = @intCast(lexed.token_count),
+                .token_capacity = @intCast(token_capacity),
+                .token_bytes = @as(u64, @intCast(token_capacity)) * @sizeOf(frontend.Token),
+                .keyword_lookups = lexed.keyword_lookups,
+                .keyword_probes = lexed.keyword_probes,
+                .keyword_max_probe = lexed.keyword_max_probe,
+                .progress_updates = lexed.progress_updates,
+            },
+        };
+        builder_owns_file = true;
+        builder_owns_source = true;
+        errdefer builder.deinit();
+        try builder.reserve(CapacityHints.fromTokens(builder.tokens));
+
+        for (lexical_diagnostics[0..lexed.diagnostic_count]) |diagnostic| {
+            try builder.addFrontendDiagnostic(diagnostic);
+        }
+        if (lexed.diagnostics_truncated) {
+            try builder.addDiagnostic(.capacity_exceeded, .{ .start = 0, .end = 0, .line = 1, .column = 1 });
+        }
+        if (lexed.token_count != 0 and lexed.ok()) try builder.parse();
+        program = try builder.finish();
     }
-    if (lexed.diagnostics_truncated) {
-        try builder.addDiagnostic(.capacity_exceeded, .{ .start = 0, .end = 0, .line = 1, .column = 1 });
-    }
-    if (lexed.token_count != 0 and lexed.ok()) try builder.parse();
-    return builder.finish();
+    tracker.populate(&program.compile_stats);
+    return program;
 }
 
 fn comparisonOp(kind: frontend.TokenKind) ?bytecode.OpCode {
@@ -2968,7 +3399,7 @@ fn builtinForKeyword(keyword: frontend.Keyword) ?bytecode.Builtin {
     };
 }
 
-fn parseNumericConstant(allocator: std.mem.Allocator, text: []const u8) !bytecode.Constant {
+fn parseNumericConstant(text: []u8) !bytecode.Constant {
     if (text.len == 0) return error.InvalidCharacter;
     var end = text.len;
     var suffix: ?u8 = null;
@@ -2979,9 +3410,13 @@ fn parseNumericConstant(allocator: std.mem.Allocator, text: []const u8) !bytecod
     const number_text = text[0..end];
     var floating = false;
     var double_exponent = false;
-    for (number_text) |byte| {
+    var double_exponent_index: ?usize = null;
+    for (number_text, 0..) |byte, index| {
         if (byte == '.' or byte == 'E' or byte == 'e' or byte == 'D' or byte == 'd') floating = true;
-        if (byte == 'D' or byte == 'd') double_exponent = true;
+        if (byte == 'D' or byte == 'd') {
+            double_exponent = true;
+            double_exponent_index = index;
+        }
     }
 
     if (!floating and suffix != '!' and suffix != '#') {
@@ -2999,12 +3434,15 @@ fn parseNumericConstant(allocator: std.mem.Allocator, text: []const u8) !bytecod
         return error.Overflow;
     }
 
-    const normalized = try allocator.dupe(u8, number_text);
-    defer allocator.free(normalized);
-    for (normalized) |*byte| {
-        if (byte.* == 'D' or byte.* == 'd') byte.* = 'E';
+    var original_exponent: u8 = 0;
+    if (double_exponent_index) |index| {
+        original_exponent = number_text[index];
+        number_text[index] = 'E';
     }
-    const number = try std.fmt.parseFloat(f64, normalized);
+    defer {
+        if (double_exponent_index) |index| number_text[index] = original_exponent;
+    }
+    const number = try std.fmt.parseFloat(f64, number_text);
     if (!std.math.isFinite(number)) return error.Overflow;
     if (suffix == '%') return .{ .integer = try values.roundToInteger(number) };
     if (suffix == '&') return .{ .long = try values.roundToLong(number) };
@@ -3014,8 +3452,8 @@ fn parseNumericConstant(allocator: std.mem.Allocator, text: []const u8) !bytecod
     return .{ .single = single };
 }
 
-fn parseSignedNumericConstant(allocator: std.mem.Allocator, text: []const u8, negative: bool) !bytecode.Constant {
-    const constant = try parseNumericConstant(allocator, text);
+fn parseSignedNumericConstant(text: []u8, negative: bool) !bytecode.Constant {
+    const constant = try parseNumericConstant(text);
     if (!negative) return constant;
     return switch (constant) {
         .integer => |number| if (number == std.math.minInt(i16)) error.Overflow else .{ .integer = -number },

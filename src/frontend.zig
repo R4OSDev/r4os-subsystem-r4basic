@@ -3,6 +3,7 @@ const std = @import("std");
 pub const contract_version = "1.0.0";
 pub const maximum_source_bytes: usize = 256 * 1024;
 pub const maximum_identifier_bytes: usize = 40;
+pub const maximum_expression_depth: usize = 128;
 pub const recommended_token_capacity: usize = 24 * 1024;
 pub const recommended_diagnostic_capacity: usize = 128;
 
@@ -39,6 +40,7 @@ pub const DiagnosticCode = enum {
     unmatched_block,
     unclosed_block,
     nesting_too_deep,
+    expression_too_deep,
 };
 
 pub const Diagnostic = struct {
@@ -67,6 +69,7 @@ pub const Diagnostic = struct {
             .unmatched_block => "block terminator does not match the active block",
             .unclosed_block => "block is not closed before end of source",
             .nesting_too_deep => "BASIC block nesting is too deep",
+            .expression_too_deep => "BASIC expression nesting is too deep",
         };
     }
 };
@@ -228,6 +231,7 @@ pub const ProgramSummary = struct {
     user_types: u32 = 0,
     metacommands: u32 = 0,
     maximum_block_depth: u16 = 0,
+    maximum_expression_depth: u16 = 0,
 };
 
 pub const Result = struct {
@@ -355,6 +359,20 @@ pub fn tokenizeNamedObserved(
     };
 }
 
+pub fn countTokens(source: []const u8) usize {
+    if (source.len > maximum_source_bytes) return 1;
+    var no_diagnostics: [0]Diagnostic = .{};
+    var sink = DiagnosticSink{ .storage = no_diagnostics[0..], .file_name = "" };
+    var lexer = Lexer{
+        .source = source,
+        .tokens = &.{},
+        .diagnostics = &sink,
+        .count_only = true,
+    };
+    lexer.run();
+    return @max(@as(usize, 1), lexer.count);
+}
+
 const KeywordLookupStats = struct {
     lookups: u64 = 0,
     probes: u64 = 0,
@@ -380,10 +398,11 @@ const Lexer = struct {
     next_progress: usize = 0,
     progress_updates: u32 = 0,
     cancelled: bool = false,
+    count_only: bool = false,
     keyword_stats: KeywordLookupStats = .{},
 
     fn run(self: *Lexer) void {
-        if (self.tokens.len == 0) {
+        if (!self.count_only and self.tokens.len == 0) {
             self.diagnostics.add(.token_capacity_exceeded, self.pointSpan());
             return;
         }
@@ -428,7 +447,7 @@ const Lexer = struct {
             .line = self.line,
             .column = self.column,
         });
-        if (self.count == self.tokens.len and self.tokens[self.count - 1].kind != .eof) {
+        if (!self.count_only and self.count == self.tokens.len and self.tokens[self.count - 1].kind != .eof) {
             self.tokens[self.count - 1] = .{ .kind = .eof, .span = self.pointSpan() };
         }
         _ = self.reportProgress();
@@ -499,7 +518,7 @@ const Lexer = struct {
             return;
         }
 
-        const keyword = keywordFor(text, &self.keyword_stats);
+        const keyword = if (self.count_only) Keyword.none else keywordFor(text, &self.keyword_stats);
         self.emit(if (keyword == .none) .identifier else .keyword, keyword, self.makeSpan(start, self.index, line, column));
         self.statement_start = false;
     }
@@ -588,6 +607,10 @@ const Lexer = struct {
     }
 
     fn emit(self: *Lexer, kind: TokenKind, keyword: Keyword, span: Span) void {
+        if (self.count_only) {
+            self.count += 1;
+            return;
+        }
         if (self.count >= self.tokens.len) {
             if (!self.capacity_reported) {
                 self.diagnostics.add(.token_capacity_exceeded, span);
@@ -852,6 +875,7 @@ const Parser = struct {
     summary: ProgramSummary = .{},
     blocks: [128]Block = undefined,
     block_count: usize = 0,
+    expression_depth: usize = 0,
 
     fn run(self: *Parser) void {
         while (!self.at(.eof)) {
@@ -1463,6 +1487,8 @@ const Parser = struct {
     }
 
     fn parseExpression(self: *Parser) bool {
+        if (!self.enterExpression(self.current().span)) return false;
+        defer self.leaveExpression();
         if (!self.parseBinary(1)) return false;
         self.summary.expressions += 1;
         return true;
@@ -1473,18 +1499,41 @@ const Parser = struct {
         while (binaryPrecedence(self.current()) >= minimum_precedence) {
             const precedence = binaryPrecedence(self.current());
             const right_associative = self.current().kind == .power;
+            const operator = self.current();
             self.advance();
-            if (!self.parseBinary(if (right_associative) precedence else precedence + 1)) return false;
+            if (!self.enterExpression(operator.span)) return false;
+            const parsed = self.parseBinary(if (right_associative) precedence else precedence + 1);
+            self.leaveExpression();
+            if (!parsed) return false;
         }
         return true;
     }
 
     fn parseUnary(self: *Parser) bool {
         if (self.at(.plus) or self.at(.minus) or self.atKeyword(.not)) {
+            const operator = self.current();
             self.advance();
-            return self.parseUnary();
+            if (!self.enterExpression(operator.span)) return false;
+            const parsed = self.parseUnary();
+            self.leaveExpression();
+            return parsed;
         }
         return self.parsePrimary();
+    }
+
+    fn enterExpression(self: *Parser, span: Span) bool {
+        if (self.expression_depth >= maximum_expression_depth) return self.failAt(.expression_too_deep, span);
+        self.expression_depth += 1;
+        self.summary.maximum_expression_depth = @max(
+            self.summary.maximum_expression_depth,
+            @as(u16, @intCast(self.expression_depth)),
+        );
+        return true;
+    }
+
+    fn leaveExpression(self: *Parser) void {
+        std.debug.assert(self.expression_depth != 0);
+        self.expression_depth -= 1;
     }
 
     fn parsePrimary(self: *Parser) bool {

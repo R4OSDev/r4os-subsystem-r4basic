@@ -63,7 +63,8 @@ pub fn r4_app_main(app: *r4os.App) i32 {
             @errorName(fault),
         });
     };
-    defer allocator.free(source);
+    var source_owned = true;
+    defer if (source_owned) allocator.free(source);
     timeline.source_end_ns = monotonicNow(sys);
     if (trace.baseline and (!std.ascii.eqlIgnoreCase(launch.guest_path, canonical_baseline_path) or !canonicalBaselineSource(source))) {
         return writeBaselineFailure(&files, trace, "source-identity", 67);
@@ -98,7 +99,9 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         baseName(launch.guest_path),
         &timeline,
     );
-    var program = compiler.compileObserved(allocator, launch.guest_path, source, compile_progress.observer()) catch |fault| {
+    const compile_vm_before = r4os.vm_allocator.stats();
+    source_owned = false;
+    var program = compiler.compileOwnedObserved(allocator, launch.guest_path, source, compile_progress.observer()) catch |fault| {
         if (fault == error.Cancelled) {
             if (compile_progress.failure != 0) {
                 if (trace.baseline) return writeBaselineFailure(&files, trace, "compile-progress", compile_progress.failure);
@@ -112,6 +115,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
             @errorName(fault),
         });
     };
+    const compile_vm_memory = CompileVmMemory.capture(compile_vm_before, r4os.vm_allocator.stats());
     defer program.deinit();
     timeline.compile_end_ns = monotonicNow(sys);
     if (!program.ok()) {
@@ -196,6 +200,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         source.len,
         program.instructions.len,
         program.compile_stats,
+        compile_vm_memory,
         baseName(launch.guest_path),
     );
     runtime_host.runtime = &runtime;
@@ -519,6 +524,32 @@ fn canonicalBaselineSource(source: []const u8) bool {
     return std.mem.eql(u8, canonical_baseline_sha256[0..], digest[0..]);
 }
 
+const CompileVmMemory = struct {
+    allocations: u64,
+    frees: u64,
+    active_before: u64,
+    active_after: u64,
+    peak_active: u64,
+    reserved_before: u64,
+    reserved_after: u64,
+    committed_before: u64,
+    committed_after: u64,
+
+    fn capture(before: r4os.vm_allocator.Stats, after: r4os.vm_allocator.Stats) CompileVmMemory {
+        return .{
+            .allocations = after.allocations -| before.allocations,
+            .frees = after.frees -| before.frees,
+            .active_before = before.active_bytes,
+            .active_after = after.active_bytes,
+            .peak_active = after.peak_active_bytes,
+            .reserved_before = before.reserved_bytes,
+            .reserved_after = after.reserved_bytes,
+            .committed_before = before.committed_bytes,
+            .committed_after = after.committed_bytes,
+        };
+    }
+};
+
 fn writeBaselineFailure(files: *const r4os.Files, trace: LaunchTrace, reason: []const u8, code: i32) i32 {
     var report_storage: [256]u8 = undefined;
     const report = std.fmt.bufPrint(report_storage[0..], "R4BASIC baseline: FAILED id={s} reason={s} code={d}\r\n", .{
@@ -542,6 +573,7 @@ const RuntimeHost = struct {
     source_bytes: usize,
     program_instructions: usize,
     compile_stats: @import("bytecode.zig").CompileStats,
+    compile_vm_memory: CompileVmMemory,
     runtime: ?*runtime_api.Runtime = null,
     title: [title_capacity]u8 = [_]u8{0} ** title_capacity,
     title_len: usize = 0,
@@ -561,6 +593,7 @@ const RuntimeHost = struct {
         source_bytes: usize,
         program_instructions: usize,
         compile_stats: @import("bytecode.zig").CompileStats,
+        compile_vm_memory: CompileVmMemory,
         guest_name: []const u8,
     ) RuntimeHost {
         var self = RuntimeHost{
@@ -574,6 +607,7 @@ const RuntimeHost = struct {
             .source_bytes = source_bytes,
             .program_instructions = program_instructions,
             .compile_stats = compile_stats,
+            .compile_vm_memory = compile_vm_memory,
         };
         const value = std.fmt.bufPrintZ(self.title[0..], "R4BASIC - {s}", .{guest_name}) catch "R4BASIC";
         self.title_len = value.len;
@@ -651,7 +685,7 @@ const RuntimeHost = struct {
         self.observeRuntime();
         const runtime = self.runtime orelse return false;
         const presenter = self.window.video.stats;
-        var report_storage: [3072]u8 = undefined;
+        var report_storage: [4096]u8 = undefined;
         var report_len: usize = 0;
         const header = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC {s}: OK id={s} mode={s} guest={s} source_bytes={d} bytecode={d}\r\n", .{
             if (self.trace.baseline) "baseline" else "trace",
@@ -684,8 +718,9 @@ const RuntimeHost = struct {
             self.timeline.first_frame_ns,
         }) catch return false;
         report_len += timeline.len;
-        const compiler_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC compiler: tokens={d} keyword_lookups={d} keyword_probes={d} keyword_max_probe={d} name_lookups={d} name_insertions={d} name_probes={d} name_max_probe={d} index_rebuilds={d} label_fixups={d} data_fixups={d} reused_bindings={d} progress_updates={d}\r\n", .{
+        const compiler_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC compiler: tokens={d} token_capacity={d} keyword_lookups={d} keyword_probes={d} keyword_max_probe={d} name_lookups={d} name_insertions={d} name_probes={d} name_max_probe={d} index_rebuilds={d} constant_lookups={d} constant_reuses={d} constant_probes={d} constant_max_probe={d} label_fixups={d} data_fixups={d} reused_bindings={d} expression_depth={d} progress_updates={d}\r\n", .{
             self.compile_stats.tokens,
+            self.compile_stats.token_capacity,
             self.compile_stats.keyword_lookups,
             self.compile_stats.keyword_probes,
             self.compile_stats.keyword_max_probe,
@@ -694,12 +729,43 @@ const RuntimeHost = struct {
             self.compile_stats.name_probes,
             self.compile_stats.name_max_probe,
             self.compile_stats.index_rebuilds,
+            self.compile_stats.constant_lookups,
+            self.compile_stats.constant_reuses,
+            self.compile_stats.constant_probes,
+            self.compile_stats.constant_max_probe,
             self.compile_stats.label_fixups,
             self.compile_stats.data_fixups,
             self.compile_stats.reused_statement_bindings,
+            self.compile_stats.maximum_expression_depth,
             self.compile_stats.progress_updates,
         }) catch return false;
         report_len += compiler_line.len;
+        const compiler_memory_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC compiler-memory: token_bytes={d} initial_list_bytes={d} allocations={d} reallocations={d} copy_bytes={d} peak_bytes={d} program_bytes={d} adopted_source_bytes={d} diagnostics_total={d} diagnostics_stored={d} diagnostics_truncated={d}\r\n", .{
+            self.compile_stats.token_bytes,
+            self.compile_stats.initial_list_bytes,
+            self.compile_stats.allocator_allocations,
+            self.compile_stats.allocator_reallocations,
+            self.compile_stats.allocator_copy_bytes,
+            self.compile_stats.compiler_peak_bytes,
+            self.compile_stats.program_bytes,
+            self.compile_stats.adopted_source_bytes,
+            self.compile_stats.diagnostics_total,
+            self.compile_stats.diagnostics_stored,
+            @intFromBool(self.compile_stats.diagnostics_truncated),
+        }) catch return false;
+        report_len += compiler_memory_line.len;
+        const compiler_vm_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC compiler-vm: allocations={d} frees={d} active_before={d} active_after={d} peak_active={d} reserved_before={d} reserved_after={d} committed_before={d} committed_after={d}\r\n", .{
+            self.compile_vm_memory.allocations,
+            self.compile_vm_memory.frees,
+            self.compile_vm_memory.active_before,
+            self.compile_vm_memory.active_after,
+            self.compile_vm_memory.peak_active,
+            self.compile_vm_memory.reserved_before,
+            self.compile_vm_memory.reserved_after,
+            self.compile_vm_memory.committed_before,
+            self.compile_vm_memory.committed_after,
+        }) catch return false;
+        report_len += compiler_vm_line.len;
         const runtime_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC runtime: requested_operations={d} executed_operations={d} slices={d} yields={d} sleeps={d} present_attempts={d} presents={d} skipped_presents={d}\r\n", .{
             runtime.stats.requested_operations,
             runtime.stats.executed_operations,
@@ -754,8 +820,9 @@ fn showCompilerDiagnostics(
     draw: r4os.r4draw.Context,
     program: *const @import("bytecode.zig").Program,
 ) i32 {
-    var lines: [20][160]u8 = undefined;
-    var views: [22][]const u8 = undefined;
+    var lines: [compiler.maximum_stored_diagnostics][160]u8 = undefined;
+    var truncation_line: [160]u8 = undefined;
+    var views: [compiler.maximum_stored_diagnostics + 3][]const u8 = undefined;
     views[0] = "Die BASIC-Datei enthaelt Syntax- oder Bindefehler:";
     views[1] = program.file_name;
     var count: usize = 2;
@@ -765,6 +832,12 @@ fn showCompilerDiagnostics(
             diagnostic.span.column,
             diagnostic.message(),
         }) catch "Diagnose konnte nicht formatiert werden";
+        count += 1;
+    }
+    if (program.diagnostics_truncated) {
+        views[count] = std.fmt.bufPrint(truncation_line[0..], "Weitere Diagnosen wurden nicht gespeichert ({d} Fehler insgesamt).", .{
+            program.diagnostics_total,
+        }) catch "Weitere Diagnosen wurden nicht gespeichert.";
         count += 1;
     }
     return showStatus(allocator, sys, desk, draw, "R4BASIC - Syntaxfehler", views[0..count]);
