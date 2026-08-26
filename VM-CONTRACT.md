@@ -1,6 +1,6 @@
 ﻿# R4BASIC v1 core VM contract
 
-Contract version: `1.8.0`
+Contract version: `1.9.0`
 
 This document freezes the executable R4BASIC language layers. The broader
 source syntax accepted by the frontend remains defined in
@@ -215,11 +215,13 @@ guest address can become an R4OS or host pointer.
   with sixteen attributes. Graphics primitives remain illegal in mode 0.
   Pixels are indexed bytes and the mutable 256-entry XRGB palette is separate,
   so `PALETTE` recolors existing graphics pixels immediately.
-- Mode changes allocate a fresh surface atomically, reset the default
-  CGA/EGA palette, current graphics point, and text geometry, and mark one
-  full damage rectangle. An injected unavailable mode raises catchable BASIC
-  error 5 without replacing the previous surface, which permits the normal
-  `ON ERROR` fallback from mode 9 to mode 1.
+- Mode changes reset the default CGA/EGA palette, current graphics point and
+  text geometry, clear every target pixel, and mark one full damage rectangle.
+  A same-size surface allocation is retained and cleared; a different size is
+  allocated atomically before the previous surface is released. An injected
+  unavailable mode raises catchable BASIC error 5 without replacing the
+  previous surface, which permits the normal `ON ERROR` fallback from mode 9
+  to mode 1.
 - Coordinates apply BASIC numeric rounding before clipping. `PSET` clips
   silently, `POINT` returns the stored attribute or `-1` outside the screen,
   and `LINE` uses the current point for `STEP`. Boxes, filled boxes, arcs,
@@ -229,9 +231,15 @@ guest address can become an R4OS or host pointer.
   per pixel; mode 9 stores four one-bit planes per scan line. `PUT` decodes
   the same representation with exact `PSET` or attribute-wise `XOR` and
   rejects an image extending outside the guest surface. LONG DATA therefore
-  remains bit-exact and needs no program-specific conversion.
+  remains bit-exact and needs no program-specific conversion. On the x86_64
+  target the compact numeric storage is already the required little-endian
+  raw view: `GET` writes only the image prefix and `PUT` reads only the bytes
+  named by its header, without serializing an oversized array.
 - Pixel changes, palette changes, and text-cell rasterization merge into one
-  damage rectangle. The runtime adapter hands an Indexed8 surface to
+  damage rectangle. Text rows, clipped line pixels, solid spans, scanline
+  flood-fill runs and decoded image rows accumulate that rectangle locally
+  and advance the content revision once per changed operation. The runtime
+  adapter hands an Indexed8 surface to
   `r4os.subsystem_host`; it never calls R4DRAW for individual primitives.
   A 640 by 350 full frame becomes fifteen bounded raster blocks, later
   changes use damage frames, and an unchanged guest image publishes no frame.
@@ -372,7 +380,11 @@ guest address can become an R4OS or host pointer.
   after unrelated numeric instructions. VM, adapter, and runtime statistics
   expose observer, metadata, cell-resolution, conversion, comparison, TIMER,
   clock, adaptive-block, host-cycle, event-wait, yield, zero-progress,
-  frame-age/backlog/result, file-host, and ns/instruction evidence.
+  frame-age/backlog/result, file-host, and ns/instruction evidence. Raster
+  statistics additionally expose allocation/reuse and clear bytes, logical
+  pixel/span work, damage commits, text rows, clipped line work, flood-fill
+  spans and queue bounds, requested/emitted/skipped circle segments, and the
+  exact packed byte prefixes consumed by `GET` and `PUT`.
 - Reset constructs a fresh global-value and aggregate set before discarding
   the old state, then clears stacks, DATA cursor, handlers, trapped error,
   private segment and byte, text screen, keyboard and input line, guest-time

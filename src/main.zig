@@ -1038,6 +1038,40 @@ const RuntimeHost = struct {
             vm_stats.maximum_timer_wake_lateness_ns,
         }) catch return false;
         report_len += vm_line.len;
+        const raster = vm_stats.raster;
+        const raster_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC raster: mode_allocations={d} mode_reuses={d} mode_clear_bytes={d} pixel_probes={d} pixel_changes={d} spans={d} span_pixels={d} damage_commits={d} text_cells={d} text_rows={d} line_segments={d} line_pixels={d} fill_spans={d} paint_spans={d} paint_pixels={d} paint_probes={d} paint_pushes={d} paint_pops={d} paint_duplicate_pops={d} paint_grows={d} paint_queue_max={d} circle_requested={d} circle_segments={d} circle_skipped={d} capture_calls={d} capture_pixels={d} capture_bytes={d} put_calls={d} put_pixels={d} put_bytes={d}\r\n", .{
+            raster.mode_allocations,
+            raster.mode_reuses,
+            raster.mode_clear_bytes,
+            raster.pixel_probes,
+            raster.pixel_changes,
+            raster.span_operations,
+            raster.span_pixels,
+            raster.damage_commits,
+            raster.text_cells,
+            raster.text_rows,
+            raster.line_segments,
+            raster.line_pixels,
+            raster.fill_spans,
+            raster.paint_spans,
+            raster.paint_pixels,
+            raster.paint_pixel_probes,
+            raster.paint_queue_pushes,
+            raster.paint_queue_pops,
+            raster.paint_duplicate_pops,
+            raster.paint_queue_grows,
+            raster.maximum_paint_queue,
+            raster.circle_requested_segments,
+            raster.circle_segments,
+            raster.circle_skipped_segments,
+            raster.capture_calls,
+            raster.capture_pixels,
+            raster.capture_bytes,
+            raster.put_calls,
+            raster.put_pixels,
+            raster.put_bytes,
+        }) catch return false;
+        report_len += raster_line.len;
         const ownership_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC ownership: compile_borrowed={d} string_clones={d} string_clone_bytes={d} builtin_borrowed={d} builtin_owned={d} procedure_calls={d} local_pool_grows={d} local_pool_reuses={d} local_initializations={d} local_initialization_bytes={d} local_aggregate_initializations={d} format_stack_uses={d} str_result_allocations={d} val_direct={d} val_stack={d} val_scratch={d} val_scratch_grows={d}\r\n", .{
             self.compile_stats.borrowed_builtin_arguments,
             vm_stats.string_clones,

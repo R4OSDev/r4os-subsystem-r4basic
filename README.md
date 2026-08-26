@@ -23,7 +23,7 @@ graphics retain their normal bounded pacing without repeated scratch work.
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.9`
+- Module version: `1.2.10`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -56,7 +56,7 @@ this repository and is read directly from the ignored workspace injection
 tree. The normal test step uses the permanent general BAS fixtures under
 `Tests/Fixtures`, including the standalone audio contract.
 
-R4BASIC 1.2.9 uses a shared 262,144-instruction ceiling with adaptive bounded
+R4BASIC 1.2.10 uses a shared 262,144-instruction ceiling with adaptive bounded
 clock blocks and an 8-ms production time boundary. Active work requests a
 scheduler yield at most once per 8-ms interval; input-only waits, pause and
 static status windows block on the Desktop activity sequence. The first guest
@@ -69,6 +69,13 @@ atomic bounded `REDIM`, and bounded formatting/VAL storage. `/PERFTEST` prints
 separate QEMU-readable numeric, 4-KB assignment, LEN, UCASE$, call and array
 markers plus an exact summary. The productive artifact remains the canonical
 GUI subsystem host and uses its measured module-local `OPTIMIZE=speed` profile.
+
+Text rows, lines, filled regions and flood fill now commit one accumulated
+damage region per operation. Same-size `SCREEN` changes clear and reuse their
+surface, invisible full-circle polygons are rejected before their segment
+trigonometry, and numeric-array `GET`/`PUT` use only the packed image prefix
+without a whole-array conversion buffer. Pixel-exact full-raster hashes and
+the unchanged checksum-bound GORILLA acceptance guard the QBasic output.
 
 The build starters map the current local R4OS SDK and Contract checkouts from
 `Settings.R4S`. The URL and hash in `build.zig.zon` record the last verified

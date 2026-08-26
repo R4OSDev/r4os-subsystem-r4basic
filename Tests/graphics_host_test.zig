@@ -4,6 +4,15 @@ const r4os = @import("r4os");
 
 const host = r4os.subsystem_host;
 
+fn imageHash(bytes: []const u8) u64 {
+    var result: u64 = 0xcbf29ce484222325;
+    for (bytes) |byte| {
+        result ^= byte;
+        result *%= 0x100000001b3;
+    }
+    return result;
+}
+
 const FakeBackend = struct {
     full_begins: u32 = 0,
     damage_begins: u32 = 0,
@@ -177,4 +186,149 @@ test "R4BASIC publishes full damage and unchanged frames through the subsystem h
     const reset_view = machine.graphicsView() orelse return error.MissingResetGraphicsView;
     try std.testing.expect(reset_view.mode_revision != previous_mode_revision);
     try std.testing.expect(try adapter.syncVideo(&presenter));
+}
+
+test "text raster has a pixel-exact reference image" {
+    var text: core.text_screen.Screen = .{};
+    try text.setColor(14, 1);
+    try text.locate(2, 3, null, null, null);
+    text.write("R4Basic 0.69.61");
+    try text.setColor(10, 4);
+    try text.locate(9, 17, null, null, null);
+    text.write("Raster reference");
+
+    var screen: core.graphics_screen.Screen = .{};
+    defer screen.deinit(std.testing.allocator);
+    try screen.setMode(std.testing.allocator, 0);
+    _ = screen.takeDamage();
+    const before = screen.performanceStats();
+    screen.renderText(&text, text.takeDirty() orelse return error.MissingTextDamage);
+    const after = screen.performanceStats();
+    const view = screen.view() orelse return error.MissingTextRaster;
+    try std.testing.expectEqual(@as(u64, 0xa533e9d9dcbd63f1), imageHash(view.pixels));
+    try std.testing.expectEqual(@as(u64, 2_000), after.text_cells - before.text_cells);
+    try std.testing.expectEqual(@as(u64, 400), after.text_rows - before.text_rows);
+    try std.testing.expectEqual(@as(u64, 400), after.span_operations - before.span_operations);
+    try std.testing.expectEqual(@as(u64, 256_000), after.span_pixels - before.span_pixels);
+    try std.testing.expectEqual(@as(u64, 256_000), after.pixel_probes - before.pixel_probes);
+    try std.testing.expect(after.pixel_changes > before.pixel_changes);
+    try std.testing.expectEqual(@as(u64, 1), after.damage_commits - before.damage_commits);
+
+    _ = screen.takeDamage();
+    screen.renderText(&text, .{ .x = 0, .y = 0, .w = 80, .h = 25 });
+    const unchanged = screen.performanceStats();
+    try std.testing.expectEqual(after.damage_commits, unchanged.damage_commits);
+    try std.testing.expect(screen.takeDamage() == null);
+}
+
+test "graphics primitives and packed images have pixel-exact references" {
+    var screen: core.graphics_screen.Screen = .{};
+    defer screen.deinit(std.testing.allocator);
+    try screen.setMode(std.testing.allocator, 9);
+    _ = screen.takeDamage();
+
+    try screen.pset(.{ .x = 3, .y = 4 }, 12);
+    try screen.line(.{ .x = -20, .y = 8 }, .{ .x = 130, .y = 93 }, 2, .line);
+    try screen.line(.{ .x = 25, .y = 30 }, .{ .x = 105, .y = 82 }, 4, .box);
+    try screen.line(.{ .x = 115, .y = 24 }, .{ .x = 172, .y = 68 }, 5, .filled_box);
+    try screen.line(.{ .x = 205, .y = 35 }, .{ .x = 282, .y = 104 }, 15, .box);
+    try screen.paint(std.testing.allocator, .{ .x = 220, .y = 50 }, 3, 15);
+    try screen.circle(.{ .x = 170, .y = 150 }, 43, 11, null, null, null);
+    try screen.circle(.{ .x = 285, .y = 165 }, 67, 13, -0.35, -4.95, 0.72);
+
+    const packed_image = try screen.capture(std.testing.allocator, .{ .x = 8, .y = 6 }, .{ .x = 327, .y = 205 });
+    defer std.testing.allocator.free(packed_image);
+    try screen.put(.{ .x = 315, .y = 125 }, packed_image, .pset);
+    try screen.put(.{ .x = 315, .y = 125 }, packed_image, .xor);
+    try screen.put(.{ .x = 315, .y = 125 }, packed_image, .xor);
+
+    const view = screen.view() orelse return error.MissingGraphicsRaster;
+    try std.testing.expectEqual(@as(u64, 0x2c649185395d9fe1), imageHash(view.pixels));
+    try std.testing.expectEqual(@as(u64, 0xf09378bb86921a3e), imageHash(packed_image));
+}
+
+test "filled regions and PAINT use one damage commit and bounded spans" {
+    var screen: core.graphics_screen.Screen = .{};
+    defer screen.deinit(std.testing.allocator);
+    try screen.setMode(std.testing.allocator, 9);
+    _ = screen.takeDamage();
+    const box_before = screen.performanceStats();
+    try screen.line(.{ .x = 10, .y = 20 }, .{ .x = 67, .y = 64 }, 6, .filled_box);
+    const box_after = screen.performanceStats();
+    try std.testing.expectEqual(@as(u64, 45), box_after.fill_spans - box_before.fill_spans);
+    try std.testing.expectEqual(@as(u64, 45), box_after.span_operations - box_before.span_operations);
+    try std.testing.expectEqual(@as(u64, 58 * 45), box_after.span_pixels - box_before.span_pixels);
+    try std.testing.expectEqual(@as(u64, 1), box_after.damage_commits - box_before.damage_commits);
+
+    try screen.setMode(std.testing.allocator, 1);
+    _ = screen.takeDamage();
+    const paint_before = screen.performanceStats();
+    try screen.paint(std.testing.allocator, .{ .x = 0, .y = 0 }, 1, 1);
+    const paint_after = screen.performanceStats();
+    try std.testing.expectEqual(@as(u64, 200), paint_after.paint_spans - paint_before.paint_spans);
+    try std.testing.expectEqual(@as(u64, 64_000), paint_after.paint_pixels - paint_before.paint_pixels);
+    try std.testing.expectEqual(@as(u64, 200), paint_after.paint_queue_pushes - paint_before.paint_queue_pushes);
+    try std.testing.expectEqual(@as(u64, 200), paint_after.paint_queue_pops - paint_before.paint_queue_pops);
+    try std.testing.expectEqual(@as(u64, 0), paint_after.paint_duplicate_pops - paint_before.paint_duplicate_pops);
+    try std.testing.expect(paint_after.maximum_paint_queue <= 2);
+    try std.testing.expectEqual(@as(u64, 1), paint_after.damage_commits - paint_before.damage_commits);
+}
+
+test "invisible huge circles skip their complete trigonometric segment set" {
+    var screen: core.graphics_screen.Screen = .{};
+    defer screen.deinit(std.testing.allocator);
+    try screen.setMode(std.testing.allocator, 9);
+    _ = screen.takeDamage();
+    const before = screen.performanceStats();
+    try screen.circle(.{ .x = 320, .y = 175 }, 1_000_000, 7, null, null, null);
+    const after = screen.performanceStats();
+    try std.testing.expectEqual(@as(u64, 16_384), after.circle_requested_segments - before.circle_requested_segments);
+    try std.testing.expectEqual(@as(u64, 16_384), after.circle_skipped_segments - before.circle_skipped_segments);
+    try std.testing.expectEqual(before.circle_segments, after.circle_segments);
+    try std.testing.expectEqual(before.pixel_changes, after.pixel_changes);
+    try std.testing.expectEqual(before.damage_commits, after.damage_commits);
+    try std.testing.expect(screen.takeDamage() == null);
+}
+
+test "same-mode SCREEN reuses and clears its pixel allocation" {
+    var screen: core.graphics_screen.Screen = .{};
+    defer screen.deinit(std.testing.allocator);
+    try screen.setMode(std.testing.allocator, 9);
+    const original_pointer = screen.pixels.?.ptr;
+    try screen.pset(.{ .x = 12, .y = 13 }, 8);
+    try screen.setMode(std.testing.allocator, 9);
+    try std.testing.expectEqual(original_pointer, screen.pixels.?.ptr);
+    try std.testing.expectEqual(@as(i32, 0), try screen.point(.{ .x = 12, .y = 13 }));
+    const stats = screen.performanceStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.mode_allocations);
+    try std.testing.expectEqual(@as(u64, 1), stats.mode_reuses);
+    try std.testing.expectEqual(@as(u64, 2 * 640 * 350), stats.mode_clear_bytes);
+}
+
+test "VM GET and PUT expose only the packed image prefix of a large numeric array" {
+    const source =
+        \\DEFINT A-Z
+        \\DIM Sprite&(0 TO 30000)
+        \\Sprite&(30000) = 123456789
+        \\SCREEN 9
+        \\LINE (0, 0)-(7, 7), 9, BF
+        \\GET (0, 0)-(7, 7), Sprite&
+        \\PUT (20, 20), Sprite&, PSET
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "packed-prefix.bas", source);
+    defer program.deinit();
+    try std.testing.expect(program.ok());
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(4096, 32));
+
+    try std.testing.expectEqual(@as(i32, 123456789), machine.globalArrayElement("Sprite&", &.{30000}).?.long);
+    const raster = machine.performanceStats().raster;
+    try std.testing.expectEqual(@as(u64, 1), raster.capture_calls);
+    try std.testing.expectEqual(@as(u64, 64), raster.capture_pixels);
+    try std.testing.expectEqual(@as(u64, 36), raster.capture_bytes);
+    try std.testing.expectEqual(@as(u64, 1), raster.put_calls);
+    try std.testing.expectEqual(@as(u64, 64), raster.put_pixels);
+    try std.testing.expectEqual(@as(u64, 36), raster.put_bytes);
 }

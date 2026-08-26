@@ -29,6 +29,39 @@ pub const View = struct {
     content_revision: u64,
 };
 
+pub const PerformanceStats = struct {
+    mode_allocations: u64 = 0,
+    mode_reuses: u64 = 0,
+    mode_clear_bytes: u64 = 0,
+    pixel_probes: u64 = 0,
+    pixel_changes: u64 = 0,
+    span_operations: u64 = 0,
+    span_pixels: u64 = 0,
+    damage_commits: u64 = 0,
+    text_cells: u64 = 0,
+    text_rows: u64 = 0,
+    line_segments: u64 = 0,
+    line_pixels: u64 = 0,
+    fill_spans: u64 = 0,
+    paint_spans: u64 = 0,
+    paint_pixels: u64 = 0,
+    paint_pixel_probes: u64 = 0,
+    paint_queue_pushes: u64 = 0,
+    paint_queue_pops: u64 = 0,
+    paint_duplicate_pops: u64 = 0,
+    paint_queue_grows: u64 = 0,
+    maximum_paint_queue: u64 = 0,
+    circle_requested_segments: u64 = 0,
+    circle_segments: u64 = 0,
+    circle_skipped_segments: u64 = 0,
+    capture_calls: u64 = 0,
+    capture_pixels: u64 = 0,
+    capture_bytes: u64 = 0,
+    put_calls: u64 = 0,
+    put_pixels: u64 = 0,
+    put_bytes: u64 = 0,
+};
+
 const mode_1_width: u32 = 320;
 const mode_1_height: u32 = 200;
 const mode_9_width: u32 = 640;
@@ -48,6 +81,42 @@ const maximum_circle_segments: usize = 16_384;
 const ega_16_codes = [_]u8{ 0, 1, 2, 3, 4, 5, 20, 7, 56, 57, 58, 59, 60, 61, 62, 63 };
 const screen_1_defaults = [_]u8{ 0, 11, 13, 15 };
 
+const Mutation = struct {
+    damage: ?Rect = null,
+
+    fn notePoint(self: *Mutation, x: u32, y: u32) void {
+        self.noteRect(.{ .x = x, .y = y, .w = 1, .h = 1 });
+    }
+
+    fn noteSpan(self: *Mutation, x: u32, y: u32, width: u32) void {
+        self.noteRect(.{ .x = x, .y = y, .w = width, .h = 1 });
+    }
+
+    fn noteRect(self: *Mutation, requested: Rect) void {
+        if (requested.w == 0 or requested.h == 0) return;
+        if (self.damage) |current| {
+            const x = @min(current.x, requested.x);
+            const y = @min(current.y, requested.y);
+            const right = @max(current.x + current.w, requested.x + requested.w);
+            const bottom = @max(current.y + current.h, requested.y + requested.h);
+            self.damage = .{ .x = x, .y = y, .w = right - x, .h = bottom - y };
+        } else {
+            self.damage = requested;
+        }
+    }
+};
+
+const ImageLayout = struct {
+    left: i32,
+    top: i32,
+    width: usize,
+    height: usize,
+    width_bits: usize,
+    row_bytes: usize,
+    planes: usize,
+    byte_count: usize,
+};
+
 pub const Screen = struct {
     pixels: ?[]u8 = null,
     palette: [256]u32 = [_]u32{0} ** 256,
@@ -58,6 +127,7 @@ pub const Screen = struct {
     mode_revision: u64 = 1,
     content_revision: u64 = 1,
     damage: ?Rect = null,
+    stats: PerformanceStats = .{},
 
     pub fn deinit(self: *Screen, allocator: std.mem.Allocator) void {
         if (self.pixels) |pixels| allocator.free(pixels);
@@ -88,19 +158,30 @@ pub const Screen = struct {
             else => unreachable,
         };
         const count = std.math.mul(usize, width, height) catch return error.OutOfMemory;
-        const replacement = try allocator.alloc(u8, count);
-        @memset(replacement, 0);
-
-        if (self.pixels) |pixels| allocator.free(pixels);
-        self.pixels = replacement;
+        if (self.pixels != null and self.pixels.?.len == count) {
+            @memset(self.pixels.?, 0);
+            self.stats.mode_reuses +%= 1;
+        } else {
+            const replacement = try allocator.alloc(u8, count);
+            @memset(replacement, 0);
+            if (self.pixels) |pixels| allocator.free(pixels);
+            self.pixels = replacement;
+            self.stats.mode_allocations +%= 1;
+        }
+        self.stats.mode_clear_bytes +%= count;
         self.width = width;
         self.height = height;
         self.mode = mode;
         self.current = .{ .x = 0, .y = 0 };
         self.resetPalette();
         self.damage = .{ .x = 0, .y = 0, .w = width, .h = height };
+        self.stats.damage_commits +%= 1;
         self.mode_revision +%= 1;
         self.content_revision +%= 1;
+    }
+
+    pub fn performanceStats(self: *const Screen) PerformanceStats {
+        return self.stats;
     }
 
     pub fn view(self: *Screen) ?View {
@@ -149,11 +230,14 @@ pub const Screen = struct {
     pub fn clear(self: *Screen, requested_attribute: i32) Error!void {
         const color = try self.attribute(requested_attribute);
         const pixels = self.pixels orelse return error.IllegalFunctionCall;
-        for (pixels) |existing| if (existing != color) {
-            @memset(pixels, color);
-            self.markFull();
-            return;
-        };
+        const unchanged = std.mem.count(u8, pixels, &[_]u8{color});
+        self.stats.pixel_probes +%= pixels.len;
+        if (unchanged == pixels.len) return;
+        @memset(pixels, color);
+        self.stats.pixel_changes +%= pixels.len - unchanged;
+        self.stats.span_operations +%= self.height;
+        self.stats.span_pixels +%= pixels.len;
+        self.markFull();
     }
 
     pub fn resolvePoint(self: *const Screen, x: i32, y: i32, relative: bool) Point {
@@ -167,7 +251,9 @@ pub const Screen = struct {
     pub fn pset(self: *Screen, target: Point, requested_color: i32) Error!void {
         const color = try self.attribute(requested_color);
         self.current = target;
-        self.setPixel(target.x, target.y, color);
+        var mutation: Mutation = .{};
+        self.writePixelChecked(&mutation, target.x, target.y, color);
+        self.commitMutation(mutation);
     }
 
     pub fn point(self: *const Screen, point_value: Point) Error!i32 {
@@ -186,16 +272,18 @@ pub const Screen = struct {
     ) Error!void {
         const color = try self.attribute(requested_color);
         self.current = second;
+        var mutation: Mutation = .{};
         switch (box_mode) {
-            .line => self.drawLine(first, second, color),
+            .line => self.drawLine(&mutation, first, second, color),
             .box => {
-                self.drawLine(first, .{ .x = second.x, .y = first.y }, color);
-                self.drawLine(.{ .x = second.x, .y = first.y }, second, color);
-                self.drawLine(second, .{ .x = first.x, .y = second.y }, color);
-                self.drawLine(.{ .x = first.x, .y = second.y }, first, color);
+                self.drawLine(&mutation, first, .{ .x = second.x, .y = first.y }, color);
+                self.drawLine(&mutation, .{ .x = second.x, .y = first.y }, second, color);
+                self.drawLine(&mutation, second, .{ .x = first.x, .y = second.y }, color);
+                self.drawLine(&mutation, .{ .x = first.x, .y = second.y }, first, color);
             },
-            .filled_box => self.fillBox(first, second, color),
+            .filled_box => self.fillBox(&mutation, first, second, color),
         }
+        self.commitMutation(mutation);
     }
 
     pub fn circle(
@@ -230,17 +318,25 @@ pub const Screen = struct {
         const circumference_hint = @max(radius_x, radius_y) * sweep;
         const segment_float = @ceil(@max(16.0, circumference_hint * 2.0));
         const segments: usize = @intFromFloat(@min(@as(f64, @floatFromInt(maximum_circle_segments)), segment_float));
+        self.stats.circle_requested_segments +%= segments;
+        if (full_circle and !radial_start and !radial_end and !self.ellipsePolygonMayTouchScreen(center, radius_x, radius_y, segments)) {
+            self.stats.circle_skipped_segments +%= segments;
+            return;
+        }
+        self.stats.circle_segments +%= segments;
 
+        var mutation: Mutation = .{};
         var previous = ellipsePoint(center, radius_x, radius_y, start);
-        if (radial_start) self.drawLine(center, previous, color);
+        if (radial_start) self.drawLine(&mutation, center, previous, color);
         var step: usize = 1;
         while (step <= segments) : (step += 1) {
             const ratio = @as(f64, @floatFromInt(step)) / @as(f64, @floatFromInt(segments));
             const next = ellipsePoint(center, radius_x, radius_y, start + sweep * ratio);
-            self.drawLine(previous, next, color);
+            self.drawLine(&mutation, previous, next, color);
             previous = next;
         }
-        if (radial_end) self.drawLine(center, previous, color);
+        if (radial_end) self.drawLine(&mutation, center, previous, color);
+        self.commitMutation(mutation);
     }
 
     pub fn paint(
@@ -260,61 +356,61 @@ pub const Screen = struct {
 
         var pending: std.ArrayList(u32) = .empty;
         defer pending.deinit(allocator);
-        try pending.append(allocator, @intCast(initial_index));
+        try self.appendPaintSeed(&pending, allocator, @intCast(initial_index));
+        var mutation: Mutation = .{};
+        errdefer self.commitMutation(mutation);
         while (pending.pop()) |raw_index| {
+            self.stats.paint_queue_pops +%= 1;
             const index: usize = raw_index;
-            if (pixels[index] != target or pixels[index] == border_color) continue;
-            const x: u32 = @intCast(index % self.width);
-            const y: u32 = @intCast(index / self.width);
-            self.setPixel(@intCast(x), @intCast(y), fill_color);
-            if (x != 0) try pending.append(allocator, raw_index - 1);
-            if (x + 1 < self.width) try pending.append(allocator, raw_index + 1);
-            if (y != 0) try pending.append(allocator, raw_index - self.width);
-            if (y + 1 < self.height) try pending.append(allocator, raw_index + self.width);
+            self.stats.paint_pixel_probes +%= 1;
+            if (pixels[index] != target) {
+                self.stats.paint_duplicate_pops +%= 1;
+                continue;
+            }
+            const row_width: usize = self.width;
+            const y: usize = index / row_width;
+            const row_start = y * row_width;
+            var left = index - row_start;
+            var right = left;
+            while (left != 0) {
+                self.stats.paint_pixel_probes +%= 1;
+                if (pixels[row_start + left - 1] != target) break;
+                left -= 1;
+            }
+            while (right + 1 < row_width) {
+                self.stats.paint_pixel_probes +%= 1;
+                if (pixels[row_start + right + 1] != target) break;
+                right += 1;
+            }
+
+            const span = pixels[row_start + left .. row_start + right + 1];
+            @memset(span, fill_color);
+            self.stats.pixel_changes +%= span.len;
+            self.stats.span_operations +%= 1;
+            self.stats.span_pixels +%= span.len;
+            self.stats.paint_spans +%= 1;
+            self.stats.paint_pixels +%= span.len;
+            mutation.noteSpan(@intCast(left), @intCast(y), @intCast(span.len));
+
+            if (y != 0) try self.appendPaintRuns(&pending, allocator, pixels, row_start - row_width, left, right, target);
+            if (y + 1 < self.height) try self.appendPaintRuns(&pending, allocator, pixels, row_start + row_width, left, right, target);
         }
+        self.commitMutation(mutation);
     }
 
-    pub fn capture(self: *const Screen, allocator: std.mem.Allocator, first: Point, second: Point) Error![]u8 {
-        if (self.mode == 0) return error.IllegalFunctionCall;
-        const pixels = self.pixels orelse return error.IllegalFunctionCall;
-        const left = @min(first.x, second.x);
-        const right = @max(first.x, second.x);
-        const top = @min(first.y, second.y);
-        const bottom = @max(first.y, second.y);
-        if (!self.contains(left, top) or !self.contains(right, bottom)) return error.IllegalFunctionCall;
-        const image_width: usize = @intCast(right - left + 1);
-        const image_height: usize = @intCast(bottom - top + 1);
-        const width_bits: usize = if (self.mode == 1) image_width * 2 else image_width;
-        const row_bytes = (width_bits + 7) / 8;
-        const planes: usize = if (self.mode == 1) 1 else 4;
-        const payload = std.math.mul(usize, row_bytes * planes, image_height) catch return error.OutOfMemory;
-        const result = try allocator.alloc(u8, image_header_bytes + payload);
-        @memset(result, 0);
-        std.mem.writeInt(u16, result[0..2], @intCast(width_bits), .little);
-        std.mem.writeInt(u16, result[2..4], @intCast(image_height), .little);
-
-        var y: usize = 0;
-        while (y < image_height) : (y += 1) {
-            var x: usize = 0;
-            while (x < image_width) : (x += 1) {
-                const source_x: usize = @intCast(left + @as(i32, @intCast(x)));
-                const source_y: usize = @intCast(top + @as(i32, @intCast(y)));
-                const color = pixels[source_y * self.width + source_x];
-                if (self.mode == 1) {
-                    const bit = x * 2;
-                    const shift: u3 = @intCast(6 - (bit & 7));
-                    result[image_header_bytes + y * row_bytes + bit / 8] |= (color & 3) << shift;
-                } else {
-                    var plane: usize = 0;
-                    while (plane < 4) : (plane += 1) {
-                        if ((color & (@as(u8, 1) << @intCast(plane))) == 0) continue;
-                        const offset = image_header_bytes + y * row_bytes * 4 + plane * row_bytes + x / 8;
-                        result[offset] |= @as(u8, 0x80) >> @intCast(x & 7);
-                    }
-                }
-            }
-        }
+    pub fn capture(self: *Screen, allocator: std.mem.Allocator, first: Point, second: Point) Error![]u8 {
+        const layout = try self.imageLayout(first, second);
+        const result = try allocator.alloc(u8, layout.byte_count);
+        errdefer allocator.free(result);
+        self.captureLayoutInto(layout, result);
         return result;
+    }
+
+    pub fn captureInto(self: *Screen, first: Point, second: Point, out: []u8) Error!usize {
+        const layout = try self.imageLayout(first, second);
+        if (out.len < layout.byte_count) return error.IllegalFunctionCall;
+        self.captureLayoutInto(layout, out[0..layout.byte_count]);
+        return layout.byte_count;
     }
 
     pub fn put(self: *Screen, origin: Point, bytes: []const u8, action: bytecode.GraphicsPutAction) Error!void {
@@ -340,8 +436,15 @@ pub const Screen = struct {
             return error.IllegalFunctionCall;
         }
 
+        self.stats.put_calls +%= 1;
+        self.stats.put_pixels +%= image_width * image_height;
+        self.stats.put_bytes +%= image_header_bytes + payload;
+        var mutation: Mutation = .{};
+        const pixels = self.pixels.?;
         var y: usize = 0;
         while (y < image_height) : (y += 1) {
+            const target_y: u32 = @intCast(origin.y + @as(i32, @intCast(y)));
+            const row_start = @as(usize, target_y) * self.width + @as(usize, @intCast(origin.x));
             var x: usize = 0;
             while (x < image_width) : (x += 1) {
                 var color: u8 = 0;
@@ -358,16 +461,16 @@ pub const Screen = struct {
                         }
                     }
                 }
-                const target_x: i32 = origin.x + @as(i32, @intCast(x));
-                const target_y: i32 = origin.y + @as(i32, @intCast(y));
-                if (action == .xor) color ^= self.pixel(target_x, target_y);
-                self.setPixel(target_x, target_y, color);
+                const target_index = row_start + x;
+                if (action == .xor) color ^= pixels[target_index];
+                self.writePixelAt(&mutation, target_index, @intCast(origin.x + @as(i32, @intCast(x))), target_y, color);
             }
         }
+        self.commitMutation(mutation);
     }
 
     pub fn renderText(self: *Screen, text: *const text_screen.Screen, cells: text_screen.CellRect) void {
-        if (self.pixels == null) return;
+        const pixels = self.pixels orelse return;
         const columns = if (self.mode == 1) text_columns_mode_1 else text_columns_mode_9;
         const cell_height = switch (self.mode) {
             0 => text_cell_height_mode_0,
@@ -379,26 +482,52 @@ pub const Screen = struct {
         const first_y = @min(cells.y, text_rows);
         const last_x = @min(columns, cells.x +| cells.w);
         const last_y = @min(text_rows, cells.y +| cells.h);
+        const maximum_attribute = self.maximumAttribute();
+        var mutation: Mutation = .{};
         var cell_y = first_y;
         while (cell_y < last_y) : (cell_y += 1) {
-            var cell_x = first_x;
-            while (cell_x < last_x) : (cell_x += 1) {
-                const cell = text.cell(cell_y, cell_x) orelse continue;
-                const glyph = basic_font.glyph(cell.character);
-                var row: usize = 0;
-                while (row < cell_height) : (row += 1) {
-                    const glyph_row = glyph[(row * glyph.len) / cell_height];
+            const cell_count = last_x - first_x;
+            var cached_cells: [text_columns_mode_9]text_screen.Cell = undefined;
+            var cached_glyphs: [text_columns_mode_9][8]u8 = undefined;
+            for (0..cell_count) |index| {
+                const cell = text.cell(cell_y, first_x + index) orelse unreachable;
+                cached_cells[index] = cell;
+                cached_glyphs[index] = basic_font.glyph(cell.character);
+                self.stats.text_cells +%= 1;
+            }
+
+            const raster_x = first_x * text_cell_width;
+            const raster_width = cell_count * text_cell_width;
+            var row: usize = 0;
+            while (row < cell_height) : (row += 1) {
+                var raster_row: [mode_0_width]u8 = undefined;
+                for (0..cell_count) |cell_index| {
+                    const cell = cached_cells[cell_index];
+                    const glyph_row = cached_glyphs[cell_index][(row * 8) / cell_height];
+                    const cell_offset = cell_index * text_cell_width;
                     var column: usize = 0;
                     while (column < text_cell_width) : (column += 1) {
                         const bit = (@as(u8, 0x80) >> @intCast(column));
-                        const color = if ((glyph_row & bit) != 0) cell.foreground else cell.background;
-                        const x: i32 = @intCast(cell_x * text_cell_width + column);
-                        const y: i32 = @intCast(cell_y * cell_height + row);
-                        self.setPixel(x, y, color & self.maximumAttribute());
+                        raster_row[cell_offset + column] = (if ((glyph_row & bit) != 0) cell.foreground else cell.background) & maximum_attribute;
                     }
                 }
+                const raster_y = cell_y * cell_height + row;
+                const offset = raster_y * self.width + raster_x;
+                const destination = pixels[offset .. offset + raster_width];
+                const replacement = raster_row[0..raster_width];
+                self.stats.text_rows +%= 1;
+                self.stats.span_operations +%= 1;
+                self.stats.span_pixels +%= raster_width;
+                self.stats.pixel_probes +%= raster_width;
+                if (std.mem.eql(u8, destination, replacement)) continue;
+                for (destination, replacement) |existing, next| {
+                    if (existing != next) self.stats.pixel_changes +%= 1;
+                }
+                @memcpy(destination, replacement);
+                mutation.noteSpan(@intCast(raster_x), @intCast(raster_y), @intCast(raster_width));
             }
         }
+        self.commitMutation(mutation);
     }
 
     fn resetPalette(self: *Screen) void {
@@ -429,46 +558,67 @@ pub const Screen = struct {
         return @as(usize, @intCast(y)) * self.width + @as(usize, @intCast(x));
     }
 
-    fn pixel(self: *const Screen, x: i32, y: i32) u8 {
-        return self.pixels.?[self.pixelIndex(x, y)];
+    fn writePixelChecked(self: *Screen, mutation: *Mutation, x: i32, y: i32, color: u8) void {
+        if (!self.contains(x, y)) return;
+        const index = self.pixelIndex(x, y);
+        self.writePixelAt(mutation, index, @intCast(x), @intCast(y), color);
     }
 
-    fn setPixel(self: *Screen, x: i32, y: i32, color: u8) void {
-        if (!self.contains(x, y)) return;
+    fn writePixelAt(self: *Screen, mutation: *Mutation, index: usize, x: u32, y: u32, color: u8) void {
         const pixels = self.pixels.?;
-        const index = self.pixelIndex(x, y);
+        self.stats.pixel_probes +%= 1;
         if (pixels[index] == color) return;
         pixels[index] = color;
-        self.mark(.{ .x = @intCast(x), .y = @intCast(y), .w = 1, .h = 1 });
+        self.stats.pixel_changes +%= 1;
+        mutation.notePoint(x, y);
     }
 
-    fn drawLine(self: *Screen, requested_first: Point, requested_second: Point, color: u8) void {
+    fn writeSolidSpan(self: *Screen, mutation: *Mutation, y: usize, left: usize, right: usize, color: u8) void {
+        const row_start = y * self.width;
+        const destination = self.pixels.?[row_start + left .. row_start + right + 1];
+        self.stats.span_operations +%= 1;
+        self.stats.span_pixels +%= destination.len;
+        const unchanged = std.mem.count(u8, destination, &[_]u8{color});
+        self.stats.pixel_probes +%= destination.len;
+        if (unchanged == destination.len) return;
+        @memset(destination, color);
+        self.stats.pixel_changes +%= destination.len - unchanged;
+        mutation.noteSpan(@intCast(left), @intCast(y), @intCast(destination.len));
+    }
+
+    fn drawLine(self: *Screen, mutation: *Mutation, requested_first: Point, requested_second: Point, color: u8) void {
         var first = requested_first;
         var second = requested_second;
         if (!self.clipLine(&first, &second)) return;
+        self.stats.line_segments +%= 1;
         var x = first.x;
         var y = first.y;
+        var pixel_index: i64 = @intCast(self.pixelIndex(x, y));
+        const row_stride: i64 = self.width;
         const dx: i32 = @intCast(@abs(second.x - first.x));
         const sx: i32 = if (first.x < second.x) 1 else -1;
         const dy: i32 = -@as(i32, @intCast(@abs(second.y - first.y)));
         const sy: i32 = if (first.y < second.y) 1 else -1;
         var err = dx + dy;
         while (true) {
-            self.setPixel(x, y, color);
+            self.stats.line_pixels +%= 1;
+            self.writePixelAt(mutation, @intCast(pixel_index), @intCast(x), @intCast(y), color);
             if (x == second.x and y == second.y) break;
             const twice = err * 2;
             if (twice >= dy) {
                 err += dy;
                 x += sx;
+                pixel_index += sx;
             }
             if (twice <= dx) {
                 err += dx;
                 y += sy;
+                pixel_index += @as(i64, sy) * row_stride;
             }
         }
     }
 
-    fn fillBox(self: *Screen, first: Point, second: Point, color: u8) void {
+    fn fillBox(self: *Screen, mutation: *Mutation, first: Point, second: Point, color: u8) void {
         const left = @max(@as(i32, 0), @min(first.x, second.x));
         const right = @min(@as(i32, @intCast(self.width - 1)), @max(first.x, second.x));
         const top = @max(@as(i32, 0), @min(first.y, second.y));
@@ -476,9 +626,144 @@ pub const Screen = struct {
         if (left > right or top > bottom) return;
         var y = top;
         while (y <= bottom) : (y += 1) {
-            var x = left;
-            while (x <= right) : (x += 1) self.setPixel(x, y, color);
+            self.stats.fill_spans +%= 1;
+            self.writeSolidSpan(mutation, @intCast(y), @intCast(left), @intCast(right), color);
         }
+    }
+
+    fn appendPaintSeed(self: *Screen, pending: *std.ArrayList(u32), allocator: std.mem.Allocator, index: u32) Error!void {
+        const previous_capacity = pending.capacity;
+        try pending.append(allocator, index);
+        self.stats.paint_queue_pushes +%= 1;
+        if (pending.capacity != previous_capacity) self.stats.paint_queue_grows +%= 1;
+        self.stats.maximum_paint_queue = @max(self.stats.maximum_paint_queue, pending.items.len);
+    }
+
+    fn appendPaintRuns(
+        self: *Screen,
+        pending: *std.ArrayList(u32),
+        allocator: std.mem.Allocator,
+        pixels: []const u8,
+        row_start: usize,
+        left: usize,
+        right: usize,
+        target: u8,
+    ) Error!void {
+        var x = left;
+        while (x <= right) {
+            self.stats.paint_pixel_probes +%= 1;
+            if (pixels[row_start + x] != target) {
+                x += 1;
+                continue;
+            }
+            try self.appendPaintSeed(pending, allocator, @intCast(row_start + x));
+            x += 1;
+            while (x <= right) : (x += 1) {
+                self.stats.paint_pixel_probes +%= 1;
+                if (pixels[row_start + x] != target) break;
+            }
+        }
+    }
+
+    fn imageLayout(self: *const Screen, first: Point, second: Point) Error!ImageLayout {
+        if (self.mode == 0 or self.pixels == null) return error.IllegalFunctionCall;
+        const left = @min(first.x, second.x);
+        const right = @max(first.x, second.x);
+        const top = @min(first.y, second.y);
+        const bottom = @max(first.y, second.y);
+        if (!self.contains(left, top) or !self.contains(right, bottom)) return error.IllegalFunctionCall;
+        const width: usize = @intCast(right - left + 1);
+        const height: usize = @intCast(bottom - top + 1);
+        const width_bits = std.math.mul(usize, width, if (self.mode == 1) 2 else 1) catch return error.OutOfMemory;
+        if (width_bits > std.math.maxInt(u16) or height > std.math.maxInt(u16)) return error.IllegalFunctionCall;
+        const row_bytes = (width_bits + 7) / 8;
+        const planes: usize = if (self.mode == 1) 1 else 4;
+        const row_plane_bytes = std.math.mul(usize, row_bytes, planes) catch return error.OutOfMemory;
+        const payload = std.math.mul(usize, row_plane_bytes, height) catch return error.OutOfMemory;
+        const byte_count = std.math.add(usize, image_header_bytes, payload) catch return error.OutOfMemory;
+        return .{
+            .left = left,
+            .top = top,
+            .width = width,
+            .height = height,
+            .width_bits = width_bits,
+            .row_bytes = row_bytes,
+            .planes = planes,
+            .byte_count = byte_count,
+        };
+    }
+
+    fn captureLayoutInto(self: *Screen, layout: ImageLayout, out: []u8) void {
+        @memset(out, 0);
+        std.mem.writeInt(u16, out[0..2], @intCast(layout.width_bits), .little);
+        std.mem.writeInt(u16, out[2..4], @intCast(layout.height), .little);
+        const pixels = self.pixels.?;
+        const source_left: usize = @intCast(layout.left);
+        const source_top: usize = @intCast(layout.top);
+        var y: usize = 0;
+        while (y < layout.height) : (y += 1) {
+            const source = pixels[(source_top + y) * self.width + source_left ..][0..layout.width];
+            const output_row = image_header_bytes + y * layout.row_bytes * layout.planes;
+            if (self.mode == 1) {
+                var x: usize = 0;
+                while (x < layout.width) : (x += 1) {
+                    const bit = x * 2;
+                    const shift: u3 = @intCast(6 - (bit & 7));
+                    out[output_row + bit / 8] |= (source[x] & 3) << shift;
+                }
+            } else {
+                var plane: usize = 0;
+                while (plane < 4) : (plane += 1) {
+                    const plane_mask = @as(u8, 1) << @intCast(plane);
+                    const plane_start = output_row + plane * layout.row_bytes;
+                    var x: usize = 0;
+                    while (x < layout.width) : (x += 1) {
+                        if ((source[x] & plane_mask) != 0) out[plane_start + x / 8] |= @as(u8, 0x80) >> @intCast(x & 7);
+                    }
+                }
+            }
+        }
+        self.stats.capture_calls +%= 1;
+        self.stats.capture_pixels +%= layout.width * layout.height;
+        self.stats.capture_bytes +%= layout.byte_count;
+    }
+
+    fn ellipsePolygonMayTouchScreen(self: *const Screen, center: Point, radius_x: f64, radius_y: f64, segments: usize) bool {
+        if (self.width == 0 or self.height == 0) return false;
+
+        // Expand by two pixels to cover endpoint rounding and Bresenham's
+        // one-pixel raster envelope. Only provably invisible full polygons
+        // are rejected, so visible CIRCLE output stays byte-identical.
+        const margin = 2.0;
+        const minimum_x = -margin;
+        const minimum_y = -margin;
+        const maximum_x = @as(f64, @floatFromInt(self.width - 1)) + margin;
+        const maximum_y = @as(f64, @floatFromInt(self.height - 1)) + margin;
+        const center_x: f64 = @floatFromInt(center.x);
+        const center_y: f64 = @floatFromInt(center.y);
+        if (radius_x == 0 and radius_y == 0) {
+            return center_x >= minimum_x and center_x <= maximum_x and center_y >= minimum_y and center_y <= maximum_y;
+        }
+        if (radius_x == 0) {
+            return center_x >= minimum_x and center_x <= maximum_x and
+                center_y + radius_y >= minimum_y and center_y - radius_y <= maximum_y;
+        }
+        if (radius_y == 0) {
+            return center_y >= minimum_y and center_y <= maximum_y and
+                center_x + radius_x >= minimum_x and center_x - radius_x <= maximum_x;
+        }
+        const closest_x = std.math.clamp(center_x, minimum_x, maximum_x);
+        const closest_y = std.math.clamp(center_y, minimum_y, maximum_y);
+        const minimum_normalized = normalizedEllipseDistance(closest_x, closest_y, center_x, center_y, radius_x, radius_y);
+        if (minimum_normalized > 1.0) return false;
+
+        const farthest_dx = @max(@abs(minimum_x - center_x), @abs(maximum_x - center_x));
+        const farthest_dy = @max(@abs(minimum_y - center_y), @abs(maximum_y - center_y));
+        const maximum_normalized = (farthest_dx / radius_x) * (farthest_dx / radius_x) +
+            (farthest_dy / radius_y) * (farthest_dy / radius_y);
+        const half_step = std.math.pi / @as(f64, @floatFromInt(segments));
+        const polygon_inner_radius = @cos(half_step);
+        return maximum_normalized >= polygon_inner_radius * polygon_inner_radius;
     }
 
     fn clipLine(self: *const Screen, first: *Point, second: *Point) bool {
@@ -535,7 +820,12 @@ pub const Screen = struct {
     fn markFull(self: *Screen) void {
         if (self.width == 0 or self.height == 0) return;
         self.damage = .{ .x = 0, .y = 0, .w = self.width, .h = self.height };
+        self.stats.damage_commits +%= 1;
         self.content_revision +%= 1;
+    }
+
+    fn commitMutation(self: *Screen, mutation: Mutation) void {
+        if (mutation.damage) |damage| self.mark(damage);
     }
 
     fn mark(self: *Screen, requested: Rect) void {
@@ -549,6 +839,7 @@ pub const Screen = struct {
         } else {
             self.damage = requested;
         }
+        self.stats.damage_commits +%= 1;
         self.content_revision +%= 1;
     }
 };
@@ -564,6 +855,12 @@ fn defaultAspect(mode: i32) f64 {
         9 => 4.0 * (@as(f64, mode_9_height) / @as(f64, mode_9_width)) / 3.0,
         else => 1.0,
     };
+}
+
+fn normalizedEllipseDistance(x: f64, y: f64, center_x: f64, center_y: f64, radius_x: f64, radius_y: f64) f64 {
+    const normalized_x = (x - center_x) / radius_x;
+    const normalized_y = (y - center_y) / radius_y;
+    return normalized_x * normalized_x + normalized_y * normalized_y;
 }
 
 fn ellipsePoint(center: Point, radius_x: f64, radius_y: f64, angle: f64) Point {

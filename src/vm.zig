@@ -6,7 +6,7 @@ const graphics_screen = @import("graphics_screen.zig");
 const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "1.8.0";
+pub const contract_version = "1.9.0";
 pub const default_instruction_budget: u32 = 262_144;
 pub const timer_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
@@ -195,6 +195,7 @@ pub const PerformanceStats = struct {
     maximum_array_resize_live_bytes: u64 = 0,
     file_table_capacity_grows: u64 = 0,
     maximum_open_files: u64 = 0,
+    raster: graphics_screen.PerformanceStats = .{},
 
     pub fn group(self: *const PerformanceStats, operation_group: OperationGroup) u64 {
         return self.groups[@intFromEnum(operation_group)];
@@ -974,6 +975,7 @@ pub const Vm = struct {
             .maximum_array_resize_live_bytes = self.maximum_array_resize_live_bytes,
             .file_table_capacity_grows = self.file_table_capacity_grows,
             .maximum_open_files = self.maximum_open_files,
+            .raster = self.graphics.performanceStats(),
         };
     }
 
@@ -1709,12 +1711,11 @@ pub const Vm = struct {
             graphics_screen.Point{ .x = saturatingCoordinateAdd(first.x, raw_second.x), .y = saturatingCoordinateAdd(first.y, raw_second.y) }
         else
             raw_second;
-        const bytes = self.graphics.capture(self.allocator, first, second) catch |fault| return switch (fault) {
+        const bytes = try arrayRawBytes(array);
+        _ = self.graphics.captureInto(first, second, bytes) catch |fault| return switch (fault) {
             error.OutOfMemory => error.OutOfMemory,
             error.IllegalFunctionCall => error.IllegalFunctionCall,
         };
-        defer self.allocator.free(bytes);
-        try writeArrayRawPrefix(array, bytes);
     }
 
     fn graphicsPut(self: *Vm, flags: u32, encoded_action: u32) ExecutionError!void {
@@ -1724,8 +1725,7 @@ pub const Vm = struct {
         const array = try self.popArrayReference();
         const raw = try self.popGraphicsPoint();
         const target = self.graphics.resolvePoint(raw.x, raw.y, (flags & bytecode.graphics_point_relative) != 0);
-        const bytes = try readArrayRaw(self.allocator, array);
-        defer self.allocator.free(bytes);
+        const bytes = try arrayRawBytesConst(array);
         self.graphics.put(target, bytes, @enumFromInt(@as(u8, @intCast(encoded_action)))) catch return error.IllegalFunctionCall;
     }
 
@@ -3145,69 +3145,26 @@ fn saturatingCoordinateAdd(first: i32, second: i32) i32 {
     return @intCast(std.math.clamp(result, std.math.minInt(i32), std.math.maxInt(i32)));
 }
 
-fn arrayElementWidth(value_type: bytecode.ValueType) ExecutionError!usize {
-    return switch (value_type) {
-        .integer => 2,
-        .long, .single => 4,
-        .double => 8,
-        .string => error.TypeMismatch,
+fn arrayRawBytesConst(array: *const ArrayValue) ExecutionError![]const u8 {
+    if (array.record_type != bytecode.invalid_index or !array.value_type.isNumeric()) return error.TypeMismatch;
+    return switch (array.storage) {
+        .integer => |items| std.mem.sliceAsBytes(items),
+        .long => |items| std.mem.sliceAsBytes(items),
+        .single => |items| std.mem.sliceAsBytes(items),
+        .double => |items| std.mem.sliceAsBytes(items),
+        .cells => error.TypeMismatch,
     };
 }
 
-fn readArrayRaw(allocator: std.mem.Allocator, array: *const ArrayValue) ExecutionError![]u8 {
+fn arrayRawBytes(array: *ArrayValue) ExecutionError![]u8 {
     if (array.record_type != bytecode.invalid_index or !array.value_type.isNumeric()) return error.TypeMismatch;
-    const width = try arrayElementWidth(array.value_type);
-    const byte_count = std.math.mul(usize, array.storage.len(), width) catch return error.OutOfMemory;
-    const result = try allocator.alloc(u8, byte_count);
-    errdefer allocator.free(result);
-    var index: usize = 0;
-    while (index < array.storage.len()) : (index += 1) {
-        const element = arrayReferenceAtConst(array, index) orelse return error.InvalidInstruction;
-        try encodeArrayElement(element, array.value_type, result[index * width ..][0..width]);
-    }
-    return result;
-}
-
-fn writeArrayRawPrefix(array: *ArrayValue, bytes: []const u8) ExecutionError!void {
-    if (array.record_type != bytecode.invalid_index or !array.value_type.isNumeric()) return error.TypeMismatch;
-    const width = try arrayElementWidth(array.value_type);
-    const byte_count = std.math.mul(usize, array.storage.len(), width) catch return error.OutOfMemory;
-    if (bytes.len > byte_count) return error.IllegalFunctionCall;
-    var raw: [8]u8 = [_]u8{0} ** 8;
-    var index: usize = 0;
-    while (index < array.storage.len()) : (index += 1) {
-        const offset = index * width;
-        if (offset >= bytes.len) break;
-        const element = arrayReferenceAt(array, index) orelse return error.InvalidInstruction;
-        try encodeArrayElement(element, array.value_type, raw[0..width]);
-        const amount = @min(width, bytes.len - offset);
-        @memcpy(raw[0..amount], bytes[offset .. offset + amount]);
-        try decodeArrayElement(element, array.value_type, raw[0..width]);
-    }
-}
-
-fn encodeArrayElement(reference: Reference, value_type: bytecode.ValueType, out: []u8) ExecutionError!void {
-    const scalar = try reference.value();
-    if (scalar.valueType() != value_type or out.len != try arrayElementWidth(value_type)) return error.TypeMismatch;
-    switch (scalar) {
-        .integer => |number| std.mem.writeInt(u16, out[0..2], @bitCast(number), .little),
-        .long => |number| std.mem.writeInt(u32, out[0..4], @bitCast(number), .little),
-        .single => |number| std.mem.writeInt(u32, out[0..4], @bitCast(number), .little),
-        .double => |number| std.mem.writeInt(u64, out[0..8], @bitCast(number), .little),
-        .string => return error.TypeMismatch,
-    }
-}
-
-fn decodeArrayElement(reference: Reference, value_type: bytecode.ValueType, bytes: []const u8) ExecutionError!void {
-    if (try reference.valueType() != value_type or bytes.len != try arrayElementWidth(value_type)) return error.TypeMismatch;
-    const scalar: values.Value = switch (value_type) {
-        .integer => .{ .integer = @bitCast(std.mem.readInt(u16, bytes[0..2], .little)) },
-        .long => .{ .long = @bitCast(std.mem.readInt(u32, bytes[0..4], .little)) },
-        .single => .{ .single = @bitCast(std.mem.readInt(u32, bytes[0..4], .little)) },
-        .double => .{ .double = @bitCast(std.mem.readInt(u64, bytes[0..8], .little)) },
-        .string => return error.TypeMismatch,
+    return switch (array.storage) {
+        .integer => |items| std.mem.sliceAsBytes(items),
+        .long => |items| std.mem.sliceAsBytes(items),
+        .single => |items| std.mem.sliceAsBytes(items),
+        .double => |items| std.mem.sliceAsBytes(items),
+        .cells => error.TypeMismatch,
     };
-    try reference.replaceNumeric(scalar);
 }
 
 fn runtimeCode(fault: ExecutionError) RuntimeCode {
