@@ -50,7 +50,12 @@ aliases, and error-handler state belong to each VM instance.
 - `'$DYNAMIC` and `REM $DYNAMIC` mark following declarations dynamic;
   `REDIM` reallocates a dynamic array with the same rank and element type and
   resets every element. A VM limits one array to 16,777,216 elements before
-  attempting allocation.
+  attempting allocation. INTEGER, LONG, SINGLE, and DOUBLE arrays use exact
+  2-, 4-, 4-, and 8-byte typed payloads; strings and records retain generic
+  Cells. The logical payload of all live arrays is limited to 128 MiB and an
+  atomic resize transition, including old/new dimensions, to 192 MiB. A
+  rejected `DIM` or `REDIM` reports out-of-memory before replacing the old
+  dimensions or payload.
 - `TYPE` layouts contain named scalar fields. Scalar records and arrays of
   records initialize every field independently. Qualified field access is
   bound to a field index; arbitrary byte offsets do not exist.
@@ -62,6 +67,9 @@ aliases, and error-handler state belong to each VM instance.
   `RESTORE` selects item zero or a compile-resolved module data label.
 - Signed LONG items retain their exact 32-bit value. `REDIM` and `READ` do
   not reinterpret numeric image data through floating point.
+- Sequential file numbers retain O(1) lookup through a 256-byte direct index.
+  Only open files own slots and buffers; the VM does not embed 256 complete
+  optional file objects.
 
 ## Values and operations
 

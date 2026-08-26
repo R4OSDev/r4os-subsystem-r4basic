@@ -282,6 +282,173 @@ test "procedure frames reuse their pool and initialize only reached locals" {
     try std.testing.expectEqual(@as(u64, 0), counters.local_aggregate_initializations);
 }
 
+test "numeric arrays use typed payloads and preserve element ByRef semantics" {
+    const source =
+        \\DEFINT A-Z
+        \\DECLARE SUB AddLong (Value AS LONG)
+        \\'$DYNAMIC
+        \\DIM Integers%(1023)
+        \\DIM Longs&(1023)
+        \\DIM Singles!(1023)
+        \\DIM Doubles#(1023)
+        \\Integers%(0) = 7
+        \\Longs&(7) = 74
+        \\CALL AddLong(Longs&(7))
+        \\REDIM Integers%(2047)
+        \\ResetValue% = Integers%(0)
+        \\END
+        \\SUB AddLong (Value AS LONG)
+        \\    Value = Value + 4
+        \\END SUB
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "compact-arrays.bas", source);
+    defer program.deinit();
+    try std.testing.expect(program.ok());
+
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(512, 32));
+    const counters = machine.performanceStats();
+
+    try std.testing.expectEqual(@as(usize, 4096), machine.globalArrayStorageBytes("Integers%").?);
+    try std.testing.expectEqual(@as(usize, 4096), machine.globalArrayStorageBytes("Longs&").?);
+    try std.testing.expectEqual(@as(usize, 4096), machine.globalArrayStorageBytes("Singles!").?);
+    try std.testing.expectEqual(@as(usize, 8192), machine.globalArrayStorageBytes("Doubles#").?);
+    try std.testing.expectEqual(@as(i32, 78), machine.globalArrayElement("Longs&", &.{7}).?.long);
+    try std.testing.expectEqual(@as(i16, 0), machine.global("ResetValue%").?.integer);
+    try std.testing.expectEqual(@as(u64, 5), counters.compact_array_resizes);
+    try std.testing.expectEqual(@as(u64, 6144), counters.compact_array_elements);
+    try std.testing.expectEqual(@as(u64, 20 * 1024), counters.array_live_payload_bytes);
+    try std.testing.expectEqual(@as(u64, 20 * 1024), counters.maximum_array_live_payload_bytes);
+    try std.testing.expect(counters.maximum_array_resize_live_bytes >= 22 * 1024);
+    try std.testing.expectEqual(@as(u64, 0), counters.generic_array_initializations);
+}
+
+test "failed compact REDIM leaves the previous array intact" {
+    const LimitedAllocator = struct {
+        backing: std.mem.Allocator,
+        maximum_request_bytes: usize,
+
+        const vtable = std.mem.Allocator.VTable{
+            .alloc = allocate,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        };
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        fn allocate(context: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (len > self.maximum_request_bytes) return null;
+            return self.backing.rawAlloc(len, alignment, return_address);
+        }
+
+        fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (new_len > self.maximum_request_bytes) return false;
+            return self.backing.rawResize(memory, alignment, new_len, return_address);
+        }
+
+        fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (new_len > self.maximum_request_bytes) return null;
+            return self.backing.rawRemap(memory, alignment, new_len, return_address);
+        }
+
+        fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.backing.rawFree(memory, alignment, return_address);
+        }
+    };
+
+    const source =
+        \\DEFINT A-Z
+        \\'$DYNAMIC
+        \\DIM Values&(3)
+        \\Values&(0) = 77
+        \\REDIM Values&(32767)
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "atomic-redim.bas", source);
+    defer program.deinit();
+    try std.testing.expect(program.ok());
+
+    var limited = LimitedAllocator{ .backing = std.testing.allocator, .maximum_request_bytes = 64 * 1024 };
+    var machine = try core.vm.Vm.init(limited.allocator(), &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.runtime_error, machine.runToCompletion(128, 16));
+    try std.testing.expectEqual(core.vm.RuntimeCode.out_of_memory, machine.runtime_diagnostic.?.code);
+    try std.testing.expectEqual(@as(usize, 4 * @sizeOf(i32)), machine.globalArrayStorageBytes("Values&").?);
+    try std.testing.expectEqual(@as(i32, 77), machine.globalArrayElement("Values&", &.{0}).?.long);
+}
+
+test "generic array payload cap rejects oversized DIM before allocation" {
+    const source =
+        \\DEFINT A-Z
+        \\TYPE Wide
+        \\    F01 AS DOUBLE
+        \\    F02 AS DOUBLE
+        \\    F03 AS DOUBLE
+        \\    F04 AS DOUBLE
+        \\    F05 AS DOUBLE
+        \\    F06 AS DOUBLE
+        \\    F07 AS DOUBLE
+        \\    F08 AS DOUBLE
+        \\    F09 AS DOUBLE
+        \\    F10 AS DOUBLE
+        \\    F11 AS DOUBLE
+        \\    F12 AS DOUBLE
+        \\    F13 AS DOUBLE
+        \\    F14 AS DOUBLE
+        \\    F15 AS DOUBLE
+        \\    F16 AS DOUBLE
+        \\END TYPE
+        \\DIM Huge(0 TO 32767, 0 TO 7) AS Wide
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "bounded-generic-array.bas", source);
+    defer program.deinit();
+    try std.testing.expect(program.ok());
+
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.runtime_error, machine.runToCompletion(128, 16));
+    try std.testing.expectEqual(core.vm.RuntimeCode.out_of_memory, machine.runtime_diagnostic.?.code);
+    const counters = machine.performanceStats();
+    try std.testing.expectEqual(@as(u64, 0), counters.array_live_payload_bytes);
+    try std.testing.expectEqual(@as(u64, 0), counters.maximum_array_live_payload_bytes);
+    try std.testing.expectEqual(@as(usize, 0), machine.globalArrayStorageBytes("Huge").?);
+}
+
+test "procedure array payload leaves the live budget on frame release" {
+    const source =
+        \\DEFINT A-Z
+        \\DECLARE SUB Work ()
+        \\CALL Work
+        \\CALL Work
+        \\END
+        \\SUB Work ()
+        \\    DIM Scratch&(1023)
+        \\    Scratch&(0) = 1
+        \\END SUB
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "local-array-budget.bas", source);
+    defer program.deinit();
+    try std.testing.expect(program.ok());
+
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 32));
+    const counters = machine.performanceStats();
+    try std.testing.expectEqual(@as(u64, 2), counters.compact_array_resizes);
+    try std.testing.expectEqual(@as(u64, 2048), counters.compact_array_elements);
+    try std.testing.expectEqual(@as(u64, 0), counters.array_live_payload_bytes);
+    try std.testing.expectEqual(@as(u64, 4096), counters.maximum_array_live_payload_bytes);
+}
+
 test "number formatting and ordinary VAL avoid transient heap buffers" {
     const source =
         \\A$ = "12.5"

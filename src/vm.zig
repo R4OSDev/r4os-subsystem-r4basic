@@ -13,6 +13,8 @@ pub const maximum_value_stack: usize = 16_384;
 pub const maximum_call_depth: usize = 256;
 pub const maximum_gosub_depth: usize = 1024;
 pub const maximum_array_elements: usize = 16 * 1024 * 1024;
+pub const array_live_payload_limit_bytes: usize = 128 * 1024 * 1024;
+pub const array_resize_live_limit_bytes: usize = 192 * 1024 * 1024;
 pub const maximum_keyboard_bytes: usize = 4096;
 pub const maximum_input_line_bytes: usize = 255;
 pub const maximum_sequential_file_bytes: usize = 4 * 1024 * 1024;
@@ -185,6 +187,15 @@ pub const PerformanceStats = struct {
     val_stack_normalizations: u64 = 0,
     val_scratch_normalizations: u64 = 0,
     val_scratch_grows: u64 = 0,
+    compact_array_resizes: u64 = 0,
+    generic_array_resizes: u64 = 0,
+    compact_array_elements: u64 = 0,
+    generic_array_initializations: u64 = 0,
+    array_live_payload_bytes: u64 = 0,
+    maximum_array_live_payload_bytes: u64 = 0,
+    maximum_array_resize_live_bytes: u64 = 0,
+    file_table_capacity_grows: u64 = 0,
+    maximum_open_files: u64 = 0,
 
     pub fn group(self: *const PerformanceStats, operation_group: OperationGroup) u64 {
         return self.groups[@intFromEnum(operation_group)];
@@ -232,12 +243,49 @@ const ArrayValue = struct {
     expected_dimensions: u8,
     is_dynamic: bool,
     dimensions: []Dimension,
-    elements: []Cell,
+    storage: ArrayStorage,
 
     fn deinit(self: *ArrayValue, allocator: std.mem.Allocator) void {
-        for (self.elements) |*element| element.deinit(allocator);
-        allocator.free(self.elements);
+        self.storage.deinit(allocator);
         allocator.free(self.dimensions);
+        self.* = undefined;
+    }
+};
+
+const ArrayStorage = union(enum) {
+    integer: []i16,
+    long: []i32,
+    single: []f32,
+    double: []f64,
+    cells: []Cell,
+
+    fn len(self: *const ArrayStorage) usize {
+        return switch (self.*) {
+            inline else => |items| items.len,
+        };
+    }
+
+    fn byteLen(self: *const ArrayStorage) usize {
+        return switch (self.*) {
+            .integer => |items| items.len * @sizeOf(i16),
+            .long => |items| items.len * @sizeOf(i32),
+            .single => |items| items.len * @sizeOf(f32),
+            .double => |items| items.len * @sizeOf(f64),
+            .cells => |items| items.len * @sizeOf(Cell),
+        };
+    }
+
+    fn deinit(self: *ArrayStorage, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .integer => |items| allocator.free(items),
+            .long => |items| allocator.free(items),
+            .single => |items| allocator.free(items),
+            .double => |items| allocator.free(items),
+            .cells => |items| {
+                for (items) |*element| element.deinit(allocator);
+                allocator.free(items);
+            },
+        }
         self.* = undefined;
     }
 };
@@ -270,7 +318,7 @@ const OwnedValue = union(enum) {
 
 const Cell = union(enum) {
     owned: OwnedValue,
-    alias: *Cell,
+    alias: Reference,
 
     fn deinit(self: *Cell, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -281,21 +329,103 @@ const Cell = union(enum) {
     }
 };
 
-const ResolvedCell = struct {
-    pointer: *Cell,
+const Reference = union(enum) {
+    cell: *Cell,
+    integer: *i16,
+    long: *i32,
+    single: *f32,
+    double: *f64,
 
-    fn scalar(self: ResolvedCell) ExecutionError!*const values.Value {
-        return switch (self.pointer.owned) {
-            .scalar => |*value| value,
+    fn value(self: Reference) ExecutionError!values.Value {
+        return switch (self) {
+            .cell => |cell| switch (cell.*) {
+                .owned => |*owned| switch (owned.*) {
+                    .scalar => |scalar_value| scalar_value,
+                    else => error.TypeMismatch,
+                },
+                .alias => error.InvalidInstruction,
+            },
+            .integer => |number| .{ .integer = number.* },
+            .long => |number| .{ .long = number.* },
+            .single => |number| .{ .single = number.* },
+            .double => |number| .{ .double = number.* },
+        };
+    }
+
+    fn valueType(self: Reference) ExecutionError!bytecode.ValueType {
+        return (try self.value()).valueType();
+    }
+
+    fn aggregateCell(self: Reference) ExecutionError!*Cell {
+        return switch (self) {
+            .cell => |cell| switch (cell.*) {
+                .owned => cell,
+                .alias => error.InvalidInstruction,
+            },
             else => error.TypeMismatch,
         };
     }
 
-    fn scalarMutable(self: ResolvedCell) ExecutionError!*values.Value {
-        return switch (self.pointer.owned) {
-            .scalar => |*value| value,
-            else => error.TypeMismatch,
-        };
+    fn replace(self: Reference, allocator: std.mem.Allocator, incoming: values.Value) ExecutionError!void {
+        switch (self) {
+            .cell => |cell| switch (cell.*) {
+                .owned => |*owned| switch (owned.*) {
+                    .scalar => |*destination| {
+                        destination.deinit(allocator);
+                        destination.* = incoming;
+                    },
+                    else => return error.TypeMismatch,
+                },
+                .alias => return error.InvalidInstruction,
+            },
+            .integer => |destination| destination.* = switch (incoming) {
+                .integer => |number| number,
+                else => return error.TypeMismatch,
+            },
+            .long => |destination| destination.* = switch (incoming) {
+                .long => |number| number,
+                else => return error.TypeMismatch,
+            },
+            .single => |destination| destination.* = switch (incoming) {
+                .single => |number| number,
+                else => return error.TypeMismatch,
+            },
+            .double => |destination| destination.* = switch (incoming) {
+                .double => |number| number,
+                else => return error.TypeMismatch,
+            },
+        }
+    }
+
+    fn replaceNumeric(self: Reference, incoming: values.Value) ExecutionError!void {
+        switch (self) {
+            .cell => |cell| switch (cell.*) {
+                .owned => |*owned| switch (owned.*) {
+                    .scalar => |*destination| {
+                        if (!destination.valueType().isNumeric() or destination.valueType() != incoming.valueType()) return error.TypeMismatch;
+                        destination.* = incoming;
+                    },
+                    else => return error.TypeMismatch,
+                },
+                .alias => return error.InvalidInstruction,
+            },
+            .integer => |destination| destination.* = switch (incoming) {
+                .integer => |number| number,
+                else => return error.TypeMismatch,
+            },
+            .long => |destination| destination.* = switch (incoming) {
+                .long => |number| number,
+                else => return error.TypeMismatch,
+            },
+            .single => |destination| destination.* = switch (incoming) {
+                .single => |number| number,
+                else => return error.TypeMismatch,
+            },
+            .double => |destination| destination.* = switch (incoming) {
+                .double => |number| number,
+                else => return error.TypeMismatch,
+            },
+        }
     }
 };
 
@@ -331,7 +461,7 @@ const Frame = struct {
 
 const StackItem = union(enum) {
     value: values.Value,
-    reference: *Cell,
+    reference: Reference,
 
     fn deinit(self: *StackItem, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -374,6 +504,11 @@ const SequentialFile = struct {
         self.output.deinit(allocator);
         self.* = undefined;
     }
+};
+
+const FileSlot = struct {
+    number: u8,
+    file: SequentialFile,
 };
 
 const module_frame = bytecode.invalid_index;
@@ -423,6 +558,15 @@ pub const Vm = struct {
     val_stack_normalizations: u64 = 0,
     val_scratch_normalizations: u64 = 0,
     val_scratch_grows: u64 = 0,
+    compact_array_resizes: u64 = 0,
+    generic_array_resizes: u64 = 0,
+    compact_array_elements: u64 = 0,
+    generic_array_initializations: u64 = 0,
+    array_live_payload_bytes: u64 = 0,
+    maximum_array_live_payload_bytes: u64 = 0,
+    maximum_array_resize_live_bytes: u64 = 0,
+    file_table_capacity_grows: u64 = 0,
+    maximum_open_files: u64 = 0,
     status: Status = .ready,
     exit_code: i32 = 0,
     runtime_diagnostic: ?RuntimeDiagnostic = null,
@@ -455,7 +599,8 @@ pub const Vm = struct {
     audio_deadline_ns: u64 = 0,
     random_state: u32 = default_random_seed,
     random_last: f32 = 0,
-    files: [maximum_file_number + 1]?SequentialFile = [_]?SequentialFile{null} ** (maximum_file_number + 1),
+    open_files: std.ArrayList(FileSlot) = .empty,
+    file_slot_indices: [maximum_file_number + 1]u8 = .{0} ** (maximum_file_number + 1),
     active_print_file: ?u8 = null,
     statement_stack_base: usize = 0,
     current_statement_start: u32 = bytecode.invalid_index,
@@ -496,6 +641,7 @@ pub const Vm = struct {
         self.numeric_scratch.deinit(self.allocator);
         self.audio_engine.deinit();
         self.discardFiles();
+        self.open_files.deinit(self.allocator);
         self.graphics.deinit(self.allocator);
         deinitGlobals(self.allocator, self.globals);
         self.* = undefined;
@@ -632,6 +778,15 @@ pub const Vm = struct {
         self.val_stack_normalizations = 0;
         self.val_scratch_normalizations = 0;
         self.val_scratch_grows = 0;
+        self.compact_array_resizes = 0;
+        self.generic_array_resizes = 0;
+        self.compact_array_elements = 0;
+        self.generic_array_initializations = 0;
+        self.array_live_payload_bytes = 0;
+        self.maximum_array_live_payload_bytes = 0;
+        self.maximum_array_resize_live_bytes = 0;
+        self.file_table_capacity_grows = 0;
+        self.maximum_open_files = 0;
         self.status = .ready;
         self.exit_code = 0;
         self.runtime_diagnostic = null;
@@ -790,6 +945,15 @@ pub const Vm = struct {
             .val_stack_normalizations = self.val_stack_normalizations,
             .val_scratch_normalizations = self.val_scratch_normalizations,
             .val_scratch_grows = self.val_scratch_grows,
+            .compact_array_resizes = self.compact_array_resizes,
+            .generic_array_resizes = self.generic_array_resizes,
+            .compact_array_elements = self.compact_array_elements,
+            .generic_array_initializations = self.generic_array_initializations,
+            .array_live_payload_bytes = self.array_live_payload_bytes,
+            .maximum_array_live_payload_bytes = self.maximum_array_live_payload_bytes,
+            .maximum_array_resize_live_bytes = self.maximum_array_resize_live_bytes,
+            .file_table_capacity_grows = self.file_table_capacity_grows,
+            .maximum_open_files = self.maximum_open_files,
         };
     }
 
@@ -807,17 +971,34 @@ pub const Vm = struct {
         return null;
     }
 
-    pub fn globalArrayElement(self: *const Vm, name: []const u8, indices: []const i32) ?*const values.Value {
+    pub fn globalArrayElement(self: *const Vm, name: []const u8, indices: []const i32) ?values.Value {
         const root = self.globalCell(name) orelse return null;
         const array = switch (root.owned) {
             .array => |*value| value,
             else => return null,
         };
         const element = arrayElementConst(array, indices) orelse return null;
-        return switch (element.owned) {
-            .scalar => |*scalar| scalar,
+        return element.value() catch null;
+    }
+
+    pub fn globalArrayStorageBytes(self: *const Vm, name: []const u8) ?usize {
+        const root = self.globalCell(name) orelse return null;
+        return switch (root.owned) {
+            .array => |*array| array.storage.byteLen(),
             else => null,
         };
+    }
+
+    pub fn staticByteSize(_: *const Vm) usize {
+        return @sizeOf(Vm);
+    }
+
+    pub fn fileIndexByteSize(_: *const Vm) usize {
+        return @sizeOf([maximum_file_number + 1]u8);
+    }
+
+    pub fn openFileCount(self: *const Vm) usize {
+        return self.open_files.items.len;
     }
 
     pub fn globalArrayRecordField(
@@ -831,7 +1012,7 @@ pub const Vm = struct {
             .array => |*value| value,
             else => return null,
         };
-        const element = arrayElementConst(array, indices) orelse return null;
+        const element = (arrayElementConst(array, indices) orelse return null).aggregateCell() catch return null;
         const record = switch (element.owned) {
             .record => |*value| value,
             else => return null,
@@ -1116,48 +1297,41 @@ pub const Vm = struct {
         }
     }
 
-    fn load(self: *Vm, cell: ResolvedCell) ExecutionError!void {
-        const value = try cell.scalar();
-        try self.pushValue(try self.cloneValueTracked(value));
+    fn load(self: *Vm, reference: Reference) ExecutionError!void {
+        const value = try reference.value();
+        try self.pushValue(try self.cloneValueTracked(&value));
     }
 
-    fn store(self: *Vm, cell: ResolvedCell, target: bytecode.ValueType) ExecutionError!void {
-        var incoming = try self.popValue();
-        var incoming_owned = true;
-        defer if (incoming_owned) incoming.deinit(self.allocator);
-        const destination = try cell.scalarMutable();
-        if (incoming.valueType() == target) {
-            self.same_type_store_moves +%= 1;
-            destination.deinit(self.allocator);
-            destination.* = incoming;
-            incoming_owned = false;
-            return;
-        }
-        self.value_conversions +%= 1;
-        var converted = try values.convert(self.allocator, incoming, target);
-        errdefer converted.deinit(self.allocator);
-        destination.deinit(self.allocator);
-        destination.* = converted;
+    fn store(self: *Vm, reference: Reference, target: bytecode.ValueType) ExecutionError!void {
+        return self.storeValue(reference, target, try self.popValue());
     }
 
     fn storeReference(self: *Vm, target: bytecode.ValueType) ExecutionError!void {
         var incoming = try self.popValue();
         var incoming_owned = true;
         defer if (incoming_owned) incoming.deinit(self.allocator);
-        const cell = try self.popReference();
-        const destination = try cell.scalarMutable();
+        const reference = try self.popReference();
+        incoming_owned = false;
+        try self.storeValue(reference, target, incoming);
+    }
+
+    fn storeValue(self: *Vm, reference: Reference, target: bytecode.ValueType, raw_incoming: values.Value) ExecutionError!void {
+        var incoming = raw_incoming;
+        var incoming_owned = true;
+        defer if (incoming_owned) incoming.deinit(self.allocator);
+        if (try reference.valueType() != target) return error.InvalidInstruction;
         if (incoming.valueType() == target) {
             self.same_type_store_moves +%= 1;
-            destination.deinit(self.allocator);
-            destination.* = incoming;
+            try reference.replace(self.allocator, incoming);
             incoming_owned = false;
             return;
         }
         self.value_conversions +%= 1;
         var converted = try values.convert(self.allocator, incoming, target);
-        errdefer converted.deinit(self.allocator);
-        destination.deinit(self.allocator);
-        destination.* = converted;
+        var converted_owned = true;
+        defer if (converted_owned) converted.deinit(self.allocator);
+        try reference.replace(self.allocator, converted);
+        converted_owned = false;
     }
 
     fn arrayDefaultLower(self: *Vm) ExecutionError!void {
@@ -1180,17 +1354,17 @@ pub const Vm = struct {
             remaining -= 1;
             indices[remaining] = try values.asLong(index_value);
         }
-        const root = (try self.popReference()).pointer;
+        const root = try (try self.popReference()).aggregateCell();
         const array = switch (root.owned) {
             .array => |*value| value,
             else => return error.TypeMismatch,
         };
         const element = arrayElement(array, indices[0..dimension_count]) orelse return error.SubscriptOutOfRange;
-        try self.pushReference(element);
+        try self.pushResolvedReference(element);
     }
 
     fn selectRecordField(self: *Vm, field_index: u32) ExecutionError!void {
-        const root = (try self.popReference()).pointer;
+        const root = try (try self.popReference()).aggregateCell();
         const record = switch (root.owned) {
             .record => |*value| value,
             else => return error.TypeMismatch,
@@ -1201,7 +1375,7 @@ pub const Vm = struct {
 
     fn dimensionArray(self: *Vm, dimension_count: u32, redimension: bool) ExecutionError!void {
         if (dimension_count == 0 or dimension_count > 60) return error.InvalidInstruction;
-        const root = (try self.popReference()).pointer;
+        const root = try (try self.popReference()).aggregateCell();
         const array = switch (root.owned) {
             .array => |*value| value,
             else => return error.TypeMismatch,
@@ -1247,32 +1421,54 @@ pub const Vm = struct {
             total *= length;
         }
         if (total > maximum_array_elements) return error.OutOfMemory;
-        const elements = try self.allocator.alloc(Cell, total);
-        var initialized: usize = 0;
-        errdefer {
-            for (elements[0..initialized]) |*element| element.deinit(self.allocator);
-            self.allocator.free(elements);
-        }
-        for (elements) |*element| {
-            element.* = try allocateElement(self.allocator, self.program, array.value_type, array.record_type);
-            initialized += 1;
+        const old_payload_bytes = try arrayLogicalPayloadBytes(self.program, array.value_type, array.record_type, array.storage.len());
+        const new_payload_bytes = try arrayLogicalPayloadBytes(self.program, array.value_type, array.record_type, total);
+        const old_dimension_bytes = std.math.mul(usize, array.dimensions.len, @sizeOf(Dimension)) catch return error.OutOfMemory;
+        const new_dimension_bytes = std.math.mul(usize, dimensions.len, @sizeOf(Dimension)) catch return error.OutOfMemory;
+        const current_live_bytes = std.math.cast(usize, self.array_live_payload_bytes) orelse return error.OutOfMemory;
+        const live_without_old_bytes = std.math.sub(usize, current_live_bytes, old_payload_bytes) catch return error.InvalidInstruction;
+        const final_live_bytes = std.math.add(usize, live_without_old_bytes, new_payload_bytes) catch return error.OutOfMemory;
+        var resize_live_bytes = std.math.add(usize, current_live_bytes, new_payload_bytes) catch return error.OutOfMemory;
+        resize_live_bytes = std.math.add(usize, resize_live_bytes, old_dimension_bytes) catch return error.OutOfMemory;
+        resize_live_bytes = std.math.add(usize, resize_live_bytes, new_dimension_bytes) catch return error.OutOfMemory;
+        if (final_live_bytes > array_live_payload_limit_bytes or resize_live_bytes > array_resize_live_limit_bytes) {
+            return error.OutOfMemory;
         }
 
-        for (array.elements) |*element| element.deinit(self.allocator);
-        self.allocator.free(array.elements);
+        if (array.record_type == bytecode.invalid_index and array.value_type.isNumeric()) {
+            try resizeCompactArrayStorage(self.allocator, &array.storage, total, array.value_type);
+            self.compact_array_resizes +%= 1;
+            self.compact_array_elements +|= @intCast(total);
+        } else {
+            const elements = try self.allocator.alloc(Cell, total);
+            var initialized: usize = 0;
+            errdefer {
+                for (elements[0..initialized]) |*element| element.deinit(self.allocator);
+                self.allocator.free(elements);
+            }
+            for (elements) |*element| {
+                element.* = try allocateElement(self.allocator, self.program, array.value_type, array.record_type);
+                initialized += 1;
+            }
+            array.storage.deinit(self.allocator);
+            array.storage = .{ .cells = elements };
+            self.generic_array_resizes +%= 1;
+            self.generic_array_initializations +|= @intCast(total);
+        }
+
+        self.array_live_payload_bytes = @intCast(final_live_bytes);
+        self.maximum_array_live_payload_bytes = @max(self.maximum_array_live_payload_bytes, self.array_live_payload_bytes);
+        self.maximum_array_resize_live_bytes = @max(self.maximum_array_resize_live_bytes, @as(u64, @intCast(resize_live_bytes)));
+
         self.allocator.free(array.dimensions);
-        array.elements = elements;
         array.dimensions = dimensions;
     }
 
     fn readData(self: *Vm, target: bytecode.ValueType) ExecutionError!void {
         const destination = try self.popReference();
         if (self.data_pointer >= self.program.data_items.len) return error.OutOfData;
-        var converted = try dataValue(self.allocator, self.program.data_items[self.data_pointer], self.program.source, target);
-        errdefer converted.deinit(self.allocator);
-        const scalar = try destination.scalarMutable();
-        scalar.deinit(self.allocator);
-        scalar.* = converted;
+        const converted = try dataValue(self.allocator, self.program.data_items[self.data_pointer], self.program.source, target);
+        try self.storeValue(destination, target, converted);
         self.data_pointer += 1;
     }
 
@@ -1519,7 +1715,7 @@ pub const Vm = struct {
     }
 
     fn popArrayReference(self: *Vm) ExecutionError!*ArrayValue {
-        const root = (try self.popReference()).pointer;
+        const root = try (try self.popReference()).aggregateCell();
         return switch (root.owned) {
             .array => |*array| if (array.record_type == bytecode.invalid_index and array.value_type.isNumeric()) array else error.TypeMismatch,
             else => error.TypeMismatch,
@@ -1796,28 +1992,24 @@ pub const Vm = struct {
         while (index < count) : (index += 1) _ = try self.inputTargetCell(base + index);
     }
 
-    fn inputTargetCell(self: *Vm, stack_index: usize) ExecutionError!ResolvedCell {
+    fn inputTargetCell(self: *Vm, stack_index: usize) ExecutionError!Reference {
         if (stack_index >= self.stack.items.len) return error.StackUnderflow;
-        const cell = switch (self.stack.items[stack_index]) {
-            .reference => |value| switch (value.*) {
-                .owned => ResolvedCell{ .pointer = value },
-                .alias => return error.InvalidInstruction,
-            },
+        const reference = switch (self.stack.items[stack_index]) {
+            .reference => |value| value,
             .value => return error.InvalidInstruction,
         };
-        _ = try cell.scalar();
-        return cell;
+        _ = try reference.value();
+        return reference;
     }
 
     fn inputTargetType(self: *Vm, stack_index: usize) ExecutionError!bytecode.ValueType {
-        return (try (try self.inputTargetCell(stack_index)).scalar()).valueType();
+        return (try self.inputTargetCell(stack_index)).valueType();
     }
 
     fn assignInputValues(self: *Vm, target_base: usize, parsed: []values.Value) void {
         for (parsed, 0..) |value, index| {
-            const scalar = (self.inputTargetCell(target_base + index) catch unreachable).scalarMutable() catch unreachable;
-            scalar.deinit(self.allocator);
-            scalar.* = value;
+            const reference = self.inputTargetCell(target_base + index) catch unreachable;
+            reference.replace(self.allocator, value) catch unreachable;
         }
     }
 
@@ -1987,9 +2179,13 @@ pub const Vm = struct {
             .string => |value| value,
             else => return error.TypeMismatch,
         };
-        if (self.files[file_number] != null) return error.FileAlreadyOpen;
+        if (self.fileSlotIndex(file_number) != null) return error.FileAlreadyOpen;
         const resolved_path = try self.resolveGuestPath(raw_path);
         errdefer self.allocator.free(resolved_path);
+
+        const previous_capacity = self.open_files.capacity;
+        try self.open_files.ensureUnusedCapacity(self.allocator, 1);
+        if (self.open_files.capacity != previous_capacity) self.file_table_capacity_grows +%= 1;
 
         var input = try self.allocator.alloc(u8, 0);
         errdefer self.allocator.free(input);
@@ -2006,11 +2202,16 @@ pub const Vm = struct {
                 }
             },
         }
-        self.files[file_number] = .{
-            .mode = mode,
-            .path = resolved_path,
-            .input = input,
-        };
+        self.open_files.appendAssumeCapacity(.{
+            .number = @intCast(file_number),
+            .file = .{
+                .mode = mode,
+                .path = resolved_path,
+                .input = input,
+            },
+        });
+        self.file_slot_indices[file_number] = @intCast(self.open_files.items.len);
+        self.maximum_open_files = @max(self.maximum_open_files, @as(u64, @intCast(self.open_files.items.len)));
     }
 
     fn readWholeFile(self: *Vm, path: []const u8) ExecutionError![]u8 {
@@ -2044,14 +2245,14 @@ pub const Vm = struct {
     }
 
     fn closeAllFiles(self: *Vm) ExecutionError!void {
-        var file_number: usize = 1;
-        while (file_number <= maximum_file_number) : (file_number += 1) {
-            if (self.files[file_number] != null) try self.closeFile(file_number);
+        while (self.open_files.items.len != 0) {
+            try self.closeFile(self.open_files.items[self.open_files.items.len - 1].number);
         }
     }
 
     fn closeFile(self: *Vm, file_number: usize) ExecutionError!void {
-        const file = try self.fileAt(file_number);
+        const slot_index = self.fileSlotIndex(file_number) orelse return error.BadFileNumber;
+        const file = &self.open_files.items[slot_index].file;
         if (file.mode != .input) {
             const result = self.host.file_write(self.fileHostContext(), file.path, file.output.items, file.mode == .append);
             switch (result) {
@@ -2059,22 +2260,33 @@ pub const Vm = struct {
                 .failure => |failure| return fileHostFault(failure),
             }
         }
-        file.deinit(self.allocator);
-        self.files[file_number] = null;
+        var removed = self.open_files.swapRemove(slot_index);
+        removed.file.deinit(self.allocator);
+        self.file_slot_indices[file_number] = 0;
+        if (slot_index < self.open_files.items.len) {
+            const moved_number = self.open_files.items[slot_index].number;
+            self.file_slot_indices[moved_number] = @intCast(slot_index + 1);
+        }
         if (self.active_print_file != null and self.active_print_file.? == @as(u8, @intCast(file_number))) self.active_print_file = null;
     }
 
     fn discardFiles(self: *Vm) void {
-        for (&self.files) |*slot| {
-            if (slot.*) |*file| file.deinit(self.allocator);
-            slot.* = null;
-        }
+        for (self.open_files.items) |*slot| slot.file.deinit(self.allocator);
+        self.open_files.clearRetainingCapacity();
+        self.file_slot_indices = .{0} ** (maximum_file_number + 1);
     }
 
     fn fileAt(self: *Vm, file_number: usize) ExecutionError!*SequentialFile {
         if (file_number == 0 or file_number > maximum_file_number) return error.BadFileNumber;
-        if (self.files[file_number]) |*file| return file;
-        return error.BadFileNumber;
+        const slot_index = self.fileSlotIndex(file_number) orelse return error.BadFileNumber;
+        if (slot_index >= self.open_files.items.len or self.open_files.items[slot_index].number != file_number) return error.InvalidInstruction;
+        return &self.open_files.items[slot_index].file;
+    }
+
+    fn fileSlotIndex(self: *const Vm, file_number: usize) ?usize {
+        if (file_number == 0 or file_number > maximum_file_number) return null;
+        const encoded = self.file_slot_indices[file_number];
+        return if (encoded == 0) null else @as(usize, encoded - 1);
     }
 
     fn fileHostContext(self: *Vm) ?*anyopaque {
@@ -2229,7 +2441,8 @@ pub const Vm = struct {
         var return_value: ?values.Value = null;
         if (procedure.returnsValue()) {
             const cell = try self.frameLocalCell(frame_depth - 1, procedure.return_local);
-            return_value = try self.cloneValueTracked(try (try self.resolveCellTracked(cell)).scalar());
+            const value = try (try self.resolveCellTracked(cell)).value();
+            return_value = try self.cloneValueTracked(&value);
         }
 
         var frame = self.frames.pop().?;
@@ -2340,12 +2553,25 @@ pub const Vm = struct {
             var slot = &storage.slots.items[current];
             std.debug.assert(slot.generation == frame.local_generation);
             const next = slot.next_initialized;
-            slot.cell.deinit(self.allocator);
+            self.deinitCellTracked(&slot.cell);
             slot.generation = 0;
             slot.next_initialized = bytecode.invalid_index;
             current = next;
         }
         frame.* = undefined;
+    }
+
+    fn deinitCellTracked(self: *Vm, cell: *Cell) void {
+        const payload_bytes = switch (cell.*) {
+            .owned => |*owned| switch (owned.*) {
+                .array => |*array| arrayLogicalPayloadBytes(self.program, array.value_type, array.record_type, array.storage.len()) catch 0,
+                else => 0,
+            },
+            .alias => 0,
+        };
+        std.debug.assert(payload_bytes <= self.array_live_payload_bytes);
+        self.array_live_payload_bytes -|= @intCast(payload_bytes);
+        cell.deinit(self.allocator);
     }
 
     fn gosub(self: *Vm, target: u32) ExecutionError!void {
@@ -2380,7 +2606,7 @@ pub const Vm = struct {
                 },
                 .reference => |cell| blk: {
                     self.builtin_borrowed_arguments +%= 1;
-                    break :blk (try (ResolvedCell{ .pointer = cell }).scalar()).*;
+                    break :blk try cell.value();
                 },
             };
         }
@@ -2631,18 +2857,15 @@ pub const Vm = struct {
         return self.pushResolvedReference(try self.resolveCellTracked(cell));
     }
 
-    fn pushResolvedReference(self: *Vm, cell: ResolvedCell) ExecutionError!void {
+    fn pushResolvedReference(self: *Vm, reference: Reference) ExecutionError!void {
         if (self.stack.items.len >= maximum_value_stack) return error.StackOverflow;
-        try self.stack.append(self.allocator, .{ .reference = cell.pointer });
+        try self.stack.append(self.allocator, .{ .reference = reference });
     }
 
-    fn popReference(self: *Vm) ExecutionError!ResolvedCell {
+    fn popReference(self: *Vm) ExecutionError!Reference {
         const item = self.stack.pop() orelse return error.StackUnderflow;
         return switch (item) {
-            .reference => |cell| switch (cell.*) {
-                .owned => .{ .pointer = cell },
-                .alias => error.InvalidInstruction,
-            },
+            .reference => |reference| reference,
             .value => |value| blk: {
                 var owned = value;
                 owned.deinit(self.allocator);
@@ -2655,14 +2878,20 @@ pub const Vm = struct {
         const item = self.stack.pop() orelse return error.StackUnderflow;
         return switch (item) {
             .value => |value| value,
-            .reference => |cell| self.cloneValueTracked(try (ResolvedCell{ .pointer = cell }).scalar()),
+            .reference => |reference| blk: {
+                const value = try reference.value();
+                break :blk self.cloneValueTracked(&value);
+            },
         };
     }
 
     fn cloneStackItem(self: *Vm, item: StackItem) ExecutionError!values.Value {
         return switch (item) {
             .value => |value| self.cloneValueTracked(&value),
-            .reference => |cell| self.cloneValueTracked(try (ResolvedCell{ .pointer = cell }).scalar()),
+            .reference => |reference| blk: {
+                const value = try reference.value();
+                break :blk self.cloneValueTracked(&value);
+            },
         };
     }
 
@@ -2684,26 +2913,32 @@ pub const Vm = struct {
         }
     }
 
-    fn localCellAt(self: *Vm, index: u32) ExecutionError!ResolvedCell {
+    fn localCellAt(self: *Vm, index: u32) ExecutionError!Reference {
         if (self.frames.items.len == 0) return error.InvalidInstruction;
         return self.resolveCellTracked(try self.frameLocalCell(self.frames.items.len - 1, index));
     }
 
-    fn globalCellAt(self: *Vm, index: u32) ExecutionError!ResolvedCell {
+    fn globalCellAt(self: *Vm, index: u32) ExecutionError!Reference {
         if (index >= self.globals.len) return error.InvalidInstruction;
         return self.resolveCellTracked(&self.globals[index]);
     }
 
-    fn resolveCellTracked(self: *Vm, original: *Cell) ExecutionError!ResolvedCell {
+    fn resolveCellTracked(self: *Vm, original: *Cell) ExecutionError!Reference {
         self.cell_resolve_calls +%= 1;
         var cell = original;
         var depth: usize = 0;
         while (depth <= maximum_call_depth) : (depth += 1) {
             switch (cell.*) {
-                .owned => return .{ .pointer = cell },
-                .alias => |target| {
-                    self.cell_alias_hops +%= 1;
-                    cell = target;
+                .owned => return .{ .cell = cell },
+                .alias => |target| switch (target) {
+                    .cell => |next| {
+                        self.cell_alias_hops +%= 1;
+                        cell = next;
+                    },
+                    else => {
+                        self.cell_alias_hops +%= 1;
+                        return target;
+                    },
                 },
             }
         }
@@ -2900,10 +3135,12 @@ fn arrayElementWidth(value_type: bytecode.ValueType) ExecutionError!usize {
 fn readArrayRaw(allocator: std.mem.Allocator, array: *const ArrayValue) ExecutionError![]u8 {
     if (array.record_type != bytecode.invalid_index or !array.value_type.isNumeric()) return error.TypeMismatch;
     const width = try arrayElementWidth(array.value_type);
-    const byte_count = std.math.mul(usize, array.elements.len, width) catch return error.OutOfMemory;
+    const byte_count = std.math.mul(usize, array.storage.len(), width) catch return error.OutOfMemory;
     const result = try allocator.alloc(u8, byte_count);
     errdefer allocator.free(result);
-    for (array.elements, 0..) |*element, index| {
+    var index: usize = 0;
+    while (index < array.storage.len()) : (index += 1) {
+        const element = arrayReferenceAtConst(array, index) orelse return error.InvalidInstruction;
         try encodeArrayElement(element, array.value_type, result[index * width ..][0..width]);
     }
     return result;
@@ -2912,12 +3149,14 @@ fn readArrayRaw(allocator: std.mem.Allocator, array: *const ArrayValue) Executio
 fn writeArrayRawPrefix(array: *ArrayValue, bytes: []const u8) ExecutionError!void {
     if (array.record_type != bytecode.invalid_index or !array.value_type.isNumeric()) return error.TypeMismatch;
     const width = try arrayElementWidth(array.value_type);
-    const byte_count = std.math.mul(usize, array.elements.len, width) catch return error.OutOfMemory;
+    const byte_count = std.math.mul(usize, array.storage.len(), width) catch return error.OutOfMemory;
     if (bytes.len > byte_count) return error.IllegalFunctionCall;
     var raw: [8]u8 = [_]u8{0} ** 8;
-    for (array.elements, 0..) |*element, index| {
+    var index: usize = 0;
+    while (index < array.storage.len()) : (index += 1) {
         const offset = index * width;
         if (offset >= bytes.len) break;
+        const element = arrayReferenceAt(array, index) orelse return error.InvalidInstruction;
         try encodeArrayElement(element, array.value_type, raw[0..width]);
         const amount = @min(width, bytes.len - offset);
         @memcpy(raw[0..amount], bytes[offset .. offset + amount]);
@@ -2925,10 +3164,10 @@ fn writeArrayRawPrefix(array: *ArrayValue, bytes: []const u8) ExecutionError!voi
     }
 }
 
-fn encodeArrayElement(cell: *const Cell, value_type: bytecode.ValueType, out: []u8) ExecutionError!void {
-    const scalar = try scalarAt(cell);
+fn encodeArrayElement(reference: Reference, value_type: bytecode.ValueType, out: []u8) ExecutionError!void {
+    const scalar = try reference.value();
     if (scalar.valueType() != value_type or out.len != try arrayElementWidth(value_type)) return error.TypeMismatch;
-    switch (scalar.*) {
+    switch (scalar) {
         .integer => |number| std.mem.writeInt(u16, out[0..2], @bitCast(number), .little),
         .long => |number| std.mem.writeInt(u32, out[0..4], @bitCast(number), .little),
         .single => |number| std.mem.writeInt(u32, out[0..4], @bitCast(number), .little),
@@ -2937,16 +3176,16 @@ fn encodeArrayElement(cell: *const Cell, value_type: bytecode.ValueType, out: []
     }
 }
 
-fn decodeArrayElement(cell: *Cell, value_type: bytecode.ValueType, bytes: []const u8) ExecutionError!void {
-    const scalar = try scalarAtMutable(cell);
-    if (scalar.valueType() != value_type or bytes.len != try arrayElementWidth(value_type)) return error.TypeMismatch;
-    scalar.* = switch (value_type) {
+fn decodeArrayElement(reference: Reference, value_type: bytecode.ValueType, bytes: []const u8) ExecutionError!void {
+    if (try reference.valueType() != value_type or bytes.len != try arrayElementWidth(value_type)) return error.TypeMismatch;
+    const scalar: values.Value = switch (value_type) {
         .integer => .{ .integer = @bitCast(std.mem.readInt(u16, bytes[0..2], .little)) },
         .long => .{ .long = @bitCast(std.mem.readInt(u32, bytes[0..4], .little)) },
         .single => .{ .single = @bitCast(std.mem.readInt(u32, bytes[0..4], .little)) },
         .double => .{ .double = @bitCast(std.mem.readInt(u64, bytes[0..8], .little)) },
         .string => return error.TypeMismatch,
     };
+    try reference.replaceNumeric(scalar);
 }
 
 fn runtimeCode(fault: ExecutionError) RuntimeCode {
@@ -3043,17 +3282,89 @@ fn allocateVariable(
     if (variable.isArray()) {
         const dimensions = try allocator.alloc(Dimension, 0);
         errdefer allocator.free(dimensions);
-        const elements = try allocator.alloc(Cell, 0);
+        const storage = try allocateEmptyArrayStorage(allocator, variable.value_type, variable.record_type);
         return .{ .owned = .{ .array = .{
             .value_type = variable.value_type,
             .record_type = variable.record_type,
             .expected_dimensions = variable.dimensions,
             .is_dynamic = variable.is_dynamic,
             .dimensions = dimensions,
-            .elements = elements,
+            .storage = storage,
         } } };
     }
     return allocateElement(allocator, program, variable.value_type, variable.record_type);
+}
+
+fn allocateEmptyArrayStorage(
+    allocator: std.mem.Allocator,
+    value_type: bytecode.ValueType,
+    record_type: u32,
+) std.mem.Allocator.Error!ArrayStorage {
+    if (record_type != bytecode.invalid_index) return .{ .cells = try allocator.alloc(Cell, 0) };
+    return switch (value_type) {
+        .integer => .{ .integer = try allocator.alloc(i16, 0) },
+        .long => .{ .long = try allocator.alloc(i32, 0) },
+        .single => .{ .single = try allocator.alloc(f32, 0) },
+        .double => .{ .double = try allocator.alloc(f64, 0) },
+        .string => .{ .cells = try allocator.alloc(Cell, 0) },
+    };
+}
+
+fn arrayLogicalPayloadBytes(
+    program: *const bytecode.Program,
+    value_type: bytecode.ValueType,
+    record_type: u32,
+    element_count: usize,
+) ExecutionError!usize {
+    const bytes_per_element: usize = if (record_type == bytecode.invalid_index)
+        switch (value_type) {
+            .integer => @sizeOf(i16),
+            .long => @sizeOf(i32),
+            .single => @sizeOf(f32),
+            .double => @sizeOf(f64),
+            .string => @sizeOf(Cell),
+        }
+    else record: {
+        if (record_type >= program.record_types.len) return error.InvalidInstruction;
+        const field_bytes = std.math.mul(usize, program.record_types[record_type].fields.len, @sizeOf(Cell)) catch return error.OutOfMemory;
+        break :record std.math.add(usize, @sizeOf(Cell), field_bytes) catch return error.OutOfMemory;
+    };
+    return std.math.mul(usize, element_count, bytes_per_element) catch return error.OutOfMemory;
+}
+
+fn resizeCompactArrayStorage(
+    allocator: std.mem.Allocator,
+    storage: *ArrayStorage,
+    new_len: usize,
+    value_type: bytecode.ValueType,
+) ExecutionError!void {
+    switch (storage.*) {
+        .integer => |items| {
+            if (value_type != .integer) return error.InvalidInstruction;
+            const replacement = try allocator.realloc(items, new_len);
+            @memset(replacement, 0);
+            storage.* = .{ .integer = replacement };
+        },
+        .long => |items| {
+            if (value_type != .long) return error.InvalidInstruction;
+            const replacement = try allocator.realloc(items, new_len);
+            @memset(replacement, 0);
+            storage.* = .{ .long = replacement };
+        },
+        .single => |items| {
+            if (value_type != .single) return error.InvalidInstruction;
+            const replacement = try allocator.realloc(items, new_len);
+            @memset(replacement, 0);
+            storage.* = .{ .single = replacement };
+        },
+        .double => |items| {
+            if (value_type != .double) return error.InvalidInstruction;
+            const replacement = try allocator.realloc(items, new_len);
+            @memset(replacement, 0);
+            storage.* = .{ .double = replacement };
+        },
+        .cells => return error.InvalidInstruction,
+    }
 }
 
 fn allocateElement(
@@ -3086,7 +3397,10 @@ fn resolveCell(original: *Cell) ?*Cell {
     while (depth <= maximum_call_depth) : (depth += 1) {
         switch (cell.*) {
             .owned => return cell,
-            .alias => |target| cell = target,
+            .alias => |target| switch (target) {
+                .cell => |next| cell = next,
+                else => return null,
+            },
         }
     }
     return null;
@@ -3098,7 +3412,10 @@ fn resolveCellConst(original: *const Cell) ?*const Cell {
     while (depth <= maximum_call_depth) : (depth += 1) {
         switch (cell.*) {
             .owned => return cell,
-            .alias => |target| cell = target,
+            .alias => |target| switch (target) {
+                .cell => |next| cell = next,
+                else => return null,
+            },
         }
     }
     return null;
@@ -3120,26 +3437,44 @@ fn scalarAtMutable(cell: *Cell) ExecutionError!*values.Value {
     };
 }
 
-fn arrayElement(array: *ArrayValue, indices: []const i32) ?*Cell {
+fn arrayElement(array: *ArrayValue, indices: []const i32) ?Reference {
     if (indices.len != array.dimensions.len) return null;
     var offset: usize = 0;
     for (array.dimensions, indices) |dimension, index| {
         if (index < dimension.lower or index > dimension.upper) return null;
         offset += @as(usize, @intCast(index - dimension.lower)) * dimension.stride;
     }
-    if (offset >= array.elements.len) return null;
-    return &array.elements[offset];
+    return arrayReferenceAt(array, offset);
 }
 
-fn arrayElementConst(array: *const ArrayValue, indices: []const i32) ?*const Cell {
+fn arrayElementConst(array: *const ArrayValue, indices: []const i32) ?Reference {
     if (indices.len != array.dimensions.len) return null;
     var offset: usize = 0;
     for (array.dimensions, indices) |dimension, index| {
         if (index < dimension.lower or index > dimension.upper) return null;
         offset += @as(usize, @intCast(index - dimension.lower)) * dimension.stride;
     }
-    if (offset >= array.elements.len) return null;
-    return &array.elements[offset];
+    return arrayReferenceAtConst(array, offset);
+}
+
+fn arrayReferenceAt(array: *ArrayValue, offset: usize) ?Reference {
+    return switch (array.storage) {
+        .integer => |items| if (offset < items.len) .{ .integer = &items[offset] } else null,
+        .long => |items| if (offset < items.len) .{ .long = &items[offset] } else null,
+        .single => |items| if (offset < items.len) .{ .single = &items[offset] } else null,
+        .double => |items| if (offset < items.len) .{ .double = &items[offset] } else null,
+        .cells => |items| if (offset < items.len) .{ .cell = &items[offset] } else null,
+    };
+}
+
+fn arrayReferenceAtConst(array: *const ArrayValue, offset: usize) ?Reference {
+    return switch (array.storage) {
+        .integer => |items| if (offset < items.len) .{ .integer = &items[offset] } else null,
+        .long => |items| if (offset < items.len) .{ .long = &items[offset] } else null,
+        .single => |items| if (offset < items.len) .{ .single = &items[offset] } else null,
+        .double => |items| if (offset < items.len) .{ .double = &items[offset] } else null,
+        .cells => |items| if (offset < items.len) .{ .cell = &items[offset] } else null,
+    };
 }
 
 fn dataValue(

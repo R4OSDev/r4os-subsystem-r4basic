@@ -1295,6 +1295,8 @@ const MemoryFiles = struct {
     absolute_output: std.ArrayList(u8) = .empty,
     reads: u32 = 0,
     writes: u32 = 0,
+    fail_next_nonempty_write: bool = false,
+    failed_writes: u32 = 0,
 
     fn deinit(self: *MemoryFiles) void {
         self.output.deinit(std.testing.allocator);
@@ -1315,6 +1317,11 @@ const MemoryFiles = struct {
     fn write(context: ?*anyopaque, path: []const u8, bytes: []const u8, append: bool) core.vm.FileWriteResult {
         const self: *MemoryFiles = @ptrCast(@alignCast(context.?));
         self.writes += 1;
+        if (bytes.len != 0 and self.fail_next_nonempty_write) {
+            self.fail_next_nonempty_write = false;
+            self.failed_writes += 1;
+            return .{ .failure = .path_error };
+        }
         const target = if (std.ascii.eqlIgnoreCase(path, "C:\\GAMES\\output.txt"))
             &self.output
         else if (std.ascii.eqlIgnoreCase(path, "C:\\GAMES\\append.txt"))
@@ -1355,6 +1362,50 @@ test "sequential files resolve guest paths and preserve INPUT PRINT and EOF" {
     try std.testing.expectEqualStrings("\"Alice\",3", files.absolute_output.items);
     try std.testing.expect(files.reads != 0);
     try std.testing.expect(files.writes >= 4);
+    const counters = machine.performanceStats();
+    try std.testing.expectEqual(@as(usize, 0), machine.openFileCount());
+    try std.testing.expectEqual(@as(usize, 256), machine.fileIndexByteSize());
+    try std.testing.expect(machine.staticByteSize() < 16 * 1024);
+    try std.testing.expect(counters.file_table_capacity_grows != 0);
+    try std.testing.expect(counters.maximum_open_files != 0);
+}
+
+test "failed CLOSE keeps sparse file slots retryable and moved indices valid" {
+    const source =
+        \\DEFINT A-Z
+        \\ON ERROR GOTO Handler
+        \\OPEN "output.txt" FOR OUTPUT AS #1
+        \\OPEN "append.txt" FOR APPEND AS #255
+        \\PRINT #1, "first";
+        \\PRINT #255, "second";
+        \\CLOSE #1
+        \\CLOSE #255
+        \\Done = 1
+        \\END
+        \\Handler:
+        \\Failure = 1
+        \\RESUME
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\ATOMIC.BAS", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var files = MemoryFiles{ .fail_next_nonempty_write = true };
+    defer files.deinit();
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{
+        .file_context = &files,
+        .file_read = MemoryFiles.read,
+        .file_write = MemoryFiles.write,
+    });
+    defer machine.deinit();
+
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 32));
+    try expectInteger(&machine, "Done", 1);
+    try std.testing.expect(machine.global("Failure").?.integer != 0);
+    try std.testing.expectEqual(@as(u32, 1), files.failed_writes);
+    try std.testing.expectEqualStrings("first", files.output.items);
+    try std.testing.expectEqualStrings("second", files.appended.items);
+    try std.testing.expectEqual(@as(usize, 0), machine.openFileCount());
+    try std.testing.expectEqual(@as(u64, 2), machine.performanceStats().maximum_open_files);
 }
 
 test "file modes numbers devices and missing paths fail visibly" {

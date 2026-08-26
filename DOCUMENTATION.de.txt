@@ -6,7 +6,7 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.69.56
+Stand 0.69.59
 ------------
 
 Diese Ausbaustufe ist der produktive R4BASIC-v1-Subsystemhost. Explorer
@@ -160,6 +160,13 @@ Dimensionen und expliziten vorzeichenbehafteten Unter- und Obergrenzen
 anlegen. Ohne Untergrenze gilt null. REDIM behaelt Rang und Elementtyp bei,
 verwirft den alten Inhalt und initialisiert die neue Belegung. Pro Array gilt
 vor dem Allokationsversuch eine feste Schutzgrenze von 16.777.216 Elementen.
+INTEGER-, LONG-, SINGLE- und DOUBLE-Arrays speichern ihre Nutzlast typgerecht
+in 2, 4, 4 beziehungsweise 8 Byte pro Element; nur Strings und Datensaetze
+verwenden weiter generische Cells. Ueber alle Arrays einer VM sind 128 MiB
+logische Live-Nutzlast erlaubt. Ein atomarer DIM-/REDIM-Uebergang mit alter
+und neuer Nutzlast sowie beiden Dimensionstabellen ist auf 192 MiB begrenzt.
+Wird eine Grenze oder die reale Allokation nicht erfuellt, bleibt die alte
+Arraybelegung unveraendert und Fehler 7 wird sichtbar.
 
 TYPE-Deklarationen werden in unveraenderliche Layouts aus skalaren Feldern
 gebunden. Laufzeitwerte besitzen dagegen pro Instanz eigene Feldzellen.
@@ -312,6 +319,9 @@ begrenzt; Ausgaben werden pro Slot gesammelt und bei CLOSE oder normalem END
 geschrieben. Fehlende Dateien, falsche Modi, EOF-Ueberlauf und Pfadfehler
 behalten getrennte QBasic-Fehlernummern. RANDOM/BINARY, Drucker, COM-Ports,
 Loeschen und Verzeichnisveraenderungen sind nicht Bestandteil dieses Stands.
+Die Dateinummern 0 bis 255 werden ueber einen festen 256-Byte-Index in O(1)
+aufgeloest; nur wirklich offene Dateien besitzen einen dynamischen Slot samt
+Puffer. Dadurch entfallen 256 eingebettete optionale Dateizustaende pro VM.
 
 Audio und Music Macro Language
 ------------------------------
@@ -404,6 +414,10 @@ Prozeduren, Built-ins, Aggregate, DATA, Fehlerfortsetzung, das private
 Speicherbyte, Text und Eingabe, Zeit und Zufall, kooperatives TIMER-Pacing,
 sequentielle Dateien, Grafik, gepackte Bilder, MML, PCM-Pufferung,
 Audio-Degradation, endlose Ausfuehrung und getrennte Fehlerzustaende.
+Die Laufzeittests pruefen ausserdem exakte typisierte Arraybytes, Element-
+ByRef, den Live- und REDIM-Peak, unveraenderten Altinhalt bei Allocator-OOM,
+vorzeitige Ablehnung eines uebergrossen Recordarrays sowie den sparse
+Dateizustand.
 Zusaetzlich werden exakte Laufzeitpositionen und Fehlernummern, Rekursion,
 verschachteltes ByRef, Hostfehler, Reset, Nullbudget-Abbruch, Fokus- und
 Instanztrennung, pausierte Wartezeit, Fensterereignisse waehrend SLEEP,

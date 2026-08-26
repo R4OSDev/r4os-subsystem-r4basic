@@ -1003,6 +1003,22 @@ const RuntimeHost = struct {
             vm_stats.val_scratch_grows,
         }) catch return false;
         report_len += ownership_line.len;
+        const storage_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC storage: compact_array_resizes={d} generic_array_resizes={d} compact_array_elements={d} generic_array_initializations={d} array_live_bytes={d} array_live_peak_bytes={d} array_resize_live_peak_bytes={d} array_live_limit_bytes={d} array_resize_live_limit_bytes={d} vm_static_bytes={d} file_index_bytes={d} file_capacity_grows={d} max_open_files={d}\r\n", .{
+            vm_stats.compact_array_resizes,
+            vm_stats.generic_array_resizes,
+            vm_stats.compact_array_elements,
+            vm_stats.generic_array_initializations,
+            vm_stats.array_live_payload_bytes,
+            vm_stats.maximum_array_live_payload_bytes,
+            vm_stats.maximum_array_resize_live_bytes,
+            vm.array_live_payload_limit_bytes,
+            vm.array_resize_live_limit_bytes,
+            self.guest.machine.staticByteSize(),
+            self.guest.machine.fileIndexByteSize(),
+            vm_stats.file_table_capacity_grows,
+            vm_stats.maximum_open_files,
+        }) catch return false;
+        report_len += storage_line.len;
         const presenter_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC presenter: published_frames={d} skipped_frames={d} full_frames={d} damage_frames={d} raster_blocks={d} sampled_pixels={d}\r\n", .{
             presenter.published_frames,
             presenter.skipped_frames,

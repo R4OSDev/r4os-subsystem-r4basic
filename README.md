@@ -23,7 +23,7 @@ graphics retain their normal bounded pacing without repeated scratch work.
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.7`
+- Module version: `1.2.8`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -56,12 +56,13 @@ this repository and is read directly from the ignored workspace injection
 tree. The normal test step uses the permanent general BAS fixtures under
 `Tests/Fixtures`, including the standalone audio contract.
 
-R4BASIC 1.2.7 uses the shared 4,096-instruction runtime budget with an 8-ms
+R4BASIC 1.2.8 uses the shared 4,096-instruction runtime budget with an 8-ms
 production time boundary instead of the former 26-instruction/2-ms throttle.
 Runnable code returns without a fixed wake; repeated TIMER polls alone yield
 cooperatively at a 1-ms guest-time boundary. `Tests/performance_test.zig`
 checks budget/time bounds, string ownership, borrowed built-ins, retained
-lazy-local frame pools and bounded formatting/VAL storage. `/PERFTEST` prints
+lazy-local frame pools, compact numeric arrays, atomic bounded `REDIM`, and
+bounded formatting/VAL storage. `/PERFTEST` prints
 separate QEMU-readable numeric, 4-KB assignment, LEN, UCASE$, call and array
 markers plus an exact summary. The productive artifact remains the canonical
 GUI subsystem host and uses its measured module-local `OPTIMIZE=speed` profile.
