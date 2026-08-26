@@ -243,7 +243,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     });
 }
 
-const performance_source =
+const performance_numeric_source =
     \\DEFINT A-Z
     \\A = 0
     \\Work:
@@ -252,27 +252,139 @@ const performance_source =
     \\GOTO Work
 ;
 
+const performance_string_assignment_source =
+    \\A$ = SPACE$(4096)
+    \\Work:
+    \\B$ = A$
+    \\GOTO Work
+;
+
+const performance_string_len_source =
+    \\A$ = SPACE$(4096)
+    \\Work:
+    \\L% = LEN(A$)
+    \\GOTO Work
+;
+
+const performance_string_ucase_source =
+    \\A$ = SPACE$(4096)
+    \\Work:
+    \\B$ = UCASE$(A$)
+    \\GOTO Work
+;
+
+const performance_call_source =
+    \\DEFINT A-Z
+    \\DECLARE SUB Work ()
+    \\DIM SHARED A AS LONG
+    \\Again:
+    \\CALL Work()
+    \\GOTO Again
+    \\SUB Work ()
+    \\    DIM LocalValue AS LONG
+    \\    LocalValue = A
+    \\    A = A + 1
+    \\END SUB
+;
+
+const performance_array_source =
+    \\DEFINT A-Z
+    \\DIM Values(255) AS LONG
+    \\I = 0
+    \\Work:
+    \\Values(I) = Values(I) + 1
+    \\I = I + 1
+    \\IF I > 255 THEN I = 0
+    \\GOTO Work
+;
+
+const PerformanceKind = enum {
+    numeric,
+    string_assignment,
+    string_len,
+    string_ucase,
+    call,
+    array,
+};
+
+const PerformanceWorkload = struct {
+    name: []const u8,
+    file_name: []const u8,
+    source: []const u8,
+    kind: PerformanceKind,
+};
+
+const performance_workloads = [_]PerformanceWorkload{
+    .{ .name = "numeric", .file_name = "R4BASIC-PERF-NUMERIC.BAS", .source = performance_numeric_source, .kind = .numeric },
+    .{ .name = "string-assign", .file_name = "R4BASIC-PERF-STRING-ASSIGN.BAS", .source = performance_string_assignment_source, .kind = .string_assignment },
+    .{ .name = "string-len", .file_name = "R4BASIC-PERF-STRING-LEN.BAS", .source = performance_string_len_source, .kind = .string_len },
+    .{ .name = "string-ucase", .file_name = "R4BASIC-PERF-STRING-UCASE.BAS", .source = performance_string_ucase_source, .kind = .string_ucase },
+    .{ .name = "call", .file_name = "R4BASIC-PERF-CALL.BAS", .source = performance_call_source, .kind = .call },
+    .{ .name = "array", .file_name = "R4BASIC-PERF-ARRAY.BAS", .source = performance_array_source, .kind = .array },
+};
+
+const PerformanceResult = struct {
+    instructions: u64,
+    elapsed_ticks: u64,
+    ips: u64,
+    slices: u64,
+    maximum_slice: u32,
+    time_limited_steps: u64,
+    no_fixed_sleep: bool,
+    clock_reads: u64,
+    maximum_clock_reads: u32,
+    ns_per_instruction: u64,
+    stats: vm.PerformanceStats,
+    ok: bool,
+};
+
 fn runPerformanceSelfTest(app: *r4os.App) i32 {
     const allocator = app.allocator() orelse return r4os.abi.err_no_group;
     const sys = app.system();
-    sys.println("R4BASIC performance stage: compile");
-    var program = compiler.compile(allocator, "R4BASIC-PERFTEST.BAS", performance_source) catch return performanceFailure(sys, "compile");
+    var results: [performance_workloads.len]PerformanceResult = undefined;
+    var all_ok = true;
+    for (performance_workloads, 0..) |workload, index| {
+        sys.print("R4BASIC performance stage: workload=");
+        sys.write(workload.name);
+        sys.println(" phase=run");
+        results[index] = runPerformanceWorkload(allocator, &sys, workload) orelse return performanceFailure(sys, workload.name);
+        writePerformanceWorkload(sys, workload, results[index]);
+        all_ok = all_ok and results[index].ok;
+    }
+
+    sys.print("R4BASIC performance: numericIps=");
+    sys.printU64(results[0].ips);
+    sys.print(" stringAssignIps=");
+    sys.printU64(results[1].ips);
+    sys.print(" stringLenIps=");
+    sys.printU64(results[2].ips);
+    sys.print(" stringUcaseIps=");
+    sys.printU64(results[3].ips);
+    sys.print(" callIps=");
+    sys.printU64(results[4].ips);
+    sys.print(" arrayIps=");
+    sys.printU64(results[5].ips);
+    sys.print(" result=");
+    sys.println(if (all_ok) "OK" else "FAILED");
+    return if (all_ok) 0 else 1;
+}
+
+fn runPerformanceWorkload(allocator: std.mem.Allocator, sys: *const r4os.r4sys.Context, workload: PerformanceWorkload) ?PerformanceResult {
+    var program = compiler.compile(allocator, workload.file_name, workload.source) catch return null;
     defer program.deinit();
-    if (!program.ok()) return performanceFailure(sys, "diagnostic");
-    sys.println("R4BASIC performance stage: vm-init");
-    var machine = vm.Vm.init(allocator, &program, .{}) catch return performanceFailure(sys, "vm-init");
+    if (!program.ok()) return null;
+    var machine = vm.Vm.init(allocator, &program, .{}) catch return null;
     defer machine.deinit();
-    var adapter = runtime_adapter.Adapter.initSystem(&machine, &sys);
+    var adapter = runtime_adapter.Adapter.initSystem(&machine, sys);
     const hz = @max(sys.monotonicHz(), 1);
     const start_tick = sys.ticks();
-    const benchmark_ticks = @max((@as(u64, hz) * 50 + 999) / 1000, 1);
+    const benchmark_ticks = @max((@as(u64, hz) * 200 + 999) / 1000, 1);
     const deadline = start_tick +| benchmark_ticks;
     var slices: u64 = 0;
     var no_fixed_sleep = true;
-    sys.println("R4BASIC performance stage: run");
     while (sys.ticks() < deadline) {
         const result = adapter.driver().step(runtime_api.default_slice_budget, 0);
-        if (result.status != .progress) return performanceFailure(sys, "unexpected-step");
+        if (result.status != .progress) return null;
         if (result.wake_guest_ns != 0) no_fixed_sleep = false;
         slices +%= 1;
         sys.taskYield();
@@ -284,48 +396,80 @@ fn runPerformanceSelfTest(app: *r4os.App) i32 {
     _ = adapter.driver().step(runtime_api.default_slice_budget, 0);
     const stats = machine.performanceStats();
     const ns_per_instruction = if (instructions == 0) @as(u64, 0) else adapter.performance.elapsed_ns / instructions;
-    const ok = machine.status == .cancelled and no_fixed_sleep and ips >= 52_000 and
+    const common_ok = machine.status == .cancelled and no_fixed_sleep and ips != 0 and
         adapter.performance.maximum_instructions <= runtime_api.default_slice_budget and
         adapter.performance.maximum_clock_reads <= 17 and ns_per_instruction != 0 and
         stats.cancel_callback_checks != 0 and stats.cancel_callback_checks < instructions and
         stats.instruction_metadata_reads != 0 and stats.instruction_metadata_reads < instructions and
         stats.text_sync_checks != 0 and stats.text_sync_checks < instructions and
-        stats.cell_resolve_calls != 0 and
-        stats.group(.value) != 0 and stats.group(.arithmetic) != 0 and stats.group(.control) != 0;
+        stats.cell_resolve_calls != 0;
+    const workload_ok = switch (workload.kind) {
+        .numeric => ips >= 52_000 and stats.group(.value) != 0 and stats.group(.arithmetic) != 0 and stats.group(.control) != 0,
+        .string_assignment => stats.string_clones != 0 and stats.string_clone_bytes == stats.string_clones * 4096,
+        .string_len => stats.builtin_borrowed_arguments != 0 and stats.string_clones == 0,
+        .string_ucase => stats.builtin_borrowed_arguments != 0 and stats.string_clones == 0,
+        .call => stats.procedure_calls != 0 and stats.local_pool_grows != 0 and stats.local_pool_reuses != 0 and
+            stats.local_pool_grows + stats.local_pool_reuses == stats.procedure_calls and
+            stats.local_initializations == stats.procedure_calls,
+        .array => stats.group(.value) != 0 and stats.group(.arithmetic) != 0,
+    };
+    return .{
+        .instructions = instructions,
+        .elapsed_ticks = elapsed,
+        .ips = ips,
+        .slices = slices,
+        .maximum_slice = adapter.performance.maximum_instructions,
+        .time_limited_steps = adapter.performance.time_limited_steps,
+        .no_fixed_sleep = no_fixed_sleep,
+        .clock_reads = adapter.performance.clock_reads,
+        .maximum_clock_reads = adapter.performance.maximum_clock_reads,
+        .ns_per_instruction = ns_per_instruction,
+        .stats = stats,
+        .ok = common_ok and workload_ok,
+    };
+}
 
-    sys.print("R4BASIC performance: instructions=");
-    sys.printU64(instructions);
+fn writePerformanceWorkload(sys: r4os.r4sys.Context, workload: PerformanceWorkload, result: PerformanceResult) void {
+    sys.print("R4BASIC performance-workload: name=");
+    sys.write(workload.name);
+    sys.print(" instructions=");
+    sys.printU64(result.instructions);
     sys.print(" ticks=");
-    sys.printU64(elapsed);
+    sys.printU64(result.elapsed_ticks);
     sys.print(" ips=");
-    sys.printU64(ips);
+    sys.printU64(result.ips);
     sys.print(" slices=");
-    sys.printU64(slices);
+    sys.printU64(result.slices);
     sys.print(" maxSlice=");
-    sys.printU64(adapter.performance.maximum_instructions);
+    sys.printU64(result.maximum_slice);
     sys.print(" timeLimited=");
-    sys.printU64(adapter.performance.time_limited_steps);
+    sys.printU64(result.time_limited_steps);
     sys.print(" noFixedSleep=");
-    sys.printU64(if (no_fixed_sleep) 1 else 0);
+    sys.printU64(if (result.no_fixed_sleep) 1 else 0);
     sys.print(" clockReads=");
-    sys.printU64(adapter.performance.clock_reads);
+    sys.printU64(result.clock_reads);
     sys.print(" maxClockReads=");
-    sys.printU64(adapter.performance.maximum_clock_reads);
+    sys.printU64(result.maximum_clock_reads);
     sys.print(" nsPerInstruction=");
-    sys.printU64(ns_per_instruction);
-    sys.print(" cancelCallbacks=");
-    sys.printU64(stats.cancel_callback_checks);
-    sys.print(" metadataReads=");
-    sys.printU64(stats.instruction_metadata_reads);
-    sys.print(" textSyncChecks=");
-    sys.printU64(stats.text_sync_checks);
-    sys.print(" cellResolves=");
-    sys.printU64(stats.cell_resolve_calls);
-    sys.print(" conversions=");
-    sys.printU64(stats.value_conversions);
+    sys.printU64(result.ns_per_instruction);
+    sys.print(" stringClones=");
+    sys.printU64(result.stats.string_clones);
+    sys.print(" stringCloneBytes=");
+    sys.printU64(result.stats.string_clone_bytes);
+    sys.print(" borrowedBuiltins=");
+    sys.printU64(result.stats.builtin_borrowed_arguments);
+    sys.print(" ownedBuiltins=");
+    sys.printU64(result.stats.builtin_owned_arguments);
+    sys.print(" procedureCalls=");
+    sys.printU64(result.stats.procedure_calls);
+    sys.print(" localPoolGrows=");
+    sys.printU64(result.stats.local_pool_grows);
+    sys.print(" localPoolReuses=");
+    sys.printU64(result.stats.local_pool_reuses);
+    sys.print(" localInitializations=");
+    sys.printU64(result.stats.local_initializations);
     sys.print(" result=");
-    sys.println(if (ok) "OK" else "FAILED");
-    return if (ok) 0 else 1;
+    sys.println(if (result.ok) "OK" else "FAILED");
 }
 
 fn performanceFailure(sys: r4os.r4sys.Context, stage: []const u8) i32 {
@@ -839,6 +983,26 @@ const RuntimeHost = struct {
             vm_stats.maximum_timer_wake_lateness_ns,
         }) catch return false;
         report_len += vm_line.len;
+        const ownership_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC ownership: compile_borrowed={d} string_clones={d} string_clone_bytes={d} builtin_borrowed={d} builtin_owned={d} procedure_calls={d} local_pool_grows={d} local_pool_reuses={d} local_initializations={d} local_initialization_bytes={d} local_aggregate_initializations={d} format_stack_uses={d} str_result_allocations={d} val_direct={d} val_stack={d} val_scratch={d} val_scratch_grows={d}\r\n", .{
+            self.compile_stats.borrowed_builtin_arguments,
+            vm_stats.string_clones,
+            vm_stats.string_clone_bytes,
+            vm_stats.builtin_borrowed_arguments,
+            vm_stats.builtin_owned_arguments,
+            vm_stats.procedure_calls,
+            vm_stats.local_pool_grows,
+            vm_stats.local_pool_reuses,
+            vm_stats.local_initializations,
+            vm_stats.local_initialization_bytes,
+            vm_stats.local_aggregate_initializations,
+            vm_stats.numeric_format_stack_uses,
+            vm_stats.str_result_allocations,
+            vm_stats.val_direct_parses,
+            vm_stats.val_stack_normalizations,
+            vm_stats.val_scratch_normalizations,
+            vm_stats.val_scratch_grows,
+        }) catch return false;
+        report_len += ownership_line.len;
         const presenter_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC presenter: published_frames={d} skipped_frames={d} full_frames={d} damage_frames={d} raster_blocks={d} sampled_pixels={d}\r\n", .{
             presenter.published_frames,
             presenter.skipped_frames,

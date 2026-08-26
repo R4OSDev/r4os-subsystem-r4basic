@@ -1,7 +1,7 @@
 const std = @import("std");
 const frontend = @import("frontend.zig");
 
-pub const contract_version = "1.4.0";
+pub const contract_version = "1.5.0";
 pub const invalid_index: u32 = std.math.maxInt(u32);
 pub const unknown_dimensions: u8 = std.math.maxInt(u8);
 
@@ -356,6 +356,7 @@ pub const CompileStats = struct {
     initial_list_bytes: u64 = 0,
     instruction_hot_bytes: u64 = 0,
     instruction_metadata_bytes: u64 = 0,
+    borrowed_builtin_arguments: u64 = 0,
     allocator_allocations: u64 = 0,
     allocator_reallocations: u64 = 0,
     allocator_copy_bytes: u64 = 0,

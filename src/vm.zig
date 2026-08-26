@@ -6,7 +6,7 @@ const graphics_screen = @import("graphics_screen.zig");
 const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "1.6.0";
+pub const contract_version = "1.7.0";
 pub const default_instruction_budget: u32 = 4096;
 pub const timer_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
@@ -20,6 +20,7 @@ pub const maximum_file_number: usize = 255;
 pub const input_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const random_mask: u32 = 0x00FF_FFFF;
 pub const default_random_seed: u32 = 0x0050_0000;
+pub const numeric_format_buffer_bytes: usize = 128;
 
 pub const MathOperation = enum(u8) {
     atn,
@@ -168,6 +169,22 @@ pub const PerformanceStats = struct {
     timer_calls: u64 = 0,
     timer_waits: u64 = 0,
     maximum_timer_wake_lateness_ns: u64 = 0,
+    string_clones: u64 = 0,
+    string_clone_bytes: u64 = 0,
+    builtin_borrowed_arguments: u64 = 0,
+    builtin_owned_arguments: u64 = 0,
+    procedure_calls: u64 = 0,
+    local_pool_grows: u64 = 0,
+    local_pool_reuses: u64 = 0,
+    local_initializations: u64 = 0,
+    local_initialization_bytes: u64 = 0,
+    local_aggregate_initializations: u64 = 0,
+    numeric_format_stack_uses: u64 = 0,
+    str_result_allocations: u64 = 0,
+    val_direct_parses: u64 = 0,
+    val_stack_normalizations: u64 = 0,
+    val_scratch_normalizations: u64 = 0,
+    val_scratch_grows: u64 = 0,
 
     pub fn group(self: *const PerformanceStats, operation_group: OperationGroup) u64 {
         return self.groups[@intFromEnum(operation_group)];
@@ -282,6 +299,22 @@ const ResolvedCell = struct {
     }
 };
 
+const FrameLocalSlot = struct {
+    cell: Cell = undefined,
+    generation: u64 = 0,
+    next_initialized: u32 = bytecode.invalid_index,
+};
+
+const FrameLocalStorage = struct {
+    slots: std.ArrayList(FrameLocalSlot) = .empty,
+    generation: u64 = 0,
+
+    fn deinit(self: *FrameLocalStorage, allocator: std.mem.Allocator) void {
+        self.slots.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 const Frame = struct {
     procedure_id: u32,
     return_ip: u32,
@@ -290,13 +323,10 @@ const Frame = struct {
     call_resume_next: u32,
     error_handler_ip: u32 = bytecode.invalid_index,
     error_handler_active: bool = false,
-    locals: []Cell,
-
-    fn deinit(self: *Frame, allocator: std.mem.Allocator) void {
-        for (self.locals) |*cell| cell.deinit(allocator);
-        allocator.free(self.locals);
-        self.* = undefined;
-    }
+    local_pool_index: usize,
+    local_count: u32,
+    local_generation: u64,
+    initialized_local_head: u32 = bytecode.invalid_index,
 };
 
 const StackItem = union(enum) {
@@ -355,6 +385,7 @@ pub const Vm = struct {
     globals: []Cell,
     stack: std.ArrayList(StackItem) = .empty,
     frames: std.ArrayList(Frame) = .empty,
+    frame_local_storage: std.ArrayList(FrameLocalStorage) = .empty,
     gosub_stack: std.ArrayList(GosubEntry) = .empty,
     instruction_pointer: u32,
     total_instructions: u64 = 0,
@@ -376,6 +407,22 @@ pub const Vm = struct {
     timer_calls: u64 = 0,
     timer_waits: u64 = 0,
     maximum_timer_wake_lateness_ns: u64 = 0,
+    string_clones: u64 = 0,
+    string_clone_bytes: u64 = 0,
+    builtin_borrowed_arguments: u64 = 0,
+    builtin_owned_arguments: u64 = 0,
+    procedure_calls: u64 = 0,
+    local_pool_grows: u64 = 0,
+    local_pool_reuses: u64 = 0,
+    local_initializations: u64 = 0,
+    local_initialization_bytes: u64 = 0,
+    local_aggregate_initializations: u64 = 0,
+    numeric_format_stack_uses: u64 = 0,
+    str_result_allocations: u64 = 0,
+    val_direct_parses: u64 = 0,
+    val_stack_normalizations: u64 = 0,
+    val_scratch_normalizations: u64 = 0,
+    val_scratch_grows: u64 = 0,
     status: Status = .ready,
     exit_code: i32 = 0,
     runtime_diagnostic: ?RuntimeDiagnostic = null,
@@ -394,6 +441,7 @@ pub const Vm = struct {
     keyboard_generation: u64 = 0,
     input_focused: bool = true,
     input_line: std.ArrayList(u8) = .empty,
+    numeric_scratch: std.ArrayList(u8) = .empty,
     pending_input_instruction: u32 = bytecode.invalid_index,
     guest_now_ns: u64 = 0,
     wait_wake_ns: u64 = 0,
@@ -437,12 +485,15 @@ pub const Vm = struct {
         self.stack.deinit(self.allocator);
         while (self.frames.pop()) |frame_value| {
             var frame = frame_value;
-            frame.deinit(self.allocator);
+            self.releaseFrameLocals(&frame);
         }
         self.frames.deinit(self.allocator);
+        for (self.frame_local_storage.items) |*storage| storage.deinit(self.allocator);
+        self.frame_local_storage.deinit(self.allocator);
         self.gosub_stack.deinit(self.allocator);
         self.keyboard.deinit(self.allocator);
         self.input_line.deinit(self.allocator);
+        self.numeric_scratch.deinit(self.allocator);
         self.audio_engine.deinit();
         self.discardFiles();
         self.graphics.deinit(self.allocator);
@@ -540,7 +591,7 @@ pub const Vm = struct {
         self.discardStackFrom(0);
         while (self.frames.pop()) |frame_value| {
             var frame = frame_value;
-            frame.deinit(self.allocator);
+            self.releaseFrameLocals(&frame);
         }
         self.gosub_stack.clearRetainingCapacity();
         deinitGlobals(self.allocator, self.globals);
@@ -565,6 +616,22 @@ pub const Vm = struct {
         self.timer_calls = 0;
         self.timer_waits = 0;
         self.maximum_timer_wake_lateness_ns = 0;
+        self.string_clones = 0;
+        self.string_clone_bytes = 0;
+        self.builtin_borrowed_arguments = 0;
+        self.builtin_owned_arguments = 0;
+        self.procedure_calls = 0;
+        self.local_pool_grows = 0;
+        self.local_pool_reuses = 0;
+        self.local_initializations = 0;
+        self.local_initialization_bytes = 0;
+        self.local_aggregate_initializations = 0;
+        self.numeric_format_stack_uses = 0;
+        self.str_result_allocations = 0;
+        self.val_direct_parses = 0;
+        self.val_stack_normalizations = 0;
+        self.val_scratch_normalizations = 0;
+        self.val_scratch_grows = 0;
         self.status = .ready;
         self.exit_code = 0;
         self.runtime_diagnostic = null;
@@ -583,6 +650,7 @@ pub const Vm = struct {
         self.keyboard_generation = 0;
         self.input_focused = true;
         self.input_line.clearRetainingCapacity();
+        self.numeric_scratch.clearRetainingCapacity();
         self.pending_input_instruction = bytecode.invalid_index;
         self.guest_now_ns = 0;
         self.wait_wake_ns = 0;
@@ -706,6 +774,22 @@ pub const Vm = struct {
             .timer_calls = self.timer_calls,
             .timer_waits = self.timer_waits,
             .maximum_timer_wake_lateness_ns = self.maximum_timer_wake_lateness_ns,
+            .string_clones = self.string_clones,
+            .string_clone_bytes = self.string_clone_bytes,
+            .builtin_borrowed_arguments = self.builtin_borrowed_arguments,
+            .builtin_owned_arguments = self.builtin_owned_arguments,
+            .procedure_calls = self.procedure_calls,
+            .local_pool_grows = self.local_pool_grows,
+            .local_pool_reuses = self.local_pool_reuses,
+            .local_initializations = self.local_initializations,
+            .local_initialization_bytes = self.local_initialization_bytes,
+            .local_aggregate_initializations = self.local_aggregate_initializations,
+            .numeric_format_stack_uses = self.numeric_format_stack_uses,
+            .str_result_allocations = self.str_result_allocations,
+            .val_direct_parses = self.val_direct_parses,
+            .val_stack_normalizations = self.val_stack_normalizations,
+            .val_scratch_normalizations = self.val_scratch_normalizations,
+            .val_scratch_grows = self.val_scratch_grows,
         };
     }
 
@@ -1034,7 +1118,7 @@ pub const Vm = struct {
 
     fn load(self: *Vm, cell: ResolvedCell) ExecutionError!void {
         const value = try cell.scalar();
-        try self.pushValue(try value.clone(self.allocator));
+        try self.pushValue(try self.cloneValueTracked(value));
     }
 
     fn store(self: *Vm, cell: ResolvedCell, target: bytecode.ValueType) ExecutionError!void {
@@ -1262,7 +1346,7 @@ pub const Vm = struct {
         while (self.frames.items.len > keep_frames) {
             var frame = self.frames.pop().?;
             self.discardStackFrom(@min(frame.stack_base, self.stack.items.len));
-            frame.deinit(self.allocator);
+            self.releaseFrameLocals(&frame);
         }
         while (self.gosub_stack.items.len != 0 and self.gosub_stack.items[self.gosub_stack.items.len - 1].frame_depth > keep_frames) {
             _ = self.gosub_stack.pop();
@@ -1537,11 +1621,16 @@ pub const Vm = struct {
     }
 
     fn printNumber(self: *Vm, number: anytype, positive: bool) ExecutionError!void {
-        const formatted = try std.fmt.allocPrint(self.allocator, "{d}", .{number});
-        defer self.allocator.free(formatted);
+        var storage: [numeric_format_buffer_bytes]u8 = undefined;
+        const formatted = try self.formatNumber(&storage, number);
         if (positive) try self.printBytes(" ");
         try self.printBytes(formatted);
         try self.printBytes(" ");
+    }
+
+    fn formatNumber(self: *Vm, storage: *[numeric_format_buffer_bytes]u8, number: anytype) ExecutionError![]const u8 {
+        self.numeric_format_stack_uses +%= 1;
+        return std.fmt.bufPrint(storage, "{d}", .{number}) catch return error.Overflow;
     }
 
     fn printBytes(self: *Vm, bytes: []const u8) ExecutionError!void {
@@ -2112,51 +2201,23 @@ pub const Vm = struct {
         if (argument_count != procedure.parameters.len or argument_count > self.stack.items.len) return error.InvalidInstruction;
         const stack_base = self.stack.items.len - argument_count;
 
-        const locals = try self.allocator.alloc(Cell, procedure.locals.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (locals[0..initialized]) |*cell| cell.deinit(self.allocator);
-            self.allocator.free(locals);
-        }
-        for (procedure.locals, 0..) |variable, index| {
-            locals[index] = try allocateVariable(self.allocator, self.program, variable);
-            initialized += 1;
-        }
+        var frame = try self.acquireFrameLocalStorage(procedure_id, stack_base);
+        errdefer self.releaseFrameLocals(&frame);
 
         for (procedure.parameters, 0..) |parameter, index| {
             const item = self.stack.items[stack_base + index];
-            switch (parameter.passing_mode) {
+            const local = switch (parameter.passing_mode) {
                 .by_ref => switch (item) {
-                    .reference => |cell| {
-                        locals[parameter.local_index].deinit(self.allocator);
-                        locals[parameter.local_index] = .{ .alias = cell };
-                    },
-                    .value => |value| {
-                        var converted = try values.convert(self.allocator, value, parameter.value_type);
-                        errdefer converted.deinit(self.allocator);
-                        locals[parameter.local_index].deinit(self.allocator);
-                        locals[parameter.local_index] = .{ .owned = .{ .scalar = converted } };
-                    },
+                    .reference => |cell| Cell{ .alias = cell },
+                    .value => try self.cloneArgumentCell(item, parameter.value_type),
                 },
-                .by_value => {
-                    var argument = try self.cloneStackItem(item);
-                    defer argument.deinit(self.allocator);
-                    var converted = try values.convert(self.allocator, argument, parameter.value_type);
-                    errdefer converted.deinit(self.allocator);
-                    locals[parameter.local_index].deinit(self.allocator);
-                    locals[parameter.local_index] = .{ .owned = .{ .scalar = converted } };
-                },
-            }
+                .by_value => try self.cloneArgumentCell(item, parameter.value_type),
+            };
+            self.installPendingFrameLocal(&frame, parameter.local_index, local);
         }
 
-        try self.frames.append(self.allocator, .{
-            .procedure_id = procedure_id,
-            .return_ip = self.instruction_pointer,
-            .stack_base = stack_base,
-            .call_resume_ip = self.current_statement_start,
-            .call_resume_next = self.current_statement_next,
-            .locals = locals,
-        });
+        try self.frames.append(self.allocator, frame);
+        self.procedure_calls +%= 1;
         self.discardStackFrom(stack_base);
         self.instruction_pointer = procedure.entry_ip;
     }
@@ -2167,17 +2228,124 @@ pub const Vm = struct {
         const procedure = self.program.procedures[self.frames.items[frame_depth - 1].procedure_id];
         var return_value: ?values.Value = null;
         if (procedure.returnsValue()) {
-            return_value = try (try scalarAt(&self.frames.items[frame_depth - 1].locals[procedure.return_local])).clone(self.allocator);
+            const cell = try self.frameLocalCell(frame_depth - 1, procedure.return_local);
+            return_value = try self.cloneValueTracked(try (try self.resolveCellTracked(cell)).scalar());
         }
 
         var frame = self.frames.pop().?;
         self.discardStackFrom(frame.stack_base);
         self.instruction_pointer = frame.return_ip;
-        frame.deinit(self.allocator);
+        self.releaseFrameLocals(&frame);
         while (self.gosub_stack.items.len != 0 and self.gosub_stack.items[self.gosub_stack.items.len - 1].frame_depth >= frame_depth) {
             _ = self.gosub_stack.pop();
         }
         if (return_value) |value| try self.pushValue(value);
+    }
+
+    fn acquireFrameLocalStorage(self: *Vm, procedure_id: u32, stack_base: usize) ExecutionError!Frame {
+        const pool_index = self.frames.items.len;
+        if (pool_index == self.frame_local_storage.items.len) {
+            try self.frame_local_storage.append(self.allocator, .{});
+        }
+        if (pool_index >= self.frame_local_storage.items.len) return error.InvalidInstruction;
+
+        const local_count = self.program.procedures[procedure_id].locals.len;
+        var storage = &self.frame_local_storage.items[pool_index];
+        if (storage.slots.capacity < local_count) {
+            try storage.slots.ensureTotalCapacityPrecise(self.allocator, local_count);
+            self.local_pool_grows +%= 1;
+        } else {
+            self.local_pool_reuses +%= 1;
+        }
+        if (storage.slots.items.len < local_count) {
+            const previous = storage.slots.items.len;
+            storage.slots.items.len = local_count;
+            for (storage.slots.items[previous..]) |*slot| slot.* = .{};
+        }
+        storage.generation +%= 1;
+        if (storage.generation == 0) {
+            for (storage.slots.items) |*slot| slot.generation = 0;
+            storage.generation = 1;
+        }
+        return .{
+            .procedure_id = procedure_id,
+            .return_ip = self.instruction_pointer,
+            .stack_base = stack_base,
+            .call_resume_ip = self.current_statement_start,
+            .call_resume_next = self.current_statement_next,
+            .local_pool_index = pool_index,
+            .local_count = @intCast(local_count),
+            .local_generation = storage.generation,
+        };
+    }
+
+    fn cloneArgumentCell(self: *Vm, item: StackItem, target: bytecode.ValueType) ExecutionError!Cell {
+        var argument = try self.cloneStackItem(item);
+        if (argument.valueType() == target) return .{ .owned = .{ .scalar = argument } };
+        defer argument.deinit(self.allocator);
+        return .{ .owned = .{ .scalar = try values.convert(self.allocator, argument, target) } };
+    }
+
+    fn installPendingFrameLocal(self: *Vm, frame: *Frame, local_index: u32, cell: Cell) void {
+        std.debug.assert(local_index < frame.local_count);
+        var storage = &self.frame_local_storage.items[frame.local_pool_index];
+        var slot = &storage.slots.items[local_index];
+        std.debug.assert(slot.generation != frame.local_generation);
+        slot.cell = cell;
+        slot.generation = frame.local_generation;
+        slot.next_initialized = frame.initialized_local_head;
+        frame.initialized_local_head = local_index;
+        self.recordLocalInitialization(frame.procedure_id, local_index);
+    }
+
+    fn frameLocalCell(self: *Vm, frame_index: usize, local_index: u32) ExecutionError!*Cell {
+        if (frame_index >= self.frames.items.len) return error.InvalidInstruction;
+        const frame = self.frames.items[frame_index];
+        if (local_index >= frame.local_count) return error.InvalidInstruction;
+        var slot = &self.frame_local_storage.items[frame.local_pool_index].slots.items[local_index];
+        if (slot.generation != frame.local_generation) {
+            const variable = self.program.procedures[frame.procedure_id].locals[local_index];
+            const cell = try allocateVariable(self.allocator, self.program, variable);
+            self.installActiveFrameLocal(frame_index, local_index, cell);
+            slot = &self.frame_local_storage.items[frame.local_pool_index].slots.items[local_index];
+        }
+        return &slot.cell;
+    }
+
+    fn installActiveFrameLocal(self: *Vm, frame_index: usize, local_index: u32, cell: Cell) void {
+        const pool_index = self.frames.items[frame_index].local_pool_index;
+        const generation = self.frames.items[frame_index].local_generation;
+        var slot = &self.frame_local_storage.items[pool_index].slots.items[local_index];
+        std.debug.assert(slot.generation != generation);
+        slot.cell = cell;
+        slot.generation = generation;
+        slot.next_initialized = self.frames.items[frame_index].initialized_local_head;
+        self.frames.items[frame_index].initialized_local_head = local_index;
+        self.recordLocalInitialization(self.frames.items[frame_index].procedure_id, local_index);
+    }
+
+    fn recordLocalInitialization(self: *Vm, procedure_id: u32, local_index: u32) void {
+        self.local_initializations +%= 1;
+        self.local_initialization_bytes +|= @as(u64, @sizeOf(Cell));
+        const variable = self.program.procedures[procedure_id].locals[local_index];
+        if (variable.isArray() or variable.record_type != bytecode.invalid_index) {
+            self.local_aggregate_initializations +%= 1;
+        }
+    }
+
+    fn releaseFrameLocals(self: *Vm, frame: *Frame) void {
+        var storage = &self.frame_local_storage.items[frame.local_pool_index];
+        var current = frame.initialized_local_head;
+        while (current != bytecode.invalid_index) {
+            var slot = &storage.slots.items[current];
+            std.debug.assert(slot.generation == frame.local_generation);
+            const next = slot.next_initialized;
+            slot.cell.deinit(self.allocator);
+            slot.generation = 0;
+            slot.next_initialized = bytecode.invalid_index;
+            current = next;
+        }
+        frame.* = undefined;
     }
 
     fn gosub(self: *Vm, target: u32) ExecutionError!void {
@@ -2197,13 +2365,24 @@ pub const Vm = struct {
 
     fn callBuiltin(self: *Vm, builtin: bytecode.Builtin, argument_count: u32) ExecutionError!void {
         if (argument_count > 3 or argument_count > self.stack.items.len) return error.InvalidInstruction;
+        var argument_items: [3]StackItem = undefined;
         var arguments: [3]values.Value = undefined;
         var first_initialized: usize = argument_count;
-        defer for (arguments[first_initialized..argument_count]) |*argument| argument.deinit(self.allocator);
+        defer for (argument_items[first_initialized..argument_count]) |*argument| argument.deinit(self.allocator);
         while (first_initialized != 0) {
-            const argument = try self.popValue();
             first_initialized -= 1;
-            arguments[first_initialized] = argument;
+            const item = self.stack.pop().?;
+            argument_items[first_initialized] = item;
+            arguments[first_initialized] = switch (item) {
+                .value => |value| blk: {
+                    self.builtin_owned_arguments +%= 1;
+                    break :blk value;
+                },
+                .reference => |cell| blk: {
+                    self.builtin_borrowed_arguments +%= 1;
+                    break :blk (try (ResolvedCell{ .pointer = cell }).scalar()).*;
+                },
+            };
         }
 
         const result = try self.evaluateBuiltin(builtin, arguments[0..argument_count]);
@@ -2364,16 +2543,17 @@ pub const Vm = struct {
     }
 
     fn numberString(self: *Vm, input: values.Value) ExecutionError!values.Value {
+        var storage: [numeric_format_buffer_bytes]u8 = undefined;
         const body = switch (input) {
-            .integer => |number| try std.fmt.allocPrint(self.allocator, "{d}", .{number}),
-            .long => |number| try std.fmt.allocPrint(self.allocator, "{d}", .{number}),
-            .single => |number| try std.fmt.allocPrint(self.allocator, "{d}", .{number}),
-            .double => |number| try std.fmt.allocPrint(self.allocator, "{d}", .{number}),
+            .integer => |number| try self.formatNumber(&storage, number),
+            .long => |number| try self.formatNumber(&storage, number),
+            .single => |number| try self.formatNumber(&storage, number),
+            .double => |number| try self.formatNumber(&storage, number),
             .string => return error.TypeMismatch,
         };
-        defer self.allocator.free(body);
         const positive = body.len == 0 or body[0] != '-';
         const result = try self.allocator.alloc(u8, body.len + @intFromBool(positive));
+        self.str_result_allocations +%= 1;
         if (positive) result[0] = ' ';
         @memcpy(result[@intFromBool(positive)..], body);
         return .{ .string = result };
@@ -2402,8 +2582,34 @@ pub const Vm = struct {
             break;
         }
         if (length == 0) return .{ .double = 0 };
-        const normalized = try self.allocator.dupe(u8, trimmed[0..length]);
-        defer self.allocator.free(normalized);
+        const number_text = trimmed[0..length];
+        var needs_normalization = false;
+        for (number_text) |byte| {
+            if (byte == 'D' or byte == 'd') {
+                needs_normalization = true;
+                break;
+            }
+        }
+        if (!needs_normalization) {
+            self.val_direct_parses +%= 1;
+            const number = std.fmt.parseFloat(f64, number_text) catch return .{ .double = 0 };
+            if (!std.math.isFinite(number)) return error.Overflow;
+            return .{ .double = number };
+        }
+
+        var stack_storage: [numeric_format_buffer_bytes]u8 = undefined;
+        const normalized: []u8 = if (number_text.len <= stack_storage.len) blk: {
+            self.val_stack_normalizations +%= 1;
+            break :blk stack_storage[0..number_text.len];
+        } else blk: {
+            const previous_capacity = self.numeric_scratch.capacity;
+            try self.numeric_scratch.ensureTotalCapacityPrecise(self.allocator, number_text.len);
+            if (self.numeric_scratch.capacity != previous_capacity) self.val_scratch_grows +%= 1;
+            self.numeric_scratch.items.len = number_text.len;
+            self.val_scratch_normalizations +%= 1;
+            break :blk self.numeric_scratch.items;
+        };
+        @memcpy(normalized, number_text);
         for (normalized) |*byte| {
             if (byte.* == 'D' or byte.* == 'd') byte.* = 'E';
         }
@@ -2449,15 +2655,26 @@ pub const Vm = struct {
         const item = self.stack.pop() orelse return error.StackUnderflow;
         return switch (item) {
             .value => |value| value,
-            .reference => |cell| (try (ResolvedCell{ .pointer = cell }).scalar()).clone(self.allocator),
+            .reference => |cell| self.cloneValueTracked(try (ResolvedCell{ .pointer = cell }).scalar()),
         };
     }
 
     fn cloneStackItem(self: *Vm, item: StackItem) ExecutionError!values.Value {
         return switch (item) {
-            .value => |value| value.clone(self.allocator),
-            .reference => |cell| (try (ResolvedCell{ .pointer = cell }).scalar()).clone(self.allocator),
+            .value => |value| self.cloneValueTracked(&value),
+            .reference => |cell| self.cloneValueTracked(try (ResolvedCell{ .pointer = cell }).scalar()),
         };
+    }
+
+    fn cloneValueTracked(self: *Vm, value: *const values.Value) ExecutionError!values.Value {
+        switch (value.*) {
+            .string => |bytes| {
+                self.string_clones +%= 1;
+                self.string_clone_bytes +|= @intCast(bytes.len);
+            },
+            else => {},
+        }
+        return value.clone(self.allocator);
     }
 
     fn discardStackFrom(self: *Vm, first: usize) void {
@@ -2469,8 +2686,7 @@ pub const Vm = struct {
 
     fn localCellAt(self: *Vm, index: u32) ExecutionError!ResolvedCell {
         if (self.frames.items.len == 0) return error.InvalidInstruction;
-        if (index >= self.frames.items[self.frames.items.len - 1].locals.len) return error.InvalidInstruction;
-        return self.resolveCellTracked(&self.frames.items[self.frames.items.len - 1].locals[index]);
+        return self.resolveCellTracked(try self.frameLocalCell(self.frames.items.len - 1, index));
     }
 
     fn globalCellAt(self: *Vm, index: u32) ExecutionError!ResolvedCell {

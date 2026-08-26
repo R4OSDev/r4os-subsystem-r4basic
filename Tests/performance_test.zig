@@ -159,6 +159,185 @@ test "bound types and resolved cells remove only measured redundant VM work" {
     try std.testing.expectEqual(@as(f32, -1), machine.global("G!").?.single);
 }
 
+test "simple string assignment clones only the distinct destination value" {
+    const source =
+        \\A$ = "ABCD"
+        \\B$ = A$
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "string-assignment.bas", source);
+    defer program.deinit();
+    try std.testing.expect(program.ok());
+
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(64, 8));
+    const counters = machine.performanceStats();
+
+    try std.testing.expectEqualStrings("ABCD", machine.global("B$").?.string);
+    try std.testing.expectEqual(@as(u64, 1), counters.string_clones);
+    try std.testing.expectEqual(@as(u64, 4), counters.string_clone_bytes);
+    try std.testing.expectEqual(@as(u64, 2), counters.same_type_store_moves);
+}
+
+test "read only builtins borrow scalar arguments without cloning strings" {
+    const source =
+        \\A$ = "12.5"
+        \\L% = LEN(A$)
+        \\U$ = UCASE$(A$)
+        \\V# = VAL(A$)
+        \\N# = 2.5
+        \\I# = INT(N#)
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "borrowed-builtins.bas", source);
+    defer program.deinit();
+    try std.testing.expect(program.ok());
+    try std.testing.expectEqual(@as(u64, 3), program.compile_stats.borrowed_builtin_arguments);
+
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(64, 8));
+    const counters = machine.performanceStats();
+
+    try std.testing.expectEqual(@as(i16, 4), machine.global("L%").?.integer);
+    try std.testing.expectEqualStrings("12.5", machine.global("U$").?.string);
+    try std.testing.expectEqual(@as(f64, 12.5), machine.global("V#").?.double);
+    try std.testing.expectEqual(@as(f64, 2), machine.global("I#").?.double);
+    try std.testing.expectEqual(@as(u64, 3), counters.builtin_borrowed_arguments);
+    try std.testing.expectEqual(@as(u64, 1), counters.builtin_owned_arguments);
+    try std.testing.expectEqual(@as(u64, 0), counters.string_clones);
+    try std.testing.expectEqual(@as(u64, 1), counters.val_direct_parses);
+}
+
+test "borrowed builtins keep interactive procedure locals alive through nested calls" {
+    const source =
+        \\DECLARE FUNCTION ReadNumber# ()
+        \\Answer# = ReadNumber#()
+        \\END
+        \\FUNCTION ReadNumber# ()
+        \\    Result$ = ""
+        \\    Done = 0
+        \\    DO WHILE NOT Done
+        \\        Kbd$ = INKEY$
+        \\        SELECT CASE Kbd$
+        \\            CASE "0" TO "9"
+        \\                Result$ = Result$ + Kbd$
+        \\            CASE CHR$(13)
+        \\                Done = -1
+        \\            CASE CHR$(8)
+        \\                IF LEN(Result$) > 0 THEN Result$ = LEFT$(Result$, LEN(Result$) - 1)
+        \\        END SELECT
+        \\    LOOP
+        \\    ReadNumber# = VAL(Result$)
+        \\END FUNCTION
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "interactive-borrow.bas", source);
+    defer program.deinit();
+    try std.testing.expect(program.ok());
+
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    for ("4X6\x085\r") |byte| {
+        const accepted = switch (byte) {
+            8, 10, 13 => try machine.enqueueKeyCode(byte),
+            else => try machine.enqueueTextCodepoint(byte),
+        };
+        try std.testing.expect(accepted);
+    }
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(1024, 64));
+    try std.testing.expectEqual(@as(f64, 45), machine.global("Answer#").?.double);
+}
+
+test "procedure frames reuse their pool and initialize only reached locals" {
+    const source =
+        \\DEFINT A-Z
+        \\DECLARE SUB Touch ()
+        \\DIM SHARED Calls AS INTEGER
+        \\CALL Touch()
+        \\CALL Touch()
+        \\END
+        \\SUB Touch ()
+        \\    IF 0 THEN NeverTouched& = 1
+        \\    Used& = Calls
+        \\    Calls = Calls + 1
+        \\END SUB
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "frame-pool.bas", source);
+    defer program.deinit();
+    try std.testing.expect(program.ok());
+    try std.testing.expectEqual(@as(usize, 1), program.procedures.len);
+    try std.testing.expectEqual(@as(usize, 2), program.procedures[0].locals.len);
+
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 8));
+    const counters = machine.performanceStats();
+
+    try std.testing.expectEqual(@as(i16, 2), machine.global("Calls").?.integer);
+    try std.testing.expectEqual(@as(u64, 2), counters.procedure_calls);
+    try std.testing.expectEqual(@as(u64, 1), counters.local_pool_grows);
+    try std.testing.expectEqual(@as(u64, 1), counters.local_pool_reuses);
+    try std.testing.expectEqual(@as(u64, 2), counters.local_initializations);
+    try std.testing.expectEqual(@as(u64, 0), counters.local_aggregate_initializations);
+}
+
+test "number formatting and ordinary VAL avoid transient heap buffers" {
+    const source =
+        \\A$ = "12.5"
+        \\V# = VAL(A$)
+        \\D# = VAL("1D2")
+        \\S$ = STR$(123)
+        \\PRINT 42;
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "numeric-transients.bas", source);
+    defer program.deinit();
+    try std.testing.expect(program.ok());
+
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 8));
+    const counters = machine.performanceStats();
+
+    try std.testing.expectEqual(@as(f64, 12.5), machine.global("V#").?.double);
+    try std.testing.expectEqual(@as(f64, 100), machine.global("D#").?.double);
+    try std.testing.expectEqualStrings(" 123", machine.global("S$").?.string);
+    try std.testing.expectEqual(@as(u64, 2), counters.numeric_format_stack_uses);
+    try std.testing.expectEqual(@as(u64, 1), counters.str_result_allocations);
+    try std.testing.expectEqual(@as(u64, 1), counters.val_direct_parses);
+    try std.testing.expectEqual(@as(u64, 1), counters.val_stack_normalizations);
+    try std.testing.expectEqual(@as(u64, 0), counters.val_scratch_normalizations);
+    try std.testing.expectEqual(@as(u64, 0), counters.val_scratch_grows);
+}
+
+test "long D exponents reuse one retained VAL normalization buffer" {
+    const long_d_number =
+        "0000000000000000000000000000000000000000000000000000000000000000" ++
+        "0000000000000000000000000000000000000000000000000000000000000000" ++
+        "1D1";
+    comptime std.debug.assert(long_d_number.len > core.vm.numeric_format_buffer_bytes);
+    const source =
+        "A$ = \"" ++ long_d_number ++ "\"\n" ++
+        "B# = VAL(A$)\n" ++
+        "C# = VAL(A$)\n" ++
+        "END\n";
+    var program = try core.compiler.compile(std.testing.allocator, "val-scratch.bas", source);
+    defer program.deinit();
+    try std.testing.expect(program.ok());
+
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(64, 8));
+    const counters = machine.performanceStats();
+
+    try std.testing.expectEqual(@as(f64, 10), machine.global("B#").?.double);
+    try std.testing.expectEqual(@as(f64, 10), machine.global("C#").?.double);
+    try std.testing.expectEqual(@as(u64, 2), counters.builtin_borrowed_arguments);
+    try std.testing.expectEqual(@as(u64, 2), counters.val_scratch_normalizations);
+    try std.testing.expectEqual(@as(u64, 1), counters.val_scratch_grows);
+}
+
 test "cooperative TIMER retries at its guest deadline without an idle yield loop" {
     var program = try core.compiler.compile(std.testing.allocator, "timer-deadline.bas", "A! = TIMER\nB! = TIMER\nEND\n");
     defer program.deinit();

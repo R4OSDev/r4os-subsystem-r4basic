@@ -2509,7 +2509,7 @@ const Builder = struct {
                         try self.addDiagnostic(.wrong_argument_count, function_token.span);
                         return null;
                     }
-                    argument_types[argument_count] = (try self.parseExpression()) orelse return null;
+                    argument_types[argument_count] = (try self.parseBuiltinArgument()) orelse return null;
                     argument_count += 1;
                     if (!self.consume(.comma)) break;
                 }
@@ -2584,6 +2584,27 @@ const Builder = struct {
             .inkey_string, .timer => {},
         }
         return result;
+    }
+
+    fn parseBuiltinArgument(self: *Builder) !?bytecode.ValueType {
+        if (self.canAliasScalarArgument()) |alias| {
+            const next = self.peek(1);
+            if (next.kind == .dot or next.kind == .left_paren) return self.parseExpression();
+            const name = self.current();
+            const value_type = if (alias.reference) |reference| reference.value_type else self.inferredType(name.span);
+            if (value_type != .string) return self.parseExpression();
+            const argument = self.advance();
+            const variable = alias.reference orelse (try self.resolveVariable(argument.span, true)).?;
+            self.stats.reused_statement_bindings +%= 1;
+            const target = (try self.parseLvalueReferenceResolved(argument, variable)) orelse return null;
+            if (target.is_whole_array or target.record_type != bytecode.invalid_index) {
+                try self.addDiagnostic(.invalid_record_access, argument.span);
+                return null;
+            }
+            self.stats.borrowed_builtin_arguments +%= 1;
+            return target.value_type;
+        }
+        return self.parseExpression();
     }
 
     fn skipParenthesized(self: *Builder) void {

@@ -9,4 +9,4 @@ pub const text_screen = @import("text_screen.zig");
 pub const value = @import("value.zig");
 pub const vm = @import("vm.zig");
 
-pub const contract_version = "1.6.0";
+pub const contract_version = "1.7.0";

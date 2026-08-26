@@ -1,6 +1,6 @@
 ﻿# R4BASIC v1 core VM contract
 
-Contract version: `1.6.0`
+Contract version: `1.7.0`
 
 This document freezes the executable R4BASIC language layers. The broader
 source syntax accepted by the frontend remains defined in
@@ -70,6 +70,9 @@ aliases, and error-handler state belong to each VM instance.
 - Strings are owned byte strings with a maximum length of 32,767 bytes. They
   are not Unicode-decoded and may contain bytes above ASCII. Concatenation or
   a literal beyond the limit reports overflow.
+- Loading a string variable for assignment creates one distinct owner. A
+  same-type store moves that owner into the target and does not clone it a
+  second time; source and destination never share mutable ownership.
 - Numeric assignment converts to the target type. Floating-to-integer
   conversion rounds the absolute half away from zero and then checks the
   target range. Non-finite input and an out-of-range result report overflow.
@@ -130,7 +133,10 @@ partially changing the queue or persistent music settings.
   the concrete SUB or FUNCTION definition still fixes the runtime type.
   Records and scalar array elements are real aliases rather than copies.
 - Every call owns a separate frame, local values, return address, and stack
-  base. Recursion is supported up to 256 simultaneous frames.
+  base. Local slot capacity is retained per active recursion depth, while a
+  fresh generation initializes only parameters, returns and locals reached by
+  executed bytecode. Teardown destroys exactly those initialized Cells.
+  Recursion is supported up to 256 simultaneous frames.
 - Functions own a typed return cell addressed by their function name.
   `EXIT SUB` and `EXIT FUNCTION` return immediately through the same frame
   teardown path as the matching terminator.
@@ -145,6 +151,13 @@ The executable built-ins are `ABS`, `ATN`, `CHR$`, `CINT`, `COS`, `EOF`,
 `INKEY$`, `INSTR`, `INT`, `LEFT$`, `LEN`, `LTRIM$`, `MID$`, coordinate
 `POINT`, `RND`, `SIN`, `SPACE$`, `STR$`, `TIMER`, `UCASE$`, and `VAL` with
 the arities and type categories defined by the source contract.
+
+Simple scalar string lvalues are passed to read-only built-ins as non-owning
+Cell references. Numeric and expression arguments remain owned stack values,
+and every string result owns independent storage. Numeric PRINT and STR$ use
+a bounded 128-byte format buffer; STR$ allocates only its final result. VAL parses
+ordinary E/e text directly, normalizes short D/d text on the stack and reuses
+one VM-owned scratch buffer only for longer D/d input.
 
 `ATN`, `COS`, `SIN`, and power call an injected math service. Cancellation
 polling, the SCREEN-mode availability probe, and sequential file I/O are
