@@ -336,30 +336,39 @@ Audio und Music Macro Language
 ------------------------------
 
 Jede VM besitzt eigene Musikparameter, Ereignisse, Oszillatorphase und
-Zeitlinie. PLAY versteht O0 bis O6, Oktavwechsel, L1 bis L64, T32 bis T255,
+kumulative Quellframe-Fences. PLAY versteht O0 bis O6, Oktavwechsel, L1 bis L64, T32 bis T255,
 MB/MF, MN/ML/MS, Noten A bis G mit Vorzeichen und optionaler Laenge sowie
 Pausen, Punkte und N0 bis N84. MB laesst BASIC nach dem Einreihen sofort
-weiterlaufen; MF wartet kooperativ auf die gesamte Zeitlinie. BEEP erzeugt
-einen 800-Hz-Ton von 200 Millisekunden und wartet ebenfalls kooperativ.
+weiterlaufen; ein unmittelbar folgendes END laesst den Hosttransport aber bis
+zur Aufloesung der geplanten Frames auslaufen. MF und der 800-Hz-/200-ms-BEEP
+warten ereignisgesteuert auf angenommene, als Stille unterdrueckte oder
+explizit verworfene Quellframes. Gastzeit allein beendet diesen Wait nicht.
 
 Der Generator liefert erkennbares, absichtlich einfaches 24-kHz-Stereo-PCM
 in S16LE. Ein Servicepaket enthaelt 960 Frames beziehungsweise 40 ms; HDA
 interpoliert es linear in vier 48-kHz-Hardwareperioden. Der produktive Host
-haelt vier solche Quanten und damit 160 ms Quellton vor. Nach dieser einmaligen
-Vorfuellung reicht er genau ein Quantum je 40-ms-Audiotermin ein. Ein bei Busy
-nicht angenommenes Quantum bleibt in seiner Queue und wird fruehestens am
-naechsten Audiotermin erneut versucht; es gibt keine kapazitaetsgetriebene
-IPC-Abfrage in jedem Hostzyklus. Ueberschreitet eine Hostverzoegerung das gesamte Fenster, wird der
-alte Quellpuffer vor der Ausgabe verworfen und die VM setzt Notenposition und
-Oszillatorphase auf die aktuelle Gastzeit. Alte Melodiefragmente werden nicht
-verspaetet nachgespielt. Die Ausgabe bleibt ueber R4AUDIO gepact. Fehlt der Dienst oder faellt
-ein Stream dauerhaft aus, zeigt der Fenstertitel die Degradation. Busy,
-Timeout und ein kurzzeitig noch nicht bereiter Dienst werden beim Oeffnen
-dreimal im 50-ms-Abstand erneut versucht. Nach dauerhafter Degradation werden
-Queue, Vorfuellzustand und Audiodeadline einmalig entfernt; weitere
-Hostzyklen rendern oder verwerfen kein PCM mehr. Gastzeit, Eingabe und Grafik
-laufen mit ihren normalen begrenzten Wartezeiten weiter; beim Ende oder
-Schliessen wird der Stream genau einmal abgebaut.
+haelt vier solche Quanten und damit 160 ms Quellton vor. Er oeffnet aber erst
+fuer das erste nichtleere, nichtstille Quantum. Stille, Pause und Mute senden
+keine Nullpakete; bis zu acht stille Instanzen belegen daher keine
+AudioService-Session.
+
+Pro Hostzyklus erfolgt nach einer anstehenden Bildpraesentation hoechstens
+ein synchroner Serviceaufruf: Open, ein Vorfuell-/Regelwrite oder ein Close.
+Vorfuellung und Resync werden ueber frische Hostzyklen verteilt. Busy behaelt
+das identische caller-eigene PCM und verwendet eine unabhaengige 10-ms-
+Wiederholungsfrist statt eines ganzen 40-ms-Quantums. R4Basic begrenzt den
+einzelnen Serviceaufruf auf 25 ms; beim Oeffnen bleiben hoechstens drei
+weitere Versuche im 50-ms-Abstand. Ueberschreitet eine Hostverzoegerung das
+gesamte Catch-up-Fenster, wird nur der bereits gerenderte Quellpuffer explizit
+verworfen und gezaehlt; Gastzeit ueberspringt keine ungerenderten Noten.
+
+Serviceannahme ist kein Hardware-Ausspielstand. R4AUDIO/AUDSVC stellt aktuell
+keinen streambezogenen Playback-Cursor bereit. Der Bericht kennzeichnet ihn
+deshalb als `playback=unavailable` und erfindet keinen Played-Zaehler. Fehlt
+der Dienst oder faellt ein Stream dauerhaft aus, zeigt der Fenstertitel die
+Degradation, loest offene BASIC-Fences durch expliziten Discard auf und laesst
+Gastzeit, Eingabe und Grafik weiterlaufen. Ende und Close verwenden denselben
+idempotenten Abbau.
 
 Produktiver Fensterhost
 -----------------------
@@ -400,7 +409,11 @@ Instanz nach dem ersten produktiven Frame. Es gibt keine Ausgabe pro Frame.
 Der Bericht enthaelt zusaetzlich den ersten sichtbaren Compileframe, die Zahl
 der Fortschrittsframes, die strukturellen Compilerzaehler sowie getrennte
 Damage-Regionen, Presenter-Voll-/Deltaframes, Indexed8-Bloecke und -Bytes,
-Kettenverdichtungen und XRGB-Fallbacks.
+Kettenverdichtungen und XRGB-Fallbacks. `R4BASIC audio` trennt Serviceaufrufe,
+maximalen Aufruf pro Hostzyklus sowie aktive, stille, pausierte und gemutete
+Arbeit. `R4BASIC audio-guest` trennt geplante, angenommene, unterdrueckte,
+verworfene, aufgeloeste und offene Quellframes; Hardware-Playback bleibt
+ausdruecklich unbekannt.
 
 R4BASIC verwendet gezielt `OPTIMIZE=speed`; andere R4X-Module bleiben bei
 ihrer jeweiligen Manifestentscheidung. Der identische Standard-QEMU-Lauf mit

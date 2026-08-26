@@ -39,11 +39,26 @@ pub const Stats = struct {
     rests: u32 = 0,
     rendered_frames: u64 = 0,
     skipped_frames: u64 = 0,
+    scheduled_frames: u64 = 0,
+    accepted_frames: u64 = 0,
+    suppressed_frames: u64 = 0,
+    discarded_frames: u64 = 0,
+    resolved_frames: u64 = 0,
+    foreground_waits: u32 = 0,
+    foreground_wakes: u32 = 0,
+    background_statements: u32 = 0,
+    transport_feedbacks: u32 = 0,
+    transport_abandons: u32 = 0,
+    direct_play_events: u64 = 0,
+    play_reserved_events: u64 = 0,
+    play_capacity_grows: u32 = 0,
+    phase_table_lookups: u64 = 0,
 };
 
 pub const PlayResult = struct {
     mode: PlayMode,
     deadline_ns: u64,
+    fence_frames: u64,
     event_count: u32,
 };
 
@@ -53,17 +68,13 @@ const Event = struct {
     tone_frames: u32,
 };
 
-const Sequence = struct {
-    events: std.ArrayList(Event) = .empty,
+const ParseResult = struct {
     settings: Settings,
     total_frames: u64 = 0,
     notes: u32 = 0,
     rests: u32 = 0,
-
-    fn deinit(self: *Sequence, allocator: std.mem.Allocator) void {
-        self.events.deinit(allocator);
-        self.* = undefined;
-    }
+    event_count: u32 = 0,
+    phase_table_lookups: u32 = 0,
 };
 
 pub const Engine = struct {
@@ -75,6 +86,8 @@ pub const Engine = struct {
     phase: u32 = 0,
     render_cursor_ns: u64 = 0,
     timeline_end_ns: u64 = 0,
+    scheduled_frames: u64 = 0,
+    resolved_frames: u64 = 0,
     stats: Stats = .{},
 
     pub fn init(allocator: std.mem.Allocator) Engine {
@@ -94,46 +107,51 @@ pub const Engine = struct {
         self.phase = 0;
         self.render_cursor_ns = 0;
         self.timeline_end_ns = 0;
+        self.scheduled_frames = 0;
+        self.resolved_frames = 0;
         self.stats = .{};
     }
 
     pub fn setGuestTime(self: *Engine, guest_now_ns: u64) void {
-        if (self.timeline_end_ns != 0 and guest_now_ns >= self.timeline_end_ns) {
-            self.stats.skipped_frames +%= self.pendingFrames();
-            self.discardEvents();
-            self.render_cursor_ns = guest_now_ns;
-            self.timeline_end_ns = guest_now_ns;
-            return;
-        }
-        if (self.event_head < self.events.items.len and guest_now_ns > self.render_cursor_ns) {
-            const skipped = self.skipFrames(nanosecondsToFramesCeil(guest_now_ns - self.render_cursor_ns));
-            self.stats.skipped_frames +%= skipped;
-            self.render_cursor_ns +|= framesToNanoseconds(skipped);
+        // Guest time positions a new idle timeline, but never pretends that
+        // queued audio was accepted or played. Transport feedback is the only
+        // mechanism which resolves scheduled frames.
+        if (self.event_head >= self.events.items.len) {
+            self.render_cursor_ns = @max(self.render_cursor_ns, guest_now_ns);
+            self.timeline_end_ns = @max(self.timeline_end_ns, guest_now_ns);
         }
     }
 
     pub fn play(self: *Engine, command: []const u8, guest_now_ns: u64) Error!PlayResult {
         self.setGuestTime(guest_now_ns);
-        var sequence = try parseSequence(self.allocator, self.settings, command);
-        defer sequence.deinit(self.allocator);
-
         self.compactEvents();
-        if (sequence.events.items.len > maximum_events - self.events.items.len) return error.InvalidCommand;
-        const queue_was_empty = self.events.items.len == 0;
-        try self.events.ensureUnusedCapacity(self.allocator, sequence.events.items.len);
-        for (sequence.events.items) |event| self.events.appendAssumeCapacity(event);
+        const event_start = self.events.items.len;
+        const queue_was_empty = event_start == 0;
+        const capacity_before = self.events.capacity;
+        const reserve = @min(command.len, maximum_events - event_start);
+        try self.events.ensureUnusedCapacity(self.allocator, reserve);
+        if (self.events.capacity != capacity_before) self.stats.play_capacity_grows +%= 1;
+        self.stats.play_reserved_events +%= reserve;
+        errdefer self.events.items.len = event_start;
+        const sequence = try parseSequenceInto(&self.events, self.settings, command);
 
         const start_ns = @max(guest_now_ns, self.timeline_end_ns);
-        if (queue_was_empty) self.render_cursor_ns = start_ns;
+        if (queue_was_empty and sequence.event_count != 0) self.render_cursor_ns = start_ns;
         self.timeline_end_ns = start_ns +| framesToNanoseconds(sequence.total_frames);
+        self.scheduled_frames +|= sequence.total_frames;
         self.settings = sequence.settings;
         self.stats.play_statements +%= 1;
         self.stats.notes +%= sequence.notes;
         self.stats.rests +%= sequence.rests;
+        self.stats.scheduled_frames +%= sequence.total_frames;
+        self.stats.direct_play_events +%= sequence.event_count;
+        self.stats.phase_table_lookups +%= sequence.phase_table_lookups;
+        if (sequence.settings.mode == .background) self.stats.background_statements +%= 1;
         return .{
             .mode = sequence.settings.mode,
             .deadline_ns = self.timeline_end_ns,
-            .event_count = @intCast(sequence.events.items.len),
+            .fence_frames = self.scheduled_frames,
+            .event_count = sequence.event_count,
         };
     }
 
@@ -151,9 +169,16 @@ pub const Engine = struct {
         const start_ns = @max(guest_now_ns, self.timeline_end_ns);
         if (queue_was_empty) self.render_cursor_ns = start_ns;
         self.timeline_end_ns = start_ns +| framesToNanoseconds(frames);
+        self.scheduled_frames +|= frames;
         self.stats.beep_statements +%= 1;
         self.stats.notes +%= 1;
-        return .{ .mode = .foreground, .deadline_ns = self.timeline_end_ns, .event_count = 1 };
+        self.stats.scheduled_frames +%= frames;
+        return .{
+            .mode = .foreground,
+            .deadline_ns = self.timeline_end_ns,
+            .fence_frames = self.scheduled_frames,
+            .event_count = 1,
+        };
     }
 
     pub fn render(self: *Engine, out: []u8) i32 {
@@ -194,6 +219,53 @@ pub const Engine = struct {
         return result;
     }
 
+    pub fn unresolvedFrames(self: *const Engine) u64 {
+        return self.scheduled_frames -| self.resolved_frames;
+    }
+
+    pub fn fenceResolved(self: *const Engine, fence_frames: u64) bool {
+        return self.resolved_frames >= fence_frames;
+    }
+
+    pub fn noteForegroundWait(self: *Engine) void {
+        self.stats.foreground_waits +%= 1;
+    }
+
+    pub fn noteForegroundWake(self: *Engine) void {
+        self.stats.foreground_wakes +%= 1;
+    }
+
+    pub fn acceptTransportProgress(
+        self: *Engine,
+        accepted_frames: u64,
+        suppressed_frames: u64,
+        discarded_frames: u64,
+    ) void {
+        if (accepted_frames == 0 and suppressed_frames == 0 and discarded_frames == 0) return;
+        self.stats.transport_feedbacks +%= 1;
+        self.resolveFrames(&self.stats.accepted_frames, accepted_frames);
+        self.resolveFrames(&self.stats.suppressed_frames, suppressed_frames);
+        self.resolveFrames(&self.stats.discarded_frames, discarded_frames);
+    }
+
+    /// Resolves only frames which have not yet left the guest renderer. PCM
+    /// already queued in the host is resolved by the accompanying discarded
+    /// transport feedback, so no frame can be counted twice.
+    pub fn abandonPending(self: *Engine) void {
+        const frames = self.pendingFrames();
+        if (frames == 0) return;
+        self.stats.transport_abandons +%= 1;
+        self.resolveFrames(&self.stats.discarded_frames, frames);
+        self.discardEvents();
+    }
+
+    fn resolveFrames(self: *Engine, counter: *u64, requested: u64) void {
+        const resolved = @min(requested, self.unresolvedFrames());
+        counter.* +%= resolved;
+        self.resolved_frames +|= resolved;
+        self.stats.resolved_frames = self.resolved_frames;
+    }
+
     fn compactEvents(self: *Engine) void {
         if (self.event_head == 0) return;
         if (self.event_head >= self.events.items.len) {
@@ -206,35 +278,6 @@ pub const Engine = struct {
         self.event_head = 0;
     }
 
-    fn skipFrames(self: *Engine, requested: u64) u64 {
-        var remaining = requested;
-        var skipped: u64 = 0;
-        while (remaining != 0 and self.event_head < self.events.items.len) {
-            const event = self.events.items[self.event_head];
-            if (self.event_frame >= event.duration_frames) {
-                self.event_head += 1;
-                self.event_frame = 0;
-                self.phase = 0;
-                continue;
-            }
-            const available = event.duration_frames - self.event_frame;
-            const take: u32 = @intCast(@min(remaining, available));
-            if (event.phase_step != 0 and self.event_frame < event.tone_frames) {
-                const tone_take = @min(take, event.tone_frames - self.event_frame);
-                self.phase +%= event.phase_step *% tone_take;
-            }
-            self.event_frame += take;
-            remaining -= take;
-            skipped += take;
-        }
-        if (self.event_head == self.events.items.len or
-            (self.event_head + 1 == self.events.items.len and self.event_frame >= self.events.items[self.event_head].duration_frames))
-        {
-            self.discardEvents();
-        }
-        return skipped;
-    }
-
     fn discardEvents(self: *Engine) void {
         self.events.clearRetainingCapacity();
         self.event_head = 0;
@@ -243,9 +286,8 @@ pub const Engine = struct {
     }
 };
 
-fn parseSequence(allocator: std.mem.Allocator, initial: Settings, command: []const u8) Error!Sequence {
-    var result = Sequence{ .settings = initial };
-    errdefer result.deinit(allocator);
+fn parseSequenceInto(events: *std.ArrayList(Event), initial: Settings, command: []const u8) Error!ParseResult {
+    var result = ParseResult{ .settings = initial };
     var index: usize = 0;
     while (true) {
         skipSpaces(command, &index);
@@ -294,13 +336,13 @@ fn parseSequence(allocator: std.mem.Allocator, initial: Settings, command: []con
             'P' => {
                 const length = readLength(command, &index, null) orelse return error.InvalidCommand;
                 const dots = readDots(command, &index);
-                try appendEvent(allocator, &result, 0, length, dots, true);
+                try appendEvent(events, &result, 0, length, dots, true);
             },
             'N' => {
                 const note = readNumber(command, &index) orelse return error.InvalidCommand;
                 if (note > 84) return error.InvalidCommand;
                 const dots = readDots(command, &index);
-                try appendEvent(allocator, &result, @intCast(note), result.settings.length, dots, note == 0);
+                try appendEvent(events, &result, @intCast(note), result.settings.length, dots, note == 0);
             },
             'A', 'B', 'C', 'D', 'E', 'F', 'G' => {
                 var note = @as(i16, result.settings.octave) * 12 + noteOffset(symbol);
@@ -321,7 +363,7 @@ fn parseSequence(allocator: std.mem.Allocator, initial: Settings, command: []con
                 if (note < 1 or note > 84) return error.InvalidCommand;
                 const length = readLength(command, &index, result.settings.length) orelse return error.InvalidCommand;
                 const dots = readDots(command, &index);
-                try appendEvent(allocator, &result, @intCast(note), length, dots, false);
+                try appendEvent(events, &result, @intCast(note), length, dots, false);
             },
             else => return error.InvalidCommand,
         }
@@ -330,14 +372,14 @@ fn parseSequence(allocator: std.mem.Allocator, initial: Settings, command: []con
 }
 
 fn appendEvent(
-    allocator: std.mem.Allocator,
-    sequence: *Sequence,
+    events: *std.ArrayList(Event),
+    sequence: *ParseResult,
     note: u8,
     length: u8,
     dots: u8,
     rest: bool,
 ) Error!void {
-    if (sequence.events.items.len >= maximum_events) return error.InvalidCommand;
+    if (events.items.len >= maximum_events) return error.InvalidCommand;
     const duration = durationFrames(sequence.settings.tempo, length, dots) orelse return error.InvalidCommand;
     const tone_frames: u32 = if (rest)
         0
@@ -346,16 +388,18 @@ fn appendEvent(
         .legato => duration,
         .staccato => @max(@as(u32, 1), duration * 3 / 4),
     };
-    try sequence.events.append(allocator, .{
+    events.appendAssumeCapacity(.{
         .phase_step = if (rest) 0 else phaseStep(note),
         .duration_frames = duration,
         .tone_frames = tone_frames,
     });
     sequence.total_frames +|= duration;
+    sequence.event_count +%= 1;
     if (rest) {
         sequence.rests +%= 1;
     } else {
         sequence.notes +%= 1;
+        sequence.phase_table_lookups +%= 1;
     }
 }
 
@@ -425,11 +469,22 @@ fn durationFrames(tempo: u8, length: u8, dots: u8) ?u32 {
     return @intFromFloat(raw);
 }
 
+const phase_step_table = [85]u32{
+    0,         2926232,   3100235,   3284585,   3479896,   3686822,   3906052,   4138318,
+    4384395,   4645104,   4921317,   5213953,   5523991,   5852465,   6200470,   6569170,
+    6959793,   7373644,   7812103,   8276635,   8768789,   9290209,   9842633,   10427907,
+    11047982,  11704930,  12400941,  13138339,  13919586,  14747287,  15624207,  16553270,
+    17537579,  18580418,  19685267,  20855814,  22095965,  23409859,  24801882,  26276679,
+    27839171,  29494575,  31248413,  33106541,  35075158,  37160835,  39370534,  41711627,
+    44191930,  46819719,  49603764,  52553357,  55678342,  58989149,  62496826,  66213081,
+    70150316,  74321671,  78741067,  83423255,  88383859,  93639437,  99207528,  105106715,
+    111356685, 117978298, 124993653, 132426162, 140300631, 148643341, 157482134, 166846509,
+    176767719, 187278874, 198415056, 210213429, 222713370, 235956596, 249987305, 264852324,
+    280601263, 297286682, 314964268, 333693018, 353535438,
+};
+
 fn phaseStep(note: u8) u32 {
-    const semitones = (@as(f64, @floatFromInt(note)) - 58.0) / 12.0;
-    const frequency = 440.0 * std.math.pow(f64, 2.0, semitones);
-    const raw = frequency * 4_294_967_296.0 / @as(f64, @floatFromInt(sample_rate));
-    return @intFromFloat(@round(raw));
+    return phase_step_table[note];
 }
 
 fn phaseStepFromMillihertz(frequency_millihz: u32) u32 {
@@ -440,9 +495,4 @@ fn phaseStepFromMillihertz(frequency_millihz: u32) u32 {
 fn framesToNanoseconds(frames: u64) u64 {
     const numerator = @as(u128, frames) * std.time.ns_per_s;
     return @intCast(@min(@as(u128, std.math.maxInt(u64)), (numerator + sample_rate - 1) / sample_rate));
-}
-
-fn nanosecondsToFramesCeil(nanoseconds: u64) u64 {
-    const numerator = @as(u128, nanoseconds) * sample_rate;
-    return @intCast(@min(@as(u128, std.math.maxInt(u64)), (numerator + std.time.ns_per_s - 1) / std.time.ns_per_s));
 }

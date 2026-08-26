@@ -1,6 +1,7 @@
 const r4os = @import("r4os");
 const host = r4os.subsystem_host;
 const runtime = r4os.subsystem_runtime;
+const audio = @import("audio.zig");
 const vm = @import("vm.zig");
 
 pub const api = runtime;
@@ -154,6 +155,7 @@ pub const Adapter = struct {
             .step_fn = step,
             .reset_fn = reset,
             .render_audio_fn = renderAudio,
+            .audio_feedback_fn = audioFeedback,
         };
     }
 
@@ -341,7 +343,11 @@ fn step(context: *anyopaque, budget: u32, guest_now_ns: u64) runtime.StepResult 
     return switch (result.status) {
         .ready, .yielded => runtime.StepResult.progress(frame_ready).withOperations(executed),
         .waiting => runtime.StepResult.waitUntil(result.wake_guest_ns, frame_ready).withOperations(executed),
-        .halted, .cancelled => runtime.StepResult.complete(self.machine.exit_code, frame_ready).withOperations(executed),
+        .halted => if (self.machine.unresolvedAudioFrames() != 0)
+            runtime.StepResult.waitUntil(0, frame_ready).withOperations(executed)
+        else
+            runtime.StepResult.complete(self.machine.exit_code, frame_ready).withOperations(executed),
+        .cancelled => runtime.StepResult.complete(self.machine.exit_code, frame_ready).withOperations(executed),
         .runtime_error => runtime.StepResult.fail(self.machine.exit_code).withOperations(executed),
     };
 }
@@ -428,4 +434,21 @@ fn reset(context: *anyopaque) i32 {
 fn renderAudio(context: *anyopaque, out: []u8) i32 {
     const self: *Adapter = @ptrCast(@alignCast(context));
     return self.machine.renderAudio(out);
+}
+
+fn audioFeedback(context: *anyopaque, feedback: runtime.AudioFeedback) bool {
+    const self: *Adapter = @ptrCast(@alignCast(context));
+    const aligned = feedback.accepted_bytes % audio.frame_bytes == 0 and
+        feedback.suppressed_bytes % audio.frame_bytes == 0 and
+        feedback.discarded_bytes % audio.frame_bytes == 0;
+    const abandon = !aligned or feedback.muted or switch (feedback.state) {
+        .disabled, .degraded, .closed => true,
+        .ready, .active => false,
+    };
+    return self.machine.noteAudioProgress(
+        if (aligned) feedback.accepted_bytes / audio.frame_bytes else 0,
+        if (aligned) feedback.suppressed_bytes / audio.frame_bytes else 0,
+        if (aligned) feedback.discarded_bytes / audio.frame_bytes else 0,
+        abandon,
+    );
 }

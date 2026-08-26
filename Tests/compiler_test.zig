@@ -1200,8 +1200,10 @@ test "PLAY MML parses stateful commands and rejects invalid ranges atomically" {
 
     const pending_after_render = engine.pendingFrames();
     engine.setGuestTime(std.time.ns_per_s);
-    try std.testing.expect(engine.stats.skipped_frames != 0);
-    try std.testing.expect(engine.pendingFrames() < pending_after_render);
+    try std.testing.expectEqual(@as(u64, 0), engine.stats.skipped_frames);
+    try std.testing.expectEqual(pending_after_render, engine.pendingFrames());
+    try std.testing.expectEqual(@as(u64, 10), engine.stats.direct_play_events);
+    try std.testing.expectEqual(@as(u64, 8), engine.stats.phase_table_lookups);
 
     const events_before = engine.pendingFrames();
     const statements_before = engine.stats.play_statements;
@@ -1210,9 +1212,18 @@ test "PLAY MML parses stateful commands and rejects invalid ranges atomically" {
         try std.testing.expectEqual(events_before, engine.pendingFrames());
         try std.testing.expectEqual(statements_before, engine.stats.play_statements);
     }
+
+    var maximum_command = [_]u8{'C'} ** core.audio.maximum_events;
+    var maximum_engine = core.audio.Engine.init(std.testing.allocator);
+    defer maximum_engine.deinit();
+    const maximum = try maximum_engine.play(maximum_command[0..], 0);
+    try std.testing.expectEqual(@as(u32, core.audio.maximum_events), maximum.event_count);
+    try std.testing.expectEqual(@as(u64, core.audio.maximum_events), maximum_engine.stats.direct_play_events);
+    try std.testing.expectEqual(@as(u64, core.audio.maximum_events), maximum_engine.stats.phase_table_lookups);
+    try std.testing.expectEqual(@as(u32, 1), maximum_engine.stats.play_capacity_grows);
 }
 
-test "MB continues while MF and BEEP wait on guest time and render PCM" {
+test "MB continues while MF and BEEP wait on resolved transport frames" {
     var program = try compileFixture(fixture_paths.audio);
     defer program.deinit();
     try expectProgramOk(&program);
@@ -1226,8 +1237,28 @@ test "MB continues while MF and BEEP wait on guest time and render PCM" {
     var pcm: [core.audio.frame_bytes * 480]u8 = undefined;
     try std.testing.expectEqual(@as(i32, @intCast(pcm.len)), machine.renderAudio(&pcm));
     try std.testing.expect(std.mem.indexOfNone(u8, &pcm, &[_]u8{0}) != null);
+    try std.testing.expect(!machine.noteAudioProgress(pcm.len / core.audio.frame_bytes, 0, 0, false));
+    machine.setGuestTime(10 * std.time.ns_per_s);
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runSlice(64).status);
 
-    machine.setGuestTime(std.time.ns_per_s);
+    var foreground_resolved = false;
+    for (0..256) |_| {
+        const count = machine.renderAudio(&pcm);
+        try std.testing.expect(count >= 0);
+        if (count == 0) break;
+        const bytes: usize = @intCast(count);
+        const silent = std.mem.indexOfNone(u8, pcm[0..bytes], &[_]u8{0}) == null;
+        if (machine.noteAudioProgress(
+            if (silent) 0 else bytes / core.audio.frame_bytes,
+            if (silent) bytes / core.audio.frame_bytes else 0,
+            0,
+            false,
+        )) {
+            foreground_resolved = true;
+            break;
+        }
+    }
+    try std.testing.expect(foreground_resolved);
     try std.testing.expectEqual(core.vm.Status.waiting, machine.runToCompletion(64, 32));
     try expectInteger(&machine, "ForegroundDone", 1);
     try expectInteger(&machine, "BeepDone", 0);
@@ -1235,9 +1266,22 @@ test "MB continues while MF and BEEP wait on guest time and render PCM" {
     try std.testing.expectEqual(@as(u32, 2), stats.play_statements);
     try std.testing.expectEqual(@as(u32, 1), stats.beep_statements);
 
-    machine.setGuestTime(std.time.ns_per_s + core.audio.beep_duration_ms * std.time.ns_per_ms);
+    var beep_resolved = false;
+    for (0..64) |_| {
+        const count = machine.renderAudio(&pcm);
+        try std.testing.expect(count >= 0);
+        if (count == 0) break;
+        const bytes: usize = @intCast(count);
+        if (machine.noteAudioProgress(bytes / core.audio.frame_bytes, 0, 0, false)) {
+            beep_resolved = true;
+            break;
+        }
+    }
+    try std.testing.expect(beep_resolved);
     try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(64, 32));
     try expectInteger(&machine, "BeepDone", 1);
+    try std.testing.expectEqual(machine.audioStats().scheduled_frames, machine.audioStats().resolved_frames);
+    try std.testing.expectEqual(@as(u32, 2), machine.audioStats().foreground_wakes);
 }
 
 test "BEEP reaches the buffered subsystem audio sink and closes it once" {
@@ -1278,6 +1322,93 @@ test "BEEP reaches the buffered subsystem audio sink and closes it once" {
     try std.testing.expectEqual(core.audio.channels, sink.channels);
     try std.testing.expectEqual(@as(u32, 1), sink.closes);
     try std.testing.expect(runtime.resources_closed);
+}
+
+test "background PLAY reaches service acceptance before a fast END closes the stream" {
+    var program = try core.compiler.compile(std.testing.allocator, "background-end.bas", "PLAY \"MBT255L64C\"\nEND\n");
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    var adapter = core.runtime_adapter.Adapter.init(&machine);
+    var host = RuntimeHostProbe{};
+    var sink = RuntimeAudioSink{};
+    var queue: [core.audio.frame_bytes * 960]u8 = undefined;
+    var scratch: [core.audio.frame_bytes * 480]u8 = undefined;
+    var runtime = try core.runtime_adapter.api.Runtime.init(.{}, 1000, 0, .{
+        .config = .{ .sample_rate = core.audio.sample_rate, .channels = core.audio.channels },
+        .queue_storage = queue[0..],
+        .scratch = scratch[0..],
+        .sink = sink.sink(),
+    });
+
+    const first = runtime.cycle(0, adapter.driver(), host.driver());
+    try std.testing.expect(first == .wait);
+    try std.testing.expectEqual(core.vm.Status.halted, machine.status);
+    try std.testing.expect(machine.unresolvedAudioFrames() != 0);
+    var completed = false;
+    for (1..64) |raw_tick| {
+        if (runtime.cycle(@intCast(raw_tick), adapter.driver(), host.driver()) == .finished) {
+            completed = true;
+            break;
+        }
+    }
+    try std.testing.expect(completed);
+    try std.testing.expectEqual(@as(u32, 1), sink.opens);
+    try std.testing.expectEqual(@as(u32, 1), sink.writes);
+    try std.testing.expectEqual(@as(u32, 1), sink.closes);
+    try std.testing.expectEqual(machine.audioStats().scheduled_frames, machine.audioStats().accepted_frames);
+    try std.testing.expectEqual(@as(u64, 0), machine.unresolvedAudioFrames());
+}
+
+test "eight silent R4BASIC guests consume no audio sessions" {
+    var program = try core.compiler.compile(std.testing.allocator, "silent-eight.bas", "DEFINT A-Z\nPLAY \"MFP64\"\nDone = 1\nEND\n");
+    defer program.deinit();
+    try expectProgramOk(&program);
+
+    var machines: [8]core.vm.Vm = undefined;
+    var adapters: [8]core.runtime_adapter.Adapter = undefined;
+    var hosts: [8]RuntimeHostProbe = undefined;
+    var sinks: [8]RuntimeAudioSink = undefined;
+    var queues: [8][core.audio.frame_bytes * 960]u8 = undefined;
+    var scratches: [8][core.audio.frame_bytes * 480]u8 = undefined;
+    var runtimes: [8]core.runtime_adapter.api.Runtime = undefined;
+    var initialized: usize = 0;
+    defer {
+        for (0..initialized) |index| machines[index].deinit();
+    }
+
+    for (0..8) |index| {
+        machines[index] = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+        initialized += 1;
+        adapters[index] = core.runtime_adapter.Adapter.init(&machines[index]);
+        hosts[index] = .{};
+        sinks[index] = .{};
+        runtimes[index] = try core.runtime_adapter.api.Runtime.init(.{}, 1000, 0, .{
+            .config = .{ .sample_rate = core.audio.sample_rate, .channels = core.audio.channels },
+            .queue_storage = queues[index][0..],
+            .scratch = scratches[index][0..],
+            .sink = sinks[index].sink(),
+        });
+    }
+
+    var completed = [_]bool{false} ** 8;
+    for (0..32) |raw_tick| {
+        for (0..8) |index| {
+            if (completed[index]) continue;
+            if (runtimes[index].cycle(@intCast(raw_tick), adapters[index].driver(), hosts[index].driver()) == .finished) {
+                completed[index] = true;
+            }
+        }
+    }
+    for (0..8) |index| {
+        try std.testing.expect(completed[index]);
+        try expectInteger(&machines[index], "Done", 1);
+        try std.testing.expectEqual(@as(u32, 0), sinks[index].opens);
+        try std.testing.expectEqual(@as(u32, 0), sinks[index].writes);
+        try std.testing.expect(runtimes[index].audio.stats.suppressed_bytes != 0);
+        try std.testing.expectEqual(@as(u64, 0), machines[index].unresolvedAudioFrames());
+    }
 }
 
 test "missing subsystem audio degrades without stopping guest time" {

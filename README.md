@@ -13,17 +13,21 @@ whole or damaged indexed raster frames through `r4os.subsystem_host`.
 `BEEP` and the supported QuickBASIC `PLAY` Music Macro Language generate
 24 kHz stereo PCM through the buffered subsystem runtime; HDA converts it to
 the 48 kHz hardware format. Foreground and background playback follow `MF`
-and `MB`. The productive host buffers four 40 ms source quanta, covering the
-160 ms HDA start window so delayed interpreter or presentation cycles do not
-fragment notes. Longer delays resynchronize the source timeline instead of
-replaying old samples. Unavailable audio degrades visibly, clears the queued
-PCM once, and leaves the audio deadline scheduler; guest time, input, and
-graphics retain their normal bounded pacing without repeated scratch work.
+and `MB`. No service session is opened until the first non-silent source
+quantum. The productive host buffers four 40 ms source quanta, but performs
+at most one open, write, or close operation after video publication in each
+host cycle. Busy retries use an independent 10 ms deadline and late prefill
+is interleaved instead of emitted as one synchronous burst. Foreground BASIC
+waits resolve on accepted, deliberately suppressed, or explicitly discarded
+source frames—not elapsed guest time. The platform exposes no per-stream
+hardware playback cursor, and R4BASIC does not infer one from service
+acceptance. Unavailable audio degrades visibly without stopping guest time,
+input, or graphics.
 
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.12`
+- Module version: `1.2.13`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -56,7 +60,7 @@ this repository and is read directly from the ignored workspace injection
 tree. The normal test step uses the permanent general BAS fixtures under
 `Tests/Fixtures`, including the standalone audio contract.
 
-R4BASIC 1.2.12 uses a shared 262,144-instruction ceiling with adaptive bounded
+R4BASIC 1.2.13 uses a shared 262,144-instruction ceiling with adaptive bounded
 clock blocks and an 8-ms production time boundary. Active work requests a
 scheduler yield at most once per 8-ms interval; input-only waits, pause and
 static status windows block on the Desktop activity sequence. The first guest
@@ -70,7 +74,7 @@ separate QEMU-readable numeric, 4-KB assignment, LEN, UCASE$, call and array
 markers plus an exact summary. The productive artifact remains the canonical
 GUI subsystem host and uses its measured module-local `OPTIMIZE=speed` profile.
 
-The 1.2.12 input profile emits each printable key exactly once as text,
+The 1.2.13 input profile emits each printable key exactly once as text,
 retains Enter and Backspace as keys, and filters pointer traffic before guest
 coordinate mapping. Stable sequence/tick metadata follows accepted bytes to
 consumption; bounded counters distinguish focus, invalid-code, unsupported,

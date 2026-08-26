@@ -6,7 +6,7 @@ const graphics_screen = @import("graphics_screen.zig");
 const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "1.10.0";
+pub const contract_version = "1.11.0";
 pub const default_instruction_budget: u32 = 262_144;
 pub const timer_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
@@ -649,7 +649,7 @@ pub const Vm = struct {
     sleep_input_generation: u64 = 0,
     audio_engine: audio.Engine,
     pending_audio_instruction: u32 = bytecode.invalid_index,
-    audio_deadline_ns: u64 = 0,
+    audio_fence_frames: u64 = 0,
     random_state: u32 = default_random_seed,
     random_last: f32 = 0,
     open_files: std.ArrayList(FileSlot) = .empty,
@@ -723,6 +723,28 @@ pub const Vm = struct {
 
     pub fn pendingAudioFrames(self: *const Vm) u64 {
         return self.audio_engine.pendingFrames();
+    }
+
+    pub fn unresolvedAudioFrames(self: *const Vm) u64 {
+        return self.audio_engine.unresolvedFrames();
+    }
+
+    /// Applies source-frame progress at the AudioService acceptance boundary.
+    /// `abandon_pending` is used only when the transport became unavailable or
+    /// was explicitly muted. Hardware playback remains deliberately unknown.
+    pub fn noteAudioProgress(
+        self: *Vm,
+        accepted_frames: u64,
+        suppressed_frames: u64,
+        discarded_frames: u64,
+        abandon_pending: bool,
+    ) bool {
+        self.audio_engine.acceptTransportProgress(accepted_frames, suppressed_frames, discarded_frames);
+        if (abandon_pending) self.audio_engine.abandonPending();
+        const foreground_ready = self.pending_audio_instruction != bytecode.invalid_index and
+            self.audio_engine.fenceResolved(self.audio_fence_frames);
+        const terminal_drain_ready = self.status == .halted and self.audio_engine.unresolvedFrames() == 0;
+        return foreground_ready or terminal_drain_ready;
     }
 
     pub fn setInputFocused(self: *Vm, focused: bool) void {
@@ -947,7 +969,7 @@ pub const Vm = struct {
         self.sleep_input_generation = 0;
         self.audio_engine.reset();
         self.pending_audio_instruction = bytecode.invalid_index;
-        self.audio_deadline_ns = 0;
+        self.audio_fence_frames = 0;
         self.random_state = normalizeRandomSeed(self.host.initial_random_seed);
         self.random_last = 0;
         self.discardFiles();
@@ -2284,7 +2306,8 @@ pub const Vm = struct {
                 error.InvalidCommand => return error.IllegalFunctionCall,
             };
             self.pending_audio_instruction = instruction_index;
-            self.audio_deadline_ns = result.deadline_ns;
+            self.audio_fence_frames = result.fence_frames;
+            self.audio_engine.noteForegroundWait();
         }
         try self.waitForForegroundAudio();
     }
@@ -2298,20 +2321,24 @@ pub const Vm = struct {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvalidCommand => return error.IllegalFunctionCall,
             };
-            if (result.mode == .background or result.deadline_ns <= self.guest_now_ns) return;
+            if (result.mode == .background or result.event_count == 0) return;
             self.pending_audio_instruction = instruction_index;
-            self.audio_deadline_ns = result.deadline_ns;
+            self.audio_fence_frames = result.fence_frames;
+            self.audio_engine.noteForegroundWait();
         }
         try self.waitForForegroundAudio();
     }
 
     fn waitForForegroundAudio(self: *Vm) ExecutionError!void {
-        if (self.guest_now_ns >= self.audio_deadline_ns) {
+        if (self.audio_engine.fenceResolved(self.audio_fence_frames)) {
             self.pending_audio_instruction = bytecode.invalid_index;
-            self.audio_deadline_ns = 0;
+            self.audio_fence_frames = 0;
+            self.audio_engine.noteForegroundWake();
             return;
         }
-        self.wait_wake_ns = self.audio_deadline_ns;
+        // Service acceptance, suppression, or an explicit discard wakes this
+        // event-only wait through the subsystem runtime feedback callback.
+        self.wait_wake_ns = 0;
         return error.WouldBlock;
     }
 

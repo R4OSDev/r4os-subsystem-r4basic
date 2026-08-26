@@ -1,6 +1,6 @@
 ﻿# R4BASIC v1 core VM contract
 
-Contract version: `1.10.0`
+Contract version: `1.11.0`
 
 This document freezes the executable R4BASIC language layers. The broader
 source syntax accepted by the frontend remains defined in
@@ -257,38 +257,51 @@ guest address can become an R4OS or host pointer.
 
 ## Audio and Music Macro Language
 
-- Every VM owns its music settings, queued events, oscillator phase, playback
-  deadline, and counters. Reset and teardown clear them without touching any
-  other instance.
+- Every VM owns its music settings, queued events, oscillator phase,
+  cumulative source-frame fences, and counters. Reset and teardown clear them
+  without touching any other instance.
 - `PLAY` accepts case-insensitive `O0` through `O6`, `<`, `>`, `L1` through
   `L64`, `T32` through `T255`, `MB`, `MF`, `MN`, `ML`, `MS`, notes `A` through
   `G` with `#`, `+`, or `-`, optional note lengths and dots, `P` pauses, and
   numeric notes `N0` through `N84`. Octave, default length, tempo, mode, and
   articulation persist within one VM.
-- `MB` queues a sequence and lets the next BASIC instruction continue. `MF`
-  waits cooperatively until the complete queued timeline has elapsed. `BEEP`
-  queues an 800 Hz, 200 ms foreground tone. Neither wait spins or blocks host
-  event polling.
+- `MB` queues a sequence and lets the next BASIC instruction continue. A
+  normal fast `END` keeps only the host transport alive until those frames
+  have been accepted, suppressed as silence, or explicitly discarded. `MF`
+  and the 800 Hz, 200 ms `BEEP` wait on the same cumulative source-frame
+  fence. These are event-only waits; elapsed guest time cannot complete them,
+  and neither wait spins or blocks host event polling.
 - The generator emits deterministic 24,000 Hz, stereo, signed 16-bit little-
   endian square-wave PCM. HDA converts the stream to its 48 kHz hardware
   format. Hardware timbre is deliberately approximate; note, rest,
-  articulation, and tempo durations follow guest time.
+  articulation, and tempo durations are converted deterministically to source
+  frames.
 - The productive host keeps four 40 ms source quanta buffered and permits the
   same bounded catch-up depth. This covers the 160 ms HDA start window, so a
   delayed graphics or interpreter cycle cannot turn already-generated notes
   into alternating PCM and silence. Submission remains paced through R4AUDIO
   rather than being performed by the VM.
-- After the initial four-quantum prefill, the host submits exactly one quantum
-  per 40 ms audio deadline. Backpressure retains the same caller-owned PCM and
-  retries no earlier than the next deadline; it never polls sink capacity in
-  every host cycle. A transient busy, timeout, full, or service-start race gets
-  three bounded 50 ms open retries before audio degrades.
-- If a host delay exceeds that complete window, the source queue is discarded
-  before submission and the VM advances note position and oscillator phase to
-  current guest time. Old melody fragments are never replayed late.
+- Open, prefill, steady writes, deferred cleanup, and resync each perform at
+  most one synchronous AudioService operation in a host cycle, after any
+  pending video presentation. Successful prefill writes are interleaved over
+  fresh cycles. Busy retains the exact caller-owned PCM and uses an independent
+  10 ms retry deadline rather than advancing a complete 40 ms quantum.
+  R4BASIC bounds one service call to 25 ms; a transient open timeout, full, or
+  service-start race still gets at most three retries separated by 50 ms.
+- If a host delay exceeds the complete catch-up window, queued source PCM is
+  explicitly discarded before refill. The discarded frames resolve the same
+  transport fence and are counted separately; unrendered note events are not
+  silently advanced by guest time. Refill remains one service operation per
+  cycle rather than a four-write burst.
 - A missing or failing sink enters visible degraded mode; samples are
   discarded while the VM, guest clock, input, and video continue. Stream
   close and runtime shutdown are idempotent.
+- Service acceptance is not hardware playback. The current R4AUDIO/AUDSVC
+  contract exposes no per-stream hardware playback cursor, so the R4BASIC
+  report states `playback=unavailable` and never fabricates a played-frame
+  count. Passive counters separately expose active, silent, paused and muted
+  cycles/bytes plus accepted, suppressed, discarded, resolved and unresolved
+  source frames.
 
 ## Guest time, pacing, and random state
 
@@ -484,8 +497,9 @@ The permanent general fixtures below are part of this contract:
   two-instance pixel/palette isolation.
 - `vm_packed_images.bas`: original synthetic LONG arrays in the mode 1 and
   mode 9 packed formats, including reversible PUT XOR.
-- `vm_audio.bas`: stateful MML commands, MB continuation, MF and BEEP guest-
-  time waits, PCM generation, buffering, sink teardown, and degraded audio.
+- `vm_audio.bas`: stateful MML commands, MB continuation, transport-fenced MF
+  and BEEP waits, PCM generation, buffering, sink teardown, and degraded
+  audio.
 
 `Tests/compiler_test.zig` also fixes negative binding cases, exact runtime
 positions, QBasic error numbers, string overflow, host failure, and

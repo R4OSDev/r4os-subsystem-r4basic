@@ -18,6 +18,7 @@ const title_capacity: usize = 192;
 const audio_quantum_frames: u32 = runtime_api.default_quantum_frames * 2;
 const audio_target_quanta: u16 = 4;
 const audio_queue_frames: usize = @as(usize, audio_quantum_frames) * audio_target_quanta;
+const audio_service_timeout_ns: u64 = 25 * std.time.ns_per_ms;
 const canonical_baseline_path = "C:\\TEMP\\GORILLA.BAS";
 const baseline_report_path = "C:\\TEMP\\R4BASIC.BASELINE";
 const gui_report_path = "C:\\TEMP\\R4BASIC.LAST";
@@ -142,7 +143,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     var audio_sink_storage: runtime_api.R4AudioSink = undefined;
     var sink: ?runtime_api.AudioSink = null;
     if (app.audio()) |app_audio| {
-        audio_sink_storage = runtime_api.R4AudioSink.init(app_audio);
+        audio_sink_storage = runtime_api.R4AudioSink.initWithTimeout(app_audio, audio_service_timeout_ns);
         sink = audio_sink_storage.sink();
     }
     var audio_queue: [audio.frame_bytes * audio_queue_frames]u8 = undefined;
@@ -1227,14 +1228,47 @@ const RuntimeHost = struct {
             presenter.sampled_pixels,
         }) catch return false;
         report_len += presenter_line.len;
-        const audio_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC audio: state={s} lazy_opens={d} generated_bytes={d} submitted_bytes={d} suppressed_bytes={d}\r\n", .{
+        const audio_stats = self.guest.machine.audioStats();
+        const audio_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC audio: state={s} muted={d} playback=unavailable lazy_opens={d} service_ops={d} service_ops_cycle_max={d} opens={d} writes={d} closes={d} active_cycles={d} silent_cycles={d} paused_cycles={d} muted_cycles={d} active_quanta={d} silent_quanta={d} generated_bytes={d} accepted_bytes={d} suppressed_bytes={d} discarded_bytes={d} paused_bytes={d} muted_bytes={d} busy={d} resyncs={d}\r\n", .{
             @tagName(runtime.audio.state),
+            @intFromBool(runtime.audio.muted),
             runtime.audio.stats.lazy_opens,
+            runtime.audio.stats.service_operations,
+            runtime.audio.stats.maximum_service_operations_per_cycle,
+            runtime.audio.stats.open_operations,
+            runtime.audio.stats.write_operations,
+            runtime.audio.stats.close_operations,
+            runtime.audio.stats.active_cycles,
+            runtime.audio.stats.silent_cycles,
+            runtime.audio.stats.paused_cycles,
+            runtime.audio.stats.muted_cycles,
+            runtime.audio.stats.active_quanta,
+            runtime.audio.stats.silent_quanta,
             runtime.audio.stats.generated_bytes,
             runtime.audio.stats.submitted_bytes,
             runtime.audio.stats.suppressed_bytes,
+            runtime.audio.stats.discarded_bytes,
+            runtime.audio.stats.paused_bytes,
+            runtime.audio.stats.muted_bytes,
+            runtime.audio.stats.busy_writes,
+            runtime.audio.stats.late_resyncs,
         }) catch return false;
         report_len += audio_line.len;
+        const audio_guest_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC audio-guest: scheduled_frames={d} accepted_frames={d} suppressed_frames={d} discarded_frames={d} resolved_frames={d} unresolved_frames={d} foreground_waits={d} foreground_wakes={d} background={d} direct_events={d} reserve_grows={d} phase_lookups={d}\r\n", .{
+            audio_stats.scheduled_frames,
+            audio_stats.accepted_frames,
+            audio_stats.suppressed_frames,
+            audio_stats.discarded_frames,
+            audio_stats.resolved_frames,
+            self.guest.machine.unresolvedAudioFrames(),
+            audio_stats.foreground_waits,
+            audio_stats.foreground_wakes,
+            audio_stats.background_statements,
+            audio_stats.direct_play_events,
+            audio_stats.play_capacity_grows,
+            audio_stats.phase_table_lookups,
+        }) catch return false;
+        report_len += audio_guest_line.len;
         const report = report_storage[0..report_len];
         const target_path = if (self.trace.baseline) baseline_report_path else gui_report_path;
         var path = r4os.AbsoluteFilePath.parse(target_path) catch return false;
