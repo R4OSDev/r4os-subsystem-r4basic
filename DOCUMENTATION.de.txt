@@ -6,11 +6,13 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.70.3
+Stand 0.70.4
 ------------
 
 Diese Ausbaustufe ergaenzt das Vertragsfundament des produktiven R4BASIC-v2-
-Subsystemhosts um das vollstaendige Quelltext- und Programmlinienmodell.
+Subsystemhosts um das vollstaendige Quelltext- und Programmlinienmodell sowie
+die referenzgenaue Numerik, Mathematik, IEEE-/MBF-Konvertierung und
+Microsoft-Zufallsfolge.
 Explorer uebergibt eine absolute BAS-Datei ueber `R4SUBSYS1`; das R4X liest
 sie und relative `$INCLUDE`-Quellen durch die Storage-Fassade jeweils exakt
 einmal, baut daraus einen begrenzten Quellgraphen und fuehrt eine getrennte VM in
@@ -319,19 +321,18 @@ Gastmillisekunde kooperativ ab. Dadurch bleiben CalcDelay-/Rest-Muster
 reproduzierbar, ohne Grafik und Berechnung mitzubremsen.
 
 Der 12-Byte-Instruktionsstrom enthaelt nur Opcode und zwei Operanden. Exakte
-Quellposition und Statementgrenzen liegen in einer parallelen 24-Byte-Tabelle,
+Quellposition und Statementgrenzen liegen in einer parallelen 32-Byte-Tabelle,
 die nur an Statement- und Fehlergrenzen gelesen wird. INTEGER-/LONG-Vergleiche
 nutzen die bereits gebundene Typinformation ohne den bisherigen Umweg ueber
 DOUBLE. Bereits aufgeloeste Cell-Zeiger werden im Load-/Store-Pfad nicht ein
 zweites Mal aufgeloest; gleich typisierte Stores uebernehmen den Stackwert
 ohne zusaetzliche Konvertierungskopie.
 
-RND besitzt einen privaten 24-Bit-Zustand und den letzten Wert. Positive oder
-fehlende Argumente ziehen weiter, null wiederholt und ein negatives Argument
-setzt reproduzierbar neu. Ein injizierbarer Startseed macht Tests exakt
-wiederholbar. RANDOMIZE mit Ausdruck setzt direkt; RANDOMIZE ohne Ausdruck
-verwendet denselben editierbaren Eingabe- und Wiederholungspfad. Zugesagt ist
-die QBasic-Aufrufsemantik, nicht Microsofts exakte historische Zahlenfolge.
+RND besitzt pro VM Microsofts exakten 24-Bit-Zustand. Der Startwert 0x050000,
+die Multiplikator-/Additionsfolge, RND mit positivem, null oder negativem
+Argument und die DOUBLE-Wortmischung von RANDOMIZE sind mit festen
+Referenzvektoren belegt. RANDOMIZE TIMER verwendet pausenbereinigte Gastzeit;
+RANDOMIZE ohne Ausdruck bleibt im editierbaren Eingabe- und Wiederholungspfad.
 
 Sequentielle Dateien
 --------------------

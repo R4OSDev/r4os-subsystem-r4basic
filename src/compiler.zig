@@ -2314,7 +2314,31 @@ const Builder = struct {
     fn parseExpression(self: *Builder) std.mem.Allocator.Error!?bytecode.ValueType {
         if (!try self.enterExpression(self.current().span)) return null;
         defer self.leaveExpression();
-        return self.parseLogicalOr();
+        return self.parseLogicalImp();
+    }
+
+    fn parseLogicalImp(self: *Builder) !?bytecode.ValueType {
+        var left = (try self.parseLogicalEqv()) orelse return null;
+        while (self.consumeKeyword(.imp)) {
+            const operator = self.tokens[self.index - 1];
+            const right = (try self.parseLogicalEqv()) orelse return null;
+            if (!left.isNumeric() or !right.isNumeric()) try self.addDiagnostic(.type_mismatch, operator.span);
+            _ = try self.emit(.logical_imp, bytecode.encodeValueType(.long), 0, operator.span);
+            left = .long;
+        }
+        return left;
+    }
+
+    fn parseLogicalEqv(self: *Builder) !?bytecode.ValueType {
+        var left = (try self.parseLogicalOr()) orelse return null;
+        while (self.consumeKeyword(.eqv)) {
+            const operator = self.tokens[self.index - 1];
+            const right = (try self.parseLogicalOr()) orelse return null;
+            if (!left.isNumeric() or !right.isNumeric()) try self.addDiagnostic(.type_mismatch, operator.span);
+            _ = try self.emit(.logical_eqv, bytecode.encodeValueType(.long), 0, operator.span);
+            left = .long;
+        }
+        return left;
     }
 
     fn parseLogicalOr(self: *Builder) !?bytecode.ValueType {
@@ -2619,20 +2643,61 @@ const Builder = struct {
                 try self.addDiagnostic(.type_mismatch, span);
                 break :blk .single;
             },
-            .atn, .cos, .sin => if (arguments[0] == .double) .double else .single,
-            .chr_string, .left_string, .ltrim_string, .mid_string, .space_string, .str_string, .ucase_string => .string,
+            .atn, .cos, .exp, .log, .sin, .sqr, .tan => if (arguments[0] == .double) .double else .single,
+            .cdbl, .cvd, .cvdmbf => .double,
+            .clng, .cvl => .long,
+            .csng, .cvs, .cvsmbf => .single,
+            .chr_string,
+            .left_string,
+            .ltrim_string,
+            .mid_string,
+            .mkd_string,
+            .mkdmbf_string,
+            .mki_string,
+            .mkl_string,
+            .mks_string,
+            .mksmbf_string,
+            .space_string,
+            .str_string,
+            .ucase_string,
+            => .string,
             .inkey_string => .string,
-            .cint, .instr, .len, .eof, .peek, .point => .integer,
+            .cint, .cvi, .instr, .len, .eof, .peek, .point, .sgn => .integer,
             .erl => .long,
-            .int => arguments[0],
+            .fix, .int => arguments[0],
             .val => .double,
             .rnd, .timer => .single,
         };
 
         switch (builtin) {
-            .chr_string, .cint, .space_string, .peek, .eof => if (!arguments[0].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
-            .atn, .cos, .sin, .abs, .int, .str_string => if (!arguments[0].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
-            .ltrim_string, .len, .ucase_string, .val => if (arguments[0] != .string) try self.addDiagnostic(.type_mismatch, span),
+            .chr_string,
+            .cint,
+            .clng,
+            .csng,
+            .cdbl,
+            .space_string,
+            .peek,
+            .eof,
+            .atn,
+            .cos,
+            .exp,
+            .fix,
+            .log,
+            .sin,
+            .sqr,
+            .tan,
+            .abs,
+            .int,
+            .sgn,
+            .str_string,
+            .mkd_string,
+            .mkdmbf_string,
+            .mki_string,
+            .mkl_string,
+            .mks_string,
+            .mksmbf_string,
+            => if (!arguments[0].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
+            .cvd, .cvdmbf, .cvi, .cvl, .cvs, .cvsmbf, .ltrim_string, .len, .ucase_string, .val => if (arguments[0] != .string) try self.addDiagnostic(.type_mismatch, span),
             .left_string => if (arguments[0] != .string or !arguments[1].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
             .instr => {
                 const offset: usize = if (arguments.len == 3) 1 else 0;
@@ -3583,15 +3648,33 @@ fn builtinForKeyword(keyword: frontend.Keyword) ?bytecode.Builtin {
     return switch (keyword) {
         .abs => .abs,
         .atn => .atn,
+        .cdbl => .cdbl,
         .chr_string => .chr_string,
         .cint => .cint,
+        .clng => .clng,
         .cos => .cos,
+        .csng => .csng,
+        .cvd => .cvd,
+        .cvdmbf => .cvdmbf,
+        .cvi => .cvi,
+        .cvl => .cvl,
+        .cvs => .cvs,
+        .cvsmbf => .cvsmbf,
+        .exp => .exp,
+        .fix => .fix,
         .instr => .instr,
         .int => .int,
         .left_string => .left_string,
         .len => .len,
+        .log => .log,
         .ltrim_string => .ltrim_string,
         .mid_string => .mid_string,
+        .mkd_string => .mkd_string,
+        .mkdmbf_string => .mkdmbf_string,
+        .mki_string => .mki_string,
+        .mkl_string => .mkl_string,
+        .mks_string => .mks_string,
+        .mksmbf_string => .mksmbf_string,
         .peek => .peek,
         .sin => .sin,
         .space_string => .space_string,
@@ -3603,7 +3686,10 @@ fn builtinForKeyword(keyword: frontend.Keyword) ?bytecode.Builtin {
         .inkey_string => .inkey_string,
         .point => .point,
         .rnd => .rnd,
+        .sgn => .sgn,
         .timer => .timer,
+        .sqr => .sqr,
+        .tan => .tan,
         else => null,
     };
 }

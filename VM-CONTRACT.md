@@ -111,8 +111,9 @@ aliases, and error-handler state belong to each VM instance.
   same-type store moves that owner into the target and does not clone it a
   second time; source and destination never share mutable ownership.
 - Numeric assignment converts to the target type. Floating-to-integer
-  conversion rounds the absolute half away from zero and then checks the
-  target range. Non-finite input and an out-of-range result report overflow.
+  conversion rounds to the nearest integer with exact half-way cases going
+  to the even integer, then checks the target range. Non-finite input and an
+  out-of-range result report overflow.
 - Arithmetic promotes INTEGER to LONG to SINGLE to DOUBLE. `/` produces
   SINGLE unless a DOUBLE operand requires DOUBLE. `\` and `MOD` first apply
   the defined integer rounding to their operands; integer division truncates
@@ -124,9 +125,17 @@ aliases, and error-handler state belong to each VM instance.
   floating conversion, while SINGLE/DOUBLE and mixed floating pairs retain
   the established binary64 comparison path. Conditions accept every nonzero
   numeric value as true and reject strings.
-- `NOT`, `AND`, `OR`, and `XOR` use signed LONG bit operations. Power is
-  right-associative, is evaluated by the injected math host, and rejects a
-  negative base with a non-integral exponent.
+- `NOT`, `AND`, `OR`, `XOR`, `EQV`, and `IMP` use signed LONG bit operations.
+  Their precedence follows comparison, `NOT`, `AND`, `OR`, `XOR`, `EQV`,
+  then `IMP`. Power is right-associative, is evaluated by the injected math
+  host, and rejects a negative base with a non-integral exponent.
+- `CINT` and `CLNG` use the same nearest-even conversion as assignment;
+  `CDBL` and `CSNG` use ordinary target-type conversion. `FIX` truncates
+  toward zero, `INT` floors, and `SGN` returns INTEGER -1, 0, or 1.
+- `CVI`/`CVL`/`CVS`/`CVD` and `MKI$`/`MKL$`/`MKS$`/`MKD$` are exact
+  little-endian inverses. The MBF variants convert the 23- and 55-fraction-
+  bit Microsoft Binary formats with exponent bias 129 and explicit IEEE
+  rounding at representation boundaries.
 
 ## Executable statements
 
@@ -186,10 +195,12 @@ partially changing the queue or persistent music settings.
 
 ## Built-in functions and host services
 
-The executable built-ins are `ABS`, `ATN`, `CHR$`, `CINT`, `COS`, `EOF`, `ERL`,
-`INKEY$`, `INSTR`, `INT`, `LEFT$`, `LEN`, `LTRIM$`, `MID$`, coordinate
-`POINT`, `RND`, `SIN`, `SPACE$`, `STR$`, `TIMER`, `UCASE$`, and `VAL` with
-the arities and type categories defined by the source contract.
+The executable built-ins include `ABS`, `ATN`, `CDBL`, `CHR$`, `CINT`,
+`CLNG`, `COS`, `CSNG`, all IEEE/MBF `CV*` and `MK*` conversions, `EOF`,
+`ERL`, `EXP`, `FIX`, `INKEY$`, `INSTR`, `INT`, `LEFT$`, `LEN`, `LOG`,
+`LTRIM$`, `MID$`, coordinate `POINT`, `RND`, `SGN`, `SIN`, `SPACE$`, `SQR`,
+`STR$`, `TAN`, `TIMER`, `UCASE$`, and `VAL` with the arities and type
+categories defined by the source contract.
 
 `ERL` returns the latest numbered line preceding the trapped instruction, or
 zero when no numbered line precedes it. Its identity comes from immutable
@@ -202,8 +213,11 @@ a bounded 128-byte format buffer; STR$ allocates only its final result. VAL pars
 ordinary E/e text directly, normalizes short D/d text on the stack and reuses
 one VM-owned scratch buffer only for longer D/d input.
 
-`ATN`, `COS`, `SIN`, and power call an injected math service. Cancellation
-polling, the SCREEN-mode availability probe, and sequential file I/O are
+`ATN`, `COS`, `EXP`, `LOG`, `SIN`, `SQR`, `TAN`, and power call an injected
+math service. Domain checks happen before that call; non-finite results and
+math-service faults become QuickBASIC overflow rather than generic host
+failure. Cancellation polling, the SCREEN-mode availability probe, and
+sequential file I/O are
 injected separately. A missing or failing required host result becomes a
 deterministic VM error; tests do not depend on hidden process-global hooks.
 
@@ -362,13 +376,16 @@ guest address can become an R4OS or host pointer.
   earlier repeated poll returns a cooperative wait until that deadline. This
   keeps historical `CalcDelay`/`Rest` loops reproducible without throttling
   unrelated computation, graphics, input, or audio bytecode.
-- Every VM owns a 24-bit random state and last result. An injected initial
-  seed makes tests byte-for-byte reproducible. `RND` with a positive or
-  omitted argument advances, zero repeats the last result, and a negative
-  argument reseeds reproducibly before returning a value. This contract
-  promises QuickBASIC invocation semantics, not the exact Microsoft number
-  sequence.
-- `RANDOMIZE expression` reseeds from the converted SINGLE bit pattern.
+- Every VM owns Microsoft's 24-bit random state and last result. The default
+  state is `0x050000`; advancing applies
+  `(state * 0xFD43FD + 0xC39EC3) AND 0xFFFFFF`, and the SINGLE result is
+  `state / 2^24`. `RND` with a positive or omitted argument advances, zero
+  returns the current state value, and a negative argument derives a state
+  from the argument's SINGLE bits before one advance. State and reset are
+  strictly instance-local.
+- `RANDOMIZE expression` applies the Microsoft DOUBLE-word seed mixing while
+  preserving the current low state byte. `RANDOMIZE TIMER` therefore uses
+  the same deterministic guest clock as `TIMER`.
   Bare `RANDOMIZE` requests a seed in the range -32768 through 32767 through
   the same editable, retrying console-input path.
 

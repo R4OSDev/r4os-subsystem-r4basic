@@ -428,9 +428,12 @@ test "R4BASIC v2 conformance catalog is complete stable and machine readable" {
         identifiers.count(),
     );
     try expectTargetImplemented(core.conformance.part1_targets[0]);
+    try expectTargetImplemented(core.conformance.part1_targets[1]);
+    try expectTargetImplemented(core.conformance.part1_targets[5]);
     try expectTargetImplemented(core.conformance.metacommand_targets[0]);
-    try std.testing.expectEqual(core.conformance.Status.implemented, core.conformance.part1_targets[1].lexer);
-    try std.testing.expectEqual(core.conformance.Status.implemented, core.conformance.part1_targets[1].syntax);
+    for ([_]usize{ 0, 2, 11, 15, 18, 26, 27, 29, 30, 51, 55, 72, 90, 97, 99, 130, 140, 151, 154, 159, 171 }) |index| {
+        try expectTargetImplemented(core.conformance.part2_targets[index]);
+    }
     try std.testing.expectEqual(core.conformance.Status.implemented, core.conformance.part1_targets[3].lexer);
 }
 
@@ -756,8 +759,8 @@ test "typed expressions preserve QBasic values and conversions" {
     try expectSingle(&machine, "SingleValue!", 2.5);
     try expectDouble(&machine, "DoubleValue#", 8.0);
     try expectInteger(&machine, "ConstantValue%", 6);
-    try expectInteger(&machine, "RoundedHigh%", 3);
-    try expectInteger(&machine, "RoundedLow%", -3);
+    try expectInteger(&machine, "RoundedHigh%", 2);
+    try expectInteger(&machine, "RoundedLow%", -2);
     try expectInteger(&machine, "TruthValue%", -1);
     try expectInteger(&machine, "FalseValue%", 0);
     try expectInteger(&machine, "StringOrder%", -1);
@@ -765,6 +768,106 @@ test "typed expressions preserve QBasic values and conversions" {
     try expectInteger(&machine, "IntegerQuotient%", 2);
     try expectInteger(&machine, "Remainder%", 2);
     try expectString(&machine, "TextValue$", "R4OS");
+}
+
+test "QuickBASIC numeric promotion rounding and logical precedence use signed LONG semantics" {
+    const source =
+        \\EvenLow% = CINT(2.5)
+        \\EvenHigh% = CINT(3.5)
+        \\EvenNegativeLow% = CINT(-2.5)
+        \\EvenNegativeHigh% = CINT(-3.5)
+        \\LongEven& = CLNG(2147483646.5#)
+        \\SingleValue! = CSNG(1.25#)
+        \\DoubleValue# = CDBL(1.25!)
+        \\Fixed! = FIX(-2.9!)
+        \\Floored! = INT(-2.1!)
+        \\NegativeSign% = SGN(-.01#)
+        \\ZeroSign% = SGN(0)
+        \\PositiveSign% = SGN(.01#)
+        \\EqvValue& = 5 EQV 3
+        \\ImpValue& = 5 IMP 3
+        \\Precedence& = 1 OR 2 EQV 3
+        \\NotEven& = NOT 2.5
+        \\NotOdd& = NOT 3.5
+        \\RoundedDivide% = 5.5 \ 2
+        \\RoundedModulo% = 6.5 MOD 4
+        \\RightPower! = 2 ^ 3 ^ 2
+        \\UnaryPower! = -2 ^ 2
+        \\NegativeExponent! = 2 ^ -2
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "numeric-model.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(256, 16));
+
+    try expectInteger(&machine, "EvenLow%", 2);
+    try expectInteger(&machine, "EvenHigh%", 4);
+    try expectInteger(&machine, "EvenNegativeLow%", -2);
+    try expectInteger(&machine, "EvenNegativeHigh%", -4);
+    try expectLong(&machine, "LongEven&", 2_147_483_646);
+    try expectSingle(&machine, "SingleValue!", 1.25);
+    try expectDouble(&machine, "DoubleValue#", 1.25);
+    try expectSingle(&machine, "Fixed!", -2);
+    try expectSingle(&machine, "Floored!", -3);
+    try expectInteger(&machine, "NegativeSign%", -1);
+    try expectInteger(&machine, "ZeroSign%", 0);
+    try expectInteger(&machine, "PositiveSign%", 1);
+    try expectLong(&machine, "EqvValue&", -7);
+    try expectLong(&machine, "ImpValue&", -5);
+    try expectLong(&machine, "Precedence&", -1);
+    try expectLong(&machine, "NotEven&", -3);
+    try expectLong(&machine, "NotOdd&", -5);
+    try expectInteger(&machine, "RoundedDivide%", 3);
+    try expectInteger(&machine, "RoundedModulo%", 2);
+    try expectSingle(&machine, "RightPower!", 512);
+    try expectSingle(&machine, "UnaryPower!", -4);
+    try expectSingle(&machine, "NegativeExponent!", 0.25);
+}
+
+test "IEEE and Microsoft Binary Format functions are exact little-endian inverses" {
+    const source =
+        \\IntegerBytes$ = MKI$(-2)
+        \\LongBytes$ = MKL$(&H01020304&)
+        \\SingleBytes$ = MKS$(1!)
+        \\DoubleBytes$ = MKD$(1#)
+        \\MbfSingleBytes$ = MKSMBF$(1!)
+        \\MbfNegativeBytes$ = MKSMBF$(-1!)
+        \\MbfPiBytes$ = MKSMBF$(3.1415927!)
+        \\MbfDoubleBytes$ = MKDMBF$(1#)
+        \\MbfDoublePiBytes$ = MKDMBF$(3.141592653589793#)
+        \\IntegerValue% = CVI(IntegerBytes$)
+        \\LongValue& = CVL(LongBytes$)
+        \\SingleValue! = CVS(SingleBytes$)
+        \\DoubleValue# = CVD(DoubleBytes$)
+        \\MbfSingleValue! = CVSMBF(MbfPiBytes$)
+        \\MbfDoubleValue# = CVDMBF(MKDMBF$(3.141592653589793#))
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "numeric-bytes.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(256, 16));
+
+    try expectString(&machine, "IntegerBytes$", &.{ 0xFE, 0xFF });
+    try expectString(&machine, "LongBytes$", &.{ 0x04, 0x03, 0x02, 0x01 });
+    try expectString(&machine, "SingleBytes$", &.{ 0x00, 0x00, 0x80, 0x3F });
+    try expectString(&machine, "DoubleBytes$", &.{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F });
+    try expectString(&machine, "MbfSingleBytes$", &.{ 0x00, 0x00, 0x00, 0x81 });
+    try expectString(&machine, "MbfNegativeBytes$", &.{ 0x00, 0x00, 0x80, 0x81 });
+    try expectString(&machine, "MbfPiBytes$", &.{ 0xDB, 0x0F, 0x49, 0x82 });
+    try expectString(&machine, "MbfDoubleBytes$", &.{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81 });
+    try expectString(&machine, "MbfDoublePiBytes$", &.{ 0xC0, 0x68, 0x21, 0xA2, 0xDA, 0x0F, 0x49, 0x82 });
+    try expectInteger(&machine, "IntegerValue%", -2);
+    try expectLong(&machine, "LongValue&", 0x01020304);
+    try expectSingle(&machine, "SingleValue!", 1);
+    try expectDouble(&machine, "DoubleValue#", 1);
+    try expectSingle(&machine, "MbfSingleValue!", 3.1415927);
+    try expectDouble(&machine, "MbfDoubleValue#", 3.141592653589793);
 }
 
 test "bound jumps loops selection and gosub return are deterministic" {
@@ -802,7 +905,11 @@ fn probingMath(context: ?*anyopaque, operation: core.vm.MathOperation, first: f6
     return switch (operation) {
         .atn => std.math.atan(first),
         .cos => @cos(first),
+        .exp => @exp(first),
+        .log => @log(first),
         .sin => @sin(first),
+        .sqr => @sqrt(first),
+        .tan => @tan(first),
         .power => std.math.pow(f64, first, second),
     };
 }
@@ -824,13 +931,83 @@ test "math and byte-string builtins use injectable host services" {
     try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 32));
     try std.testing.expectEqual(@as(u32, 3), probe.calls);
     try expectInteger(&machine, "AbsoluteValue", 5);
-    try expectInteger(&machine, "RoundedValue", 3);
+    try expectInteger(&machine, "RoundedValue", 2);
     try expectInteger(&machine, "FloorValue", -3);
     try expectString(&machine, "TextValue$", "AR4BASICCORE  7");
     try expectInteger(&machine, "TextLength", 15);
     try expectInteger(&machine, "FoundAt", 4);
     try expectDouble(&machine, "Angle#", std.math.atan(@as(f64, 1.0)) + 1.0);
     try expectDouble(&machine, "Parsed#", 12.5);
+}
+
+test "complete numeric math builtins preserve input precision and QuickBASIC domains" {
+    const source =
+        \\ExpSingle! = EXP(1!)
+        \\ExpDouble# = EXP(1#)
+        \\LogSingle! = LOG(EXP(1!))
+        \\LogDouble# = LOG(EXP(1#))
+        \\RootSingle! = SQR(9!)
+        \\RootDouble# = SQR(2#)
+        \\TangentSingle! = TAN(.25!)
+        \\TangentDouble# = TAN(.25#)
+        \\AbsoluteLong& = ABS(-2147483647&)
+        \\Arc# = ATN(1#)
+        \\Cosine# = COS(1#)
+        \\Sine# = SIN(1#)
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "math-model.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var probe: MathProbe = .{};
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{ .context = &probe, .math = probingMath });
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(256, 16));
+    try std.testing.expectEqual(@as(u32, 13), probe.calls);
+    try expectSingle(&machine, "ExpSingle!", @exp(@as(f32, 1)));
+    try expectDouble(&machine, "ExpDouble#", @exp(@as(f64, 1)));
+    try expectSingle(&machine, "LogSingle!", 1);
+    try expectDouble(&machine, "LogDouble#", 1);
+    try expectSingle(&machine, "RootSingle!", 3);
+    try expectDouble(&machine, "RootDouble#", @sqrt(@as(f64, 2)));
+    try expectSingle(&machine, "TangentSingle!", @tan(@as(f32, 0.25)));
+    try expectDouble(&machine, "TangentDouble#", @tan(@as(f64, 0.25)));
+    try expectLong(&machine, "AbsoluteLong&", 2_147_483_647);
+    try expectDouble(&machine, "Arc#", std.math.atan(@as(f64, 1)));
+    try expectDouble(&machine, "Cosine#", @cos(@as(f64, 1)));
+    try expectDouble(&machine, "Sine#", @sin(@as(f64, 1)));
+}
+
+test "numeric builtin boundaries report QuickBASIC errors 5 and 6" {
+    const Case = struct {
+        source: []const u8,
+        code: core.vm.RuntimeCode,
+        number: i32,
+    };
+    const cases = [_]Case{
+        .{ .source = "Value# = 7#\nValue# = LOG(0)\nEND\n", .code = .illegal_function_call, .number = 5 },
+        .{ .source = "Value# = 7#\nValue# = SQR(-1)\nEND\n", .code = .illegal_function_call, .number = 5 },
+        .{ .source = "Value# = 7#\nValue# = EXP(100!)\nEND\n", .code = .overflow, .number = 6 },
+        .{ .source = "Value# = 7#\nValue# = CINT(32767.5#)\nEND\n", .code = .overflow, .number = 6 },
+        .{ .source = "Value# = 7#\nValue# = CLNG(2147483647.5#)\nEND\n", .code = .overflow, .number = 6 },
+        .{ .source = "Value# = 7#\nValue# = CVI(\"A\")\nEND\n", .code = .illegal_function_call, .number = 5 },
+        .{ .source = "Value# = 7#\nValue# = CVS(CHR$(0) + CHR$(0) + CHR$(128) + CHR$(127))\nEND\n", .code = .overflow, .number = 6 },
+        .{ .source = "Value# = 7#\nValue# = 1 / 0\nEND\n", .code = .division_by_zero, .number = 11 },
+        .{ .source = "Value# = 7#\nValue# = 1 MOD 0\nEND\n", .code = .division_by_zero, .number = 11 },
+        .{ .source = "Value# = 7#\nValue# = (-1#) ^ .5#\nEND\n", .code = .illegal_function_call, .number = 5 },
+        .{ .source = "Value# = 7#\nValue# = 32767 + 1\nEND\n", .code = .overflow, .number = 6 },
+    };
+    for (cases) |case| {
+        var program = try core.compiler.compile(std.testing.allocator, "numeric-boundary.bas", case.source);
+        defer program.deinit();
+        try expectProgramOk(&program);
+        var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+        defer machine.deinit();
+        try std.testing.expectEqual(core.vm.Status.runtime_error, machine.runToCompletion(256, 16));
+        try std.testing.expectEqual(case.code, machine.runtime_diagnostic.?.code);
+        try std.testing.expectEqual(case.number, machine.exit_code);
+        try expectDouble(&machine, "Value#", 7);
+    }
 }
 
 test "runtime faults keep stable source positions and QBasic error numbers" {
@@ -863,7 +1040,7 @@ test "runtime faults keep stable source positions and QBasic error numbers" {
     }
 }
 
-test "injected host failures become deterministic runtime diagnostics" {
+test "injected math faults become deterministic QuickBASIC overflow diagnostics" {
     var program = try core.compiler.compile(std.testing.allocator, "host-error.bas", "DEFINT A-Z\nValue# = COS(0#)\nEND\n");
     defer program.deinit();
     try expectProgramOk(&program);
@@ -871,8 +1048,8 @@ test "injected host failures become deterministic runtime diagnostics" {
     defer machine.deinit();
     try std.testing.expectEqual(core.vm.Status.runtime_error, machine.runToCompletion(32, 8));
     const diagnostic = machine.runtime_diagnostic orelse return error.MissingRuntimeDiagnostic;
-    try std.testing.expectEqual(core.vm.RuntimeCode.host_failure, diagnostic.code);
-    try std.testing.expectEqual(@as(i32, 70), machine.exit_code);
+    try std.testing.expectEqual(core.vm.RuntimeCode.overflow, diagnostic.code);
+    try std.testing.expectEqual(@as(i32, 6), machine.exit_code);
     try std.testing.expectEqual(@as(u32, 2), diagnostic.span.line);
     try std.testing.expectEqual(@as(u32, 10), diagnostic.span.column);
 }
@@ -1573,6 +1750,63 @@ test "TIMER SLEEP and RND use injected pause-free guest state" {
     try std.testing.expectEqual(core.vm.Status.halted, early.runToCompletion(32, 8));
     try std.testing.expectEqual(core.vm.Status.halted, late.runToCompletion(32, 8));
     try std.testing.expect(early.global("Value!").?.single != late.global("Value!").?.single);
+}
+
+test "RND and RANDOMIZE reproduce Microsoft's 24-bit state machine per VM" {
+    const default_source =
+        \\Held! = RND(0)
+        \\First! = RND
+        \\Second! = RND
+        \\Third! = RND
+        \\END
+    ;
+    var default_program = try core.compiler.compile(std.testing.allocator, "rnd-default.bas", default_source);
+    defer default_program.deinit();
+    try expectProgramOk(&default_program);
+    var first = try core.vm.Vm.init(std.testing.allocator, &default_program, .{});
+    defer first.deinit();
+    var second = try core.vm.Vm.init(std.testing.allocator, &default_program, .{});
+    defer second.deinit();
+    for ([_]*core.vm.Vm{ &first, &second }) |machine| {
+        try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 16));
+        try expectSingleBits(machine, "Held!", randomVector(327_680));
+        try expectSingleBits(machine, "First!", randomVector(11_837_123));
+        try expectSingleBits(machine, "Second!", randomVector(8_949_370));
+        try expectSingleBits(machine, "Third!", randomVector(9_722_709));
+    }
+    try first.reset();
+    try std.testing.expectEqual(core.vm.Status.halted, first.runToCompletion(128, 16));
+    try expectSingleBits(&first, "First!", randomVector(11_837_123));
+
+    var seeded_program = try core.compiler.compile(
+        std.testing.allocator,
+        "rnd-randomize.bas",
+        "RANDOMIZE 123\nSeeded! = RND\nEND\n",
+    );
+    defer seeded_program.deinit();
+    try expectProgramOk(&seeded_program);
+    var seeded = try core.vm.Vm.init(std.testing.allocator, &seeded_program, .{});
+    defer seeded.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, seeded.runToCompletion(128, 16));
+    try expectSingleBits(&seeded, "Seeded!", randomVector(3_835_075));
+
+    const negative_source =
+        \\NegativeOne! = RND(-1)
+        \\HeldOne! = RND(0)
+        \\NegativeSeven! = RND(-7)
+        \\HeldSeven! = RND(0)
+        \\END
+    ;
+    var negative_program = try core.compiler.compile(std.testing.allocator, "rnd-negative.bas", negative_source);
+    defer negative_program.deinit();
+    try expectProgramOk(&negative_program);
+    var negative = try core.vm.Vm.init(std.testing.allocator, &negative_program, .{});
+    defer negative.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, negative.runToCompletion(128, 16));
+    try expectSingleBits(&negative, "NegativeOne!", randomVector(3_758_214));
+    try expectSingleBits(&negative, "HeldOne!", randomVector(3_758_214));
+    try expectSingleBits(&negative, "NegativeSeven!", randomVector(1_481_859));
+    try expectSingleBits(&negative, "HeldSeven!", randomVector(1_481_859));
 }
 
 test "SLEEP yields cooperatively and a new key interrupts it" {
@@ -2380,6 +2614,16 @@ fn expectSingle(machine: *const core.vm.Vm, name: []const u8, expected: f32) !vo
     const actual = machine.global(name) orelse return error.MissingGlobal;
     try std.testing.expectEqual(core.bytecode.ValueType.single, actual.valueType());
     try std.testing.expectApproxEqAbs(expected, actual.single, 0.00001);
+}
+
+fn expectSingleBits(machine: *const core.vm.Vm, name: []const u8, expected: f32) !void {
+    const actual = machine.global(name) orelse return error.MissingGlobal;
+    try std.testing.expectEqual(core.bytecode.ValueType.single, actual.valueType());
+    try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(actual.single)));
+}
+
+fn randomVector(state: u32) f32 {
+    return @as(f32, @floatFromInt(state)) / 16_777_216.0;
 }
 
 fn expectDouble(machine: *const core.vm.Vm, name: []const u8, expected: f64) !void {

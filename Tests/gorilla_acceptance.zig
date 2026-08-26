@@ -170,7 +170,7 @@ test "canonical local GORILLA.BAS completes a deterministic round with victory" 
             .second_angle_key => if (delay_slices != 0) {
                 delay_slices -= 1;
             } else {
-                try feedInput(&machine, "45\r");
+                try feedInput(&machine, "57\r");
                 stage = .second_velocity;
             },
             .second_velocity => if (screenContains(&machine, "Velocity:")) {
@@ -180,7 +180,11 @@ test "canonical local GORILLA.BAS completes a deterministic round with victory" 
             .second_velocity_key => if (delay_slices != 0) {
                 delay_slices -= 1;
             } else {
-                try feedInput(&machine, "1\r");
+                // The reference Microsoft RND sequence places the players at
+                // (74,168) and (533,91) with wind 5 for this fixed guest-time
+                // run. 57 degrees at velocity 74 is a real high-arc hit;
+                // the former velocity-1 self-hit depended on the old RNG.
+                try feedInput(&machine, "74\r");
                 stage = .victory;
             },
             .victory => if (screenContains(&machine, "Angle:") and scoreWasUpdated(&machine) and machine.audioStats().play_statements >= 12) {
@@ -197,7 +201,7 @@ test "canonical local GORILLA.BAS completes a deterministic round with victory" 
     }
 
     if (!completed_round) {
-        std.debug.print("GORILLA guard end: status={s} instructions={d} audio_calls={d}\n", .{ @tagName(machine.status), machine.total_instructions, machine.audioStats().play_statements + machine.audioStats().beep_statements });
+        std.debug.print("GORILLA guard end: stage={s} status={s} instructions={d} audio_calls={d}\n", .{ @tagName(stage), @tagName(machine.status), machine.total_instructions, machine.audioStats().play_statements + machine.audioStats().beep_statements });
         var debug_row: [core.text_screen.columns]u8 = undefined;
         for (0..core.text_screen.rows) |row| {
             if (machine.textScreen().copyRow(row, &debug_row)) std.debug.print("{d:0>2}: {s}\n", .{ row + 1, std.mem.trimEnd(u8, &debug_row, " ") });
@@ -211,11 +215,11 @@ test "canonical local GORILLA.BAS completes a deterministic round with victory" 
     const graphics = machine.graphicsView() orelse return error.MissingGorillaGraphics;
     try std.testing.expectEqual(@as(u32, 640), graphics.width);
     try std.testing.expectEqual(@as(u32, 350), graphics.height);
-    // This is the first golden captured after the production audio transport
-    // fences were honored. The score, palette, command counts and named state
+    // This golden uses both production audio fences and Microsoft's exact
+    // 24-bit RND sequence. The score, palette, command counts and named state
     // below make the raster identity a semantic round result, not a timing
-    // snapshot from the formerly stalled test harness.
-    try std.testing.expectEqual(@as(u64, 0x2f1201c433baac00), std.hash.Wyhash.hash(0, graphics.pixels));
+    // snapshot or a program-specific random path.
+    try std.testing.expectEqual(@as(u64, 0xd58388942d891f55), std.hash.Wyhash.hash(0, graphics.pixels));
     try std.testing.expectEqual(@as(u32, 0x000000aa), graphics.palette[0]);
     try std.testing.expectEqual(@as(u32, 0x00ffaa55), graphics.palette[1]);
     try std.testing.expectEqual(@as(u32, 0x00ff0055), graphics.palette[2]);

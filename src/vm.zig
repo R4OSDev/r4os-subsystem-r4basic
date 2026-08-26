@@ -22,13 +22,17 @@ pub const sequential_file_transfer_bytes: usize = 64 * 1024;
 pub const file_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_file_number: usize = 255;
 pub const random_mask: u32 = 0x00FF_FFFF;
-pub const default_random_seed: u32 = 0x0050_0000;
+pub const default_random_seed: u32 = 0x0005_0000;
 pub const numeric_format_buffer_bytes: usize = 128;
 
 pub const MathOperation = enum(u8) {
     atn,
     cos,
+    exp,
+    log,
     sin,
+    sqr,
+    tan,
     power,
 };
 
@@ -689,13 +693,15 @@ pub const Vm = struct {
     ) InitError!Vm {
         if (!program.ok() or program.instructions.len != program.instruction_metadata.len) return error.InvalidProgram;
         const globals = try allocateGlobals(allocator, program);
+        const random_state = normalizeRandomSeed(host.initial_random_seed);
         return .{
             .allocator = allocator,
             .program = program,
             .host = host,
             .globals = globals,
             .instruction_pointer = program.module_entry,
-            .random_state = normalizeRandomSeed(host.initial_random_seed),
+            .random_state = random_state,
+            .random_last = randomValue(random_state),
             .audio_engine = audio.Engine.init(allocator),
         };
     }
@@ -1002,7 +1008,7 @@ pub const Vm = struct {
         self.pending_audio_instruction = bytecode.invalid_index;
         self.audio_fence_frames = 0;
         self.random_state = normalizeRandomSeed(self.host.initial_random_seed);
-        self.random_last = 0;
+        self.random_last = randomValue(self.random_state);
         self.discardFiles();
         self.active_print_file = null;
         self.statement_stack_base = 0;
@@ -1334,6 +1340,8 @@ pub const Vm = struct {
             .logical_and,
             .logical_or,
             .logical_xor,
+            .logical_eqv,
+            .logical_imp,
             => .arithmetic,
             .set_error_handler,
             .resume_error,
@@ -1459,6 +1467,8 @@ pub const Vm = struct {
             .logical_and => try self.binary(.logical_and, .long),
             .logical_or => try self.binary(.logical_or, .long),
             .logical_xor => try self.binary(.logical_xor, .long),
+            .logical_eqv => try self.binary(.logical_eqv, .long),
+            .logical_imp => try self.binary(.logical_imp, .long),
             .power => try self.power(bytecode.decodeValueType(instruction.a)),
             .compare_equal => try self.comparison(.equal, bytecode.decodeValueType(instruction.a)),
             .compare_not_equal => try self.comparison(.not_equal, bytecode.decodeValueType(instruction.a)),
@@ -2352,7 +2362,7 @@ pub const Vm = struct {
         if (argument_count == 1) {
             var seed_value = try self.popValue();
             defer seed_value.deinit(self.allocator);
-            self.seedRandom(try values.asDouble(seed_value));
+            self.randomizeSeed(try values.asDouble(seed_value));
             return;
         }
 
@@ -2373,21 +2383,27 @@ pub const Vm = struct {
             self.wait_wake_ns = if (self.queuedInputBytes() == 0) 0 else self.guest_now_ns;
             return error.WouldBlock;
         }
-        self.seedRandom(seed);
+        self.randomizeSeed(seed);
         self.pending_input_instruction = bytecode.invalid_index;
         self.input_line.clearRetainingCapacity();
     }
 
-    fn seedRandom(self: *Vm, seed: f64) void {
-        const single: f32 = @floatCast(seed);
-        const bits: u32 = @bitCast(single);
-        self.random_state = normalizeRandomSeed(bits ^ (bits >> 8) ^ 0x00A5_5A5A);
-        self.random_last = 0;
+    fn randomizeSeed(self: *Vm, seed: f64) void {
+        const bits: u64 = @bitCast(seed);
+        const high_words = ((bits >> 24) ^ (bits >> 40)) & 0x00FF_FF00;
+        self.random_state = @as(u32, @intCast(high_words)) | (self.random_state & 0xFF);
+        self.random_last = randomValue(self.random_state);
+    }
+
+    fn seedNegativeRandom(self: *Vm, seed: f32) void {
+        const bits: u32 = @bitCast(seed);
+        self.random_state = ((bits & random_mask) +% (bits >> 24)) & random_mask;
+        self.random_last = randomValue(self.random_state);
     }
 
     fn nextRandom(self: *Vm) f32 {
         self.random_state = (self.random_state *% 0x00FD_43FD +% 0x00C3_9EC3) & random_mask;
-        self.random_last = @as(f32, @floatFromInt(self.random_state)) / 16_777_216.0;
+        self.random_last = randomValue(self.random_state);
         return self.random_last;
     }
 
@@ -2783,7 +2799,7 @@ pub const Vm = struct {
         const second = try values.asDouble(exponent);
         if (first == 0 and second < 0) return error.DivisionByZero;
         if (first < 0 and @floor(second) != second) return error.IllegalFunctionCall;
-        const result = self.host.math(self.host.context, .power, first, second) catch return error.HostFailure;
+        const result = self.host.math(self.host.context, .power, first, second) catch return error.Overflow;
         if (!std.math.isFinite(result)) return error.Overflow;
         if (target == .double) return self.pushValue(.{ .double = result });
         const single: f32 = @floatCast(result);
@@ -3016,8 +3032,22 @@ pub const Vm = struct {
         return switch (builtin) {
             .abs => absolute(arguments[0]),
             .atn => self.hostMath(.atn, arguments[0], .{ .single = 0 }),
+            .cdbl => values.convert(self.allocator, arguments[0], .double),
             .cos => self.hostMath(.cos, arguments[0], .{ .single = 0 }),
+            .clng => values.convert(self.allocator, arguments[0], .long),
+            .csng => values.convert(self.allocator, arguments[0], .single),
+            .cvd => decodeIeeeString(arguments[0], .double),
+            .cvdmbf => decodeMbfString(arguments[0], .double),
+            .cvi => decodeIeeeString(arguments[0], .integer),
+            .cvl => decodeIeeeString(arguments[0], .long),
+            .cvs => decodeIeeeString(arguments[0], .single),
+            .cvsmbf => decodeMbfString(arguments[0], .single),
+            .exp => self.hostMath(.exp, arguments[0], .{ .single = 0 }),
+            .fix => truncate(arguments[0]),
+            .log => self.hostMath(.log, arguments[0], .{ .single = 0 }),
             .sin => self.hostMath(.sin, arguments[0], .{ .single = 0 }),
+            .sqr => self.hostMath(.sqr, arguments[0], .{ .single = 0 }),
+            .tan => self.hostMath(.tan, arguments[0], .{ .single = 0 }),
             .chr_string => self.character(arguments[0]),
             .cint => values.convert(self.allocator, arguments[0], .integer),
             .instr => self.instr(arguments),
@@ -3026,6 +3056,12 @@ pub const Vm = struct {
             .len => .{ .integer = @intCast(arguments[0].string.len) },
             .ltrim_string => self.leftTrim(arguments[0]),
             .mid_string => self.midString(arguments),
+            .mkd_string => self.encodeIeeeString(arguments[0], .double),
+            .mkdmbf_string => self.encodeMbfString(arguments[0], .double),
+            .mki_string => self.encodeIeeeString(arguments[0], .integer),
+            .mkl_string => self.encodeIeeeString(arguments[0], .long),
+            .mks_string => self.encodeIeeeString(arguments[0], .single),
+            .mksmbf_string => self.encodeMbfString(arguments[0], .single),
             .peek => error.HostFailure,
             .space_string => self.spaceString(arguments[0]),
             .str_string => self.numberString(arguments[0]),
@@ -3035,6 +3071,7 @@ pub const Vm = struct {
             .erl => self.errorLine(),
             .inkey_string => self.inkeyString(),
             .rnd => self.randomNumber(arguments),
+            .sgn => signum(arguments[0]),
             .timer => self.timerValue(),
             .point => blk: {
                 const x = try values.asLong(arguments[0]);
@@ -3073,7 +3110,7 @@ pub const Vm = struct {
         const argument = try values.asDouble(arguments[0]);
         if (!std.math.isFinite(argument)) return error.IllegalFunctionCall;
         if (argument < 0) {
-            self.seedRandom(argument);
+            self.seedNegativeRandom(try values.asSingle(arguments[0]));
             return .{ .single = self.nextRandom() };
         }
         if (argument == 0) return .{ .single = self.random_last };
@@ -3109,12 +3146,52 @@ pub const Vm = struct {
     fn hostMath(self: *Vm, operation: MathOperation, input: values.Value, unused: values.Value) ExecutionError!values.Value {
         _ = unused;
         const number = try values.asDouble(input);
-        const result = self.host.math(self.host.context, operation, number, 0) catch return error.HostFailure;
+        switch (operation) {
+            .log => if (number <= 0) return error.IllegalFunctionCall,
+            .sqr => if (number < 0) return error.IllegalFunctionCall,
+            else => {},
+        }
+        const result = self.host.math(self.host.context, operation, number, 0) catch return error.Overflow;
         if (!std.math.isFinite(result)) return error.Overflow;
         if (input.valueType() == .double) return .{ .double = result };
         const single: f32 = @floatCast(result);
         if (!std.math.isFinite(single)) return error.Overflow;
         return .{ .single = single };
+    }
+
+    fn encodeIeeeString(self: *Vm, input: values.Value, target: bytecode.ValueType) ExecutionError!values.Value {
+        const length: usize = switch (target) {
+            .integer => 2,
+            .long, .single => 4,
+            .double => 8,
+            .string => return error.TypeMismatch,
+        };
+        const raw: u64 = switch (target) {
+            .integer => @as(u16, @bitCast(try values.asInteger(input))),
+            .long => @as(u32, @bitCast(try values.asLong(input))),
+            .single => @as(u32, @bitCast(try values.asSingle(input))),
+            .double => @bitCast(try values.asDouble(input)),
+            .string => unreachable,
+        };
+        const result = try self.allocator.alloc(u8, length);
+        writeUnsignedLittle(result, raw);
+        return .{ .string = result };
+    }
+
+    fn encodeMbfString(self: *Vm, input: values.Value, target: bytecode.ValueType) ExecutionError!values.Value {
+        const length: usize = switch (target) {
+            .single => 4,
+            .double => 8,
+            else => return error.TypeMismatch,
+        };
+        const raw = switch (target) {
+            .single => @as(u64, try encodeMbfSingle(try values.asSingle(input))),
+            .double => try encodeMbfDouble(try values.asDouble(input)),
+            else => unreachable,
+        };
+        const result = try self.allocator.alloc(u8, length);
+        writeUnsignedLittle(result, raw);
+        return .{ .string = result };
     }
 
     fn character(self: *Vm, input: values.Value) ExecutionError!values.Value {
@@ -3471,8 +3548,11 @@ fn consumeLineEnding(bytes: []const u8, cursor: *usize) void {
 }
 
 fn normalizeRandomSeed(seed: u32) u32 {
-    const normalized = seed & random_mask;
-    return if (normalized == 0) 1 else normalized;
+    return seed & random_mask;
+}
+
+fn randomValue(state: u32) f32 {
+    return @as(f32, @floatFromInt(state & random_mask)) / 16_777_216.0;
 }
 
 fn fileHostFault(failure: FileHostError) ExecutionError {
@@ -3521,6 +3601,165 @@ fn isReservedDevicePath(path: []const u8) bool {
     return false;
 }
 
+fn decodeIeeeString(input: values.Value, target: bytecode.ValueType) ExecutionError!values.Value {
+    const length: usize = switch (target) {
+        .integer => 2,
+        .long, .single => 4,
+        .double => 8,
+        .string => return error.TypeMismatch,
+    };
+    const bytes = try stringAtLeast(input, length);
+    const raw = readUnsignedLittle(bytes[0..length]);
+    return switch (target) {
+        .integer => .{ .integer = @bitCast(@as(u16, @truncate(raw))) },
+        .long => .{ .long = @bitCast(@as(u32, @truncate(raw))) },
+        .single => blk: {
+            const number: f32 = @bitCast(@as(u32, @truncate(raw)));
+            if (!std.math.isFinite(number)) return error.Overflow;
+            break :blk .{ .single = number };
+        },
+        .double => blk: {
+            const number: f64 = @bitCast(raw);
+            if (!std.math.isFinite(number)) return error.Overflow;
+            break :blk .{ .double = number };
+        },
+        .string => unreachable,
+    };
+}
+
+fn decodeMbfString(input: values.Value, target: bytecode.ValueType) ExecutionError!values.Value {
+    return switch (target) {
+        .single => blk: {
+            const bytes = try stringAtLeast(input, 4);
+            const raw: u32 = @truncate(readUnsignedLittle(bytes[0..4]));
+            break :blk .{ .single = decodeMbfSingle(raw) };
+        },
+        .double => blk: {
+            const bytes = try stringAtLeast(input, 8);
+            break :blk .{ .double = decodeMbfDouble(readUnsignedLittle(bytes[0..8])) };
+        },
+        else => error.TypeMismatch,
+    };
+}
+
+fn stringAtLeast(input: values.Value, length: usize) ExecutionError![]const u8 {
+    return switch (input) {
+        .string => |bytes| if (bytes.len < length) error.IllegalFunctionCall else bytes,
+        else => error.TypeMismatch,
+    };
+}
+
+fn writeUnsignedLittle(bytes: []u8, raw: u64) void {
+    for (bytes, 0..) |*byte, index| byte.* = @truncate(raw >> @intCast(index * 8));
+}
+
+fn readUnsignedLittle(bytes: []const u8) u64 {
+    var raw: u64 = 0;
+    for (bytes, 0..) |byte, index| raw |= @as(u64, byte) << @intCast(index * 8);
+    return raw;
+}
+
+fn encodeMbfSingle(number: f32) ExecutionError!u32 {
+    if (!std.math.isFinite(number)) return error.Overflow;
+    const bits: u32 = @bitCast(number);
+    const magnitude = bits & 0x7FFF_FFFF;
+    if (magnitude == 0) return 0;
+
+    const ieee_exponent = (bits >> 23) & 0xFF;
+    var exponent: i32 = undefined;
+    var significand: u32 = undefined;
+    if (ieee_exponent == 0) {
+        const fraction = bits & 0x007F_FFFF;
+        const highest: u5 = @intCast(31 - @clz(fraction));
+        exponent = @as(i32, highest) - 149;
+        significand = fraction << @intCast(23 - highest);
+    } else {
+        exponent = @as(i32, @intCast(ieee_exponent)) - 127;
+        significand = 0x0080_0000 | (bits & 0x007F_FFFF);
+    }
+
+    if (exponent > 126) return error.Overflow;
+    if (exponent < -129) return 0;
+    const sign_bits = ((bits >> 31) & 1) << 23;
+    if (exponent == -129) {
+        if (significand <= 0x0080_0000) return 0;
+        return sign_bits | (1 << 24);
+    }
+    const mbf_exponent: u32 = @intCast(exponent + 129);
+    return (mbf_exponent << 24) | sign_bits | (significand & 0x007F_FFFF);
+}
+
+fn decodeMbfSingle(raw: u32) f32 {
+    const mbf_exponent = raw >> 24;
+    if (mbf_exponent == 0) return 0;
+    const exponent = @as(i32, @intCast(mbf_exponent)) - 129;
+    const sign_bits = (raw & 0x0080_0000) << 8;
+    const significand = 0x0080_0000 | (raw & 0x007F_FFFF);
+    const ieee_bits: u32 = if (exponent >= -126)
+        sign_bits | (@as(u32, @intCast(exponent + 127)) << 23) | (significand & 0x007F_FFFF)
+    else
+        sign_bits | @as(u32, @intCast(roundShiftRightEven(significand, @intCast(-126 - exponent))));
+    return @bitCast(ieee_bits);
+}
+
+fn encodeMbfDouble(number: f64) ExecutionError!u64 {
+    if (!std.math.isFinite(number)) return error.Overflow;
+    const bits: u64 = @bitCast(number);
+    const magnitude = bits & 0x7FFF_FFFF_FFFF_FFFF;
+    if (magnitude == 0) return 0;
+
+    const ieee_exponent = (bits >> 52) & 0x7FF;
+    var exponent: i32 = undefined;
+    var significand: u64 = undefined;
+    if (ieee_exponent == 0) {
+        const fraction = bits & 0x000F_FFFF_FFFF_FFFF;
+        const highest: u6 = @intCast(63 - @clz(fraction));
+        exponent = @as(i32, highest) - 1074;
+        significand = fraction << @intCast(52 - highest);
+    } else {
+        exponent = @as(i32, @intCast(ieee_exponent)) - 1023;
+        significand = 0x0010_0000_0000_0000 | (bits & 0x000F_FFFF_FFFF_FFFF);
+    }
+
+    if (exponent > 126) return error.Overflow;
+    if (exponent < -129) return 0;
+    const sign_bits = ((bits >> 63) & 1) << 55;
+    if (exponent == -129) {
+        if (significand <= 0x0010_0000_0000_0000) return 0;
+        return sign_bits | (@as(u64, 1) << 56);
+    }
+    const mbf_exponent: u64 = @intCast(exponent + 129);
+    const fraction = (significand & 0x000F_FFFF_FFFF_FFFF) << 3;
+    return (mbf_exponent << 56) | sign_bits | fraction;
+}
+
+fn decodeMbfDouble(raw: u64) f64 {
+    const mbf_exponent = raw >> 56;
+    if (mbf_exponent == 0) return 0;
+    var exponent = @as(i32, @intCast(mbf_exponent)) - 129;
+    const sign_bits = (raw & (@as(u64, 1) << 55)) << 8;
+    const significand = (@as(u64, 1) << 55) | (raw & 0x007F_FFFF_FFFF_FFFF);
+    var rounded = roundShiftRightEven(significand, 3);
+    if (rounded == (@as(u64, 1) << 53)) {
+        rounded >>= 1;
+        exponent += 1;
+    }
+    const ieee_exponent: u64 = @intCast(exponent + 1023);
+    const ieee_bits = sign_bits | (ieee_exponent << 52) | (rounded & 0x000F_FFFF_FFFF_FFFF);
+    return @bitCast(ieee_bits);
+}
+
+fn roundShiftRightEven(value: anytype, shift: u6) @TypeOf(value) {
+    std.debug.assert(shift != 0);
+    const Shift = std.math.Log2Int(@TypeOf(value));
+    const amount: Shift = @intCast(shift);
+    const result = value >> amount;
+    const mask = (@as(@TypeOf(value), 1) << amount) - 1;
+    const remainder = value & mask;
+    const halfway = @as(@TypeOf(value), 1) << @as(Shift, @intCast(shift - 1));
+    return result + @intFromBool(remainder > halfway or (remainder == halfway and (result & 1) != 0));
+}
+
 fn absolute(input: values.Value) ExecutionError!values.Value {
     return switch (input) {
         .integer => |number| if (number == std.math.minInt(i16)) error.Overflow else .{ .integer = @intCast(@abs(number)) },
@@ -3539,6 +3778,21 @@ fn integerFloor(input: values.Value) ExecutionError!values.Value {
         .double => |number| .{ .double = @floor(number) },
         .string => error.TypeMismatch,
     };
+}
+
+fn truncate(input: values.Value) ExecutionError!values.Value {
+    return switch (input) {
+        .integer => |number| .{ .integer = number },
+        .long => |number| .{ .long = number },
+        .single => |number| .{ .single = @trunc(number) },
+        .double => |number| .{ .double = @trunc(number) },
+        .string => error.TypeMismatch,
+    };
+}
+
+fn signum(input: values.Value) ExecutionError!values.Value {
+    const number = try values.asDouble(input);
+    return .{ .integer = if (number < 0) -1 else if (number > 0) 1 else 0 };
 }
 
 fn saturatingCoordinateAdd(first: i32, second: i32) i32 {
@@ -3610,7 +3864,11 @@ fn defaultMath(_: ?*anyopaque, operation: MathOperation, first: f64, second: f64
     const result = switch (operation) {
         .atn => std.math.atan(first),
         .cos => @cos(first),
+        .exp => @exp(first),
+        .log => @log(first),
         .sin => @sin(first),
+        .sqr => @sqrt(first),
+        .tan => @tan(first),
         .power => std.math.pow(f64, first, second),
     };
     if (!std.math.isFinite(result)) return error.MathFault;

@@ -51,6 +51,8 @@ pub const BinaryOperation = enum {
     logical_and,
     logical_or,
     logical_xor,
+    logical_eqv,
+    logical_imp,
 };
 
 pub const Comparison = enum {
@@ -170,6 +172,8 @@ pub fn binary(
         .logical_and => .{ .long = (try toLong(left)) & (try toLong(right)) },
         .logical_or => .{ .long = (try toLong(left)) | (try toLong(right)) },
         .logical_xor => .{ .long = (try toLong(left)) ^ (try toLong(right)) },
+        .logical_eqv => .{ .long = ~((try toLong(left)) ^ (try toLong(right))) },
+        .logical_imp => .{ .long = ~(try toLong(left)) | (try toLong(right)) },
     };
 }
 
@@ -389,5 +393,15 @@ fn toDouble(input: Value) Fault!f64 {
 
 fn roundedFinite(number: f64) Fault!f64 {
     if (!std.math.isFinite(number)) return error.Overflow;
-    return if (number >= 0) @floor(number + 0.5) else @ceil(number - 0.5);
+    const lower = @floor(number);
+    const fraction = number - lower;
+    if (fraction < 0.5) return lower;
+    if (fraction > 0.5) return lower + 1;
+
+    // QuickBASIC 4.5 uses IEEE round-to-nearest-even for every real-to-
+    // integer conversion, including assignment, CINT/CLNG, \ and MOD.
+    // Beyond 2^52 an f64 has no representable half-way fraction.
+    if (@abs(lower) >= 4_503_599_627_370_496.0) return lower;
+    const lower_integer: i64 = @intFromFloat(lower);
+    return if ((lower_integer & 1) == 0) lower else lower + 1;
 }

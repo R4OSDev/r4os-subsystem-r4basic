@@ -73,8 +73,8 @@ repositories under `ExFiles/Reference/Basic/README.txt`.
   Numeric literals accept `%`, `&`, `!`, and `#`, but never `$`.
 - Decimal numeric literals accept the reference decimal-point, `E`/`D`
   exponent and `%`/`&`/`!`/`#` suffix forms. Hexadecimal `&H` and octal
-  `&O`/`&` constants use the documented 16-bit range or the trailing-`&`
-  32-bit range. A leading sign remains an operator.
+  `&O`/`&` constants use the documented 16-bit range; a trailing `&` selects
+  the documented 32-bit LONG range. A leading sign remains an operator.
 - String literals are delimited by double quotation marks and cannot cross a
   line or contain an embedded double quotation mark. Bytes `0x80` through
   `0xFF` are preserved inside a literal. NUL in source is rejected. Runtime
@@ -119,8 +119,8 @@ the same grammar family. All fixture paths are below `Tests/Fixtures/`.
 | FLOW-01 | Named labels, `GOTO`, `GOSUB`, `RETURN`, `ON ERROR GOTO`, `RESUME`, and `RESUME NEXT` | yes | `positive_control_flow.bas` | `negative_structure.bas` |
 | FLOW-02 | Block and single-line `IF`, `ELSEIF`, `ELSE`, `SELECT CASE`, ranges, and `CASE ELSE` | yes | `positive_control_flow.bas` | `negative_structure.bas` |
 | FLOW-03 | `FOR`/`NEXT`, `WHILE`/`WEND`, `DO`/`LOOP`, leading conditions, trailing conditions, and `EXIT FOR`/`EXIT DO` | yes | `positive_control_flow.bas` | `negative_structure.bas`, `negative_statements.bas` |
-| EXPR-01 | Parentheses; unary `+`, `-`, `NOT`; power, multiply, divide, integer divide, `MOD`, add, subtract, comparisons, `AND`, `OR`, and `XOR` | yes | all positive fixtures | `negative_expressions.bas` |
-| EXPR-02 | `ABS`, `ATN`, `CHR$`, `CINT`, `COS`, `EOF`, `INKEY$`, `INSTR`, `INT`, `LEFT$`, `LEN`, `LTRIM$`, `MID$`, `PEEK`, coordinate `POINT`, `RND`, `SIN`, `SPACE$`, `STR$`, `TAB`, `TIMER`, `UCASE$`, and `VAL` with bounded v1 arities | yes | `positive_io_graphics.bas` | `negative_expressions.bas` |
+| EXPR-01 | Parentheses; unary `+`, `-`, `NOT`; power, multiply, divide, integer divide, `MOD`, add, subtract, comparisons, `AND`, `OR`, `XOR`, `EQV`, and `IMP` with reference precedence and signed-LONG logic | yes | all positive fixtures and inline numeric vectors | `negative_expressions.bas` |
+| EXPR-02 | Numeric conversion, IEEE/MBF byte conversion, math, string, time, graphics and host-query built-ins currently marked implemented in `src/conformance.zig` | yes | `positive_io_graphics.bas` and inline numeric/byte/error vectors | `negative_expressions.bas` |
 | TEXT-01 | `SCREEN 0`, `WIDTH`, `COLOR`, `CLS`, `LOCATE`, `VIEW PRINT`, `PRINT`, `INPUT`, and `LINE INPUT` | yes | `positive_io_graphics.bas` | `negative_statements.bas` |
 | TIME-01 | `RANDOMIZE`, `RND`, `TIMER`, `INKEY$`, and `SLEEP` syntax | yes | `positive_io_graphics.bas` | `negative_expressions.bas`, `negative_statements.bas` |
 | GFX-01 | `SCREEN 1`/`9`, `PALETTE`, `PSET`, coordinate `POINT`, `LINE` including `B`/`BF`, `CIRCLE`, and `PAINT` | yes | `positive_io_graphics.bas` | `negative_statements.bas`, `negative_expressions.bas` |
@@ -142,8 +142,11 @@ source does not select a separate production path.
 
 ## Built-in function arities
 
-- One argument: `ABS`, `ATN`, `CHR$`, `CINT`, `COS`, `EOF`, `INT`, `LEN`,
-  `LTRIM$`, `PEEK`, `SIN`, `SPACE$`, `STR$`, `TAB`, `UCASE$`, `VAL`.
+- One argument: `ABS`, `ATN`, `CDBL`, `CHR$`, `CINT`, `CLNG`, `COS`, `CSNG`,
+  `CVD`, `CVDMBF`, `CVI`, `CVL`, `CVS`, `CVSMBF`, `EOF`, `EXP`, `FIX`,
+  `INT`, `LEN`, `LOG`, `LTRIM$`, `MKD$`, `MKDMBF$`, `MKI$`, `MKL$`,
+  `MKS$`, `MKSMBF$`, `PEEK`, `SGN`, `SIN`, `SPACE$`, `SQR`, `STR$`, `TAN`,
+  `TAB`, `UCASE$`, `VAL`.
 - Two arguments: `LEFT$`, coordinate `POINT`.
 - Two or three arguments: `INSTR`, `MID$`.
 - Zero or one argument: `RND`; the bare form is accepted.
