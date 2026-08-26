@@ -6,7 +6,7 @@ const graphics_screen = @import("graphics_screen.zig");
 const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "1.9.0";
+pub const contract_version = "1.10.0";
 pub const default_instruction_budget: u32 = 262_144;
 pub const timer_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
@@ -150,6 +150,56 @@ pub const OperationGroup = enum(u8) {
 
 pub const operation_group_count: usize = 6;
 
+pub const InputStamp = struct {
+    sequence: u64 = 0,
+    tick: u64 = 0,
+};
+
+pub const InputDropReason = enum {
+    none,
+    unfocused,
+    invalid_codepoint,
+    unsupported_key,
+    unsupported_event,
+    queue_full,
+    out_of_memory,
+};
+
+pub const InputResult = struct {
+    accepted: bool,
+    reason: InputDropReason = .none,
+};
+
+pub const InputStats = struct {
+    logical_events: u64 = 0,
+    accepted_bytes: u64 = 0,
+    control_events: u64 = 0,
+    dropped_events: u64 = 0,
+    unfocused_drops: u64 = 0,
+    invalid_codepoint_drops: u64 = 0,
+    unsupported_key_drops: u64 = 0,
+    unsupported_event_drops: u64 = 0,
+    queue_full_drops: u64 = 0,
+    out_of_memory_drops: u64 = 0,
+    consumed_bytes: u64 = 0,
+    maximum_queue_depth: u64 = 0,
+    last_event_sequence: u64 = 0,
+    last_event_tick: u64 = 0,
+    last_accepted_sequence: u64 = 0,
+    last_accepted_tick: u64 = 0,
+    last_dropped_sequence: u64 = 0,
+    last_dropped_tick: u64 = 0,
+    last_drop_reason: InputDropReason = .none,
+    last_consumed_sequence: u64 = 0,
+    last_consumed_tick: u64 = 0,
+};
+
+const QueuedInput = struct {
+    value: u8,
+    sequence: u64,
+    tick: u64,
+};
+
 pub const PerformanceStats = struct {
     instructions: u64 = 0,
     groups: [operation_group_count]u64 = .{0} ** operation_group_count,
@@ -196,6 +246,7 @@ pub const PerformanceStats = struct {
     file_table_capacity_grows: u64 = 0,
     maximum_open_files: u64 = 0,
     raster: graphics_screen.PerformanceStats = .{},
+    input: InputStats = .{},
 
     pub fn group(self: *const PerformanceStats, operation_group: OperationGroup) u64 {
         return self.groups[@intFromEnum(operation_group)];
@@ -581,10 +632,11 @@ pub const Vm = struct {
     graphics: graphics_screen.Screen = .{},
     screen_mode: i32 = 0,
     host_display_requested: bool = false,
-    keyboard: std.ArrayList(u8) = .empty,
+    keyboard: std.ArrayList(QueuedInput) = .empty,
     keyboard_head: usize = 0,
     keyboard_generation: u64 = 0,
     input_focused: bool = true,
+    input_stats: InputStats = .{},
     input_line: std.ArrayList(u8) = .empty,
     numeric_scratch: std.ArrayList(u8) = .empty,
     pending_input_instruction: u32 = bytecode.invalid_index,
@@ -677,29 +729,93 @@ pub const Vm = struct {
         self.input_focused = focused;
     }
 
-    pub fn enqueueTextCodepoint(self: *Vm, codepoint: u32) std.mem.Allocator.Error!bool {
-        if (!self.input_focused or codepoint < 0x20 or codepoint > 0xFF or codepoint == 0x7F) return false;
-        if (self.keyboard.items.len - self.keyboard_head >= maximum_keyboard_bytes) return false;
-        try self.keyboard.append(self.allocator, @intCast(codepoint));
-        self.keyboard_generation +%= 1;
-        return true;
+    pub fn noteInputControl(self: *Vm, stamp: InputStamp) void {
+        self.recordInputAttempt(stamp);
+        self.input_stats.control_events +%= 1;
     }
 
-    pub fn enqueueKeyCode(self: *Vm, code: u32) std.mem.Allocator.Error!bool {
-        if (!self.input_focused) return false;
+    pub fn noteInputDrop(self: *Vm, stamp: InputStamp, reason: InputDropReason) InputResult {
+        self.recordInputAttempt(stamp);
+        return self.recordInputDrop(stamp, reason);
+    }
+
+    pub fn acceptTextCodepoint(self: *Vm, codepoint: u32, stamp: InputStamp) InputResult {
+        self.recordInputAttempt(stamp);
+        if (!self.input_focused) return self.recordInputDrop(stamp, .unfocused);
+        if (codepoint < 0x20 or codepoint > 0xFF or codepoint == 0x7F) {
+            return self.recordInputDrop(stamp, .invalid_codepoint);
+        }
+        return self.appendInput(@intCast(codepoint), stamp);
+    }
+
+    pub fn acceptKeyCode(self: *Vm, code: u32, stamp: InputStamp) InputResult {
+        self.recordInputAttempt(stamp);
+        if (!self.input_focused) return self.recordInputDrop(stamp, .unfocused);
         const byte: u8 = switch (code) {
             8 => 8,
             10, 13 => 13,
-            else => return false,
+            else => return self.recordInputDrop(stamp, .unsupported_key),
         };
-        if (self.keyboard.items.len - self.keyboard_head >= maximum_keyboard_bytes) return false;
-        try self.keyboard.append(self.allocator, byte);
-        self.keyboard_generation +%= 1;
-        return true;
+        return self.appendInput(byte, stamp);
+    }
+
+    pub fn enqueueTextCodepoint(self: *Vm, codepoint: u32) std.mem.Allocator.Error!bool {
+        return self.acceptTextCodepoint(codepoint, .{}).accepted;
+    }
+
+    pub fn enqueueKeyCode(self: *Vm, code: u32) std.mem.Allocator.Error!bool {
+        return self.acceptKeyCode(code, .{}).accepted;
     }
 
     pub fn queuedInputBytes(self: *const Vm) usize {
         return self.keyboard.items.len - self.keyboard_head;
+    }
+
+    pub fn inputStats(self: *const Vm) InputStats {
+        return self.input_stats;
+    }
+
+    fn appendInput(self: *Vm, byte: u8, stamp: InputStamp) InputResult {
+        if (self.keyboard.items.len - self.keyboard_head >= maximum_keyboard_bytes) {
+            return self.recordInputDrop(stamp, .queue_full);
+        }
+        self.keyboard.append(self.allocator, .{
+            .value = byte,
+            .sequence = stamp.sequence,
+            .tick = stamp.tick,
+        }) catch return self.recordInputDrop(stamp, .out_of_memory);
+        self.keyboard_generation +%= 1;
+        self.input_stats.accepted_bytes +%= 1;
+        self.input_stats.last_accepted_sequence = stamp.sequence;
+        self.input_stats.last_accepted_tick = stamp.tick;
+        self.input_stats.maximum_queue_depth = @max(
+            self.input_stats.maximum_queue_depth,
+            @as(u64, @intCast(self.keyboard.items.len - self.keyboard_head)),
+        );
+        return .{ .accepted = true };
+    }
+
+    fn recordInputAttempt(self: *Vm, stamp: InputStamp) void {
+        self.input_stats.logical_events +%= 1;
+        self.input_stats.last_event_sequence = stamp.sequence;
+        self.input_stats.last_event_tick = stamp.tick;
+    }
+
+    fn recordInputDrop(self: *Vm, stamp: InputStamp, reason: InputDropReason) InputResult {
+        self.input_stats.dropped_events +%= 1;
+        self.input_stats.last_dropped_sequence = stamp.sequence;
+        self.input_stats.last_dropped_tick = stamp.tick;
+        self.input_stats.last_drop_reason = reason;
+        switch (reason) {
+            .none => {},
+            .unfocused => self.input_stats.unfocused_drops +%= 1,
+            .invalid_codepoint => self.input_stats.invalid_codepoint_drops +%= 1,
+            .unsupported_key => self.input_stats.unsupported_key_drops +%= 1,
+            .unsupported_event => self.input_stats.unsupported_event_drops +%= 1,
+            .queue_full => self.input_stats.queue_full_drops +%= 1,
+            .out_of_memory => self.input_stats.out_of_memory_drops +%= 1,
+        }
+        return .{ .accepted = false, .reason = reason };
     }
 
     pub fn textScreen(self: *const Vm) *const text_screen.Screen {
@@ -819,6 +935,7 @@ pub const Vm = struct {
         self.keyboard_head = 0;
         self.keyboard_generation = 0;
         self.input_focused = true;
+        self.input_stats = .{};
         self.input_line.clearRetainingCapacity();
         self.numeric_scratch.clearRetainingCapacity();
         self.pending_input_instruction = bytecode.invalid_index;
@@ -976,6 +1093,7 @@ pub const Vm = struct {
             .file_table_capacity_grows = self.file_table_capacity_grows,
             .maximum_open_files = self.maximum_open_files,
             .raster = self.graphics.performanceStats(),
+            .input = self.input_stats,
         };
     }
 
@@ -1967,15 +2085,18 @@ pub const Vm = struct {
             self.keyboard_head = 0;
             return null;
         }
-        const result = self.keyboard.items[self.keyboard_head];
+        const queued = self.keyboard.items[self.keyboard_head];
         self.keyboard_head += 1;
         if (self.keyboard_head >= 1024 and self.keyboard_head * 2 >= self.keyboard.items.len) {
             const remaining = self.keyboard.items.len - self.keyboard_head;
-            std.mem.copyForwards(u8, self.keyboard.items[0..remaining], self.keyboard.items[self.keyboard_head..]);
+            std.mem.copyForwards(QueuedInput, self.keyboard.items[0..remaining], self.keyboard.items[self.keyboard_head..]);
             self.keyboard.items.len = remaining;
             self.keyboard_head = 0;
         }
-        return result;
+        self.input_stats.consumed_bytes +%= 1;
+        self.input_stats.last_consumed_sequence = queued.sequence;
+        self.input_stats.last_consumed_tick = queued.tick;
+        return queued.value;
     }
 
     fn decodeConsoleInput(

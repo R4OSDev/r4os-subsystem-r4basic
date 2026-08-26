@@ -23,7 +23,7 @@ graphics retain their normal bounded pacing without repeated scratch work.
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.10`
+- Module version: `1.2.12`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -56,7 +56,7 @@ this repository and is read directly from the ignored workspace injection
 tree. The normal test step uses the permanent general BAS fixtures under
 `Tests/Fixtures`, including the standalone audio contract.
 
-R4BASIC 1.2.10 uses a shared 262,144-instruction ceiling with adaptive bounded
+R4BASIC 1.2.12 uses a shared 262,144-instruction ceiling with adaptive bounded
 clock blocks and an 8-ms production time boundary. Active work requests a
 scheduler yield at most once per 8-ms interval; input-only waits, pause and
 static status windows block on the Desktop activity sequence. The first guest
@@ -69,6 +69,13 @@ atomic bounded `REDIM`, and bounded formatting/VAL storage. `/PERFTEST` prints
 separate QEMU-readable numeric, 4-KB assignment, LEN, UCASE$, call and array
 markers plus an exact summary. The productive artifact remains the canonical
 GUI subsystem host and uses its measured module-local `OPTIMIZE=speed` profile.
+
+The 1.2.12 input profile emits each printable key exactly once as text,
+retains Enter and Backspace as keys, and filters pointer traffic before guest
+coordinate mapping. Stable sequence/tick metadata follows accepted bytes to
+consumption; bounded counters distinguish focus, invalid-code, unsupported,
+full-queue and allocation drops and correlate consumed input with the next
+published frame without per-event logging.
 
 Text rows, lines, filled regions and flood fill now commit one accumulated
 damage region per operation. Same-size `SCREEN` changes clear and reuse their

@@ -1,5 +1,6 @@
 const std = @import("std");
 const core = @import("core");
+const r4os = @import("r4os");
 
 const fixture_paths = struct {
     const expressions = "Tests/Fixtures/vm_expressions.bas";
@@ -981,8 +982,153 @@ test "INKEY is nonblocking focus-aware and isolated per VM" {
     try expectString(&second, "Second$", "");
 
     var adapter = core.runtime_adapter.Adapter.init(&first);
-    try std.testing.expect(adapter.handleInput(.{ .focus = .{ .focused = false, .tick = 1 } }));
-    try std.testing.expect(!adapter.handleInput(.{ .text = .{ .codepoint = 'Z', .modifiers = 0, .tick = 2 } }));
+    const focus = adapter.handleInput(.{ .focus = .{ .focused = false, .tick = 1, .sequence = 1 } });
+    try std.testing.expectEqual(core.runtime_adapter.InputDeliveryStatus.control, focus.status);
+    const dropped = adapter.handleInput(.{ .text = .{ .codepoint = 'Z', .modifiers = 0, .tick = 2, .sequence = 2 } });
+    try std.testing.expectEqual(core.runtime_adapter.InputDeliveryStatus.dropped, dropped.status);
+    try std.testing.expectEqual(core.vm.InputDropReason.unfocused, dropped.reason);
+}
+
+test "R4BASIC input policy emits one guest byte and filters pointer mapping" {
+    const source = "First$ = INKEY$\nSecond$ = INKEY$\nEND\n";
+    var program = try core.compiler.compile(std.testing.allocator, "translated-input.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    var adapter = core.runtime_adapter.Adapter.init(&machine);
+    const viewport = try r4os.subsystem_host.calculateViewport(800, 600, 320, 200);
+    var translator = r4os.subsystem_host.InputTranslator.init(.text_only_no_pointer);
+
+    const event = translator.translate(.{
+        .kind = @intFromEnum(r4os.abi.GuiEventKind.key_down),
+        .key = 'A',
+        .tick = 41,
+    }, viewport, null) orelse return error.MissingTranslatedInput;
+    const delivery = adapter.handleInput(event);
+    try std.testing.expectEqual(core.runtime_adapter.InputDeliveryStatus.accepted, delivery.status);
+    try std.testing.expectEqual(@as(u64, 1), delivery.sequence);
+    try std.testing.expectEqual(@as(u64, 41), delivery.tick);
+    try std.testing.expect(translator.takePending() == null);
+
+    try std.testing.expect(translator.translate(.{
+        .kind = @intFromEnum(r4os.abi.GuiEventKind.mouse_move),
+        .x = viewport.x,
+        .y = viewport.y,
+        .tick = 42,
+    }, viewport, null) == null);
+    try std.testing.expectEqual(@as(u64, 2), translator.stats.raw_events);
+    try std.testing.expectEqual(@as(u64, 1), translator.stats.logical_events);
+    try std.testing.expectEqual(@as(u64, 1), translator.stats.pointer_ignored);
+    try std.testing.expectEqual(@as(u64, 0), translator.stats.mouse_mappings);
+
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(32, 8));
+    try expectString(&machine, "First$", "A");
+    try expectString(&machine, "Second$", "");
+    const input = machine.inputStats();
+    try std.testing.expectEqual(@as(u64, 1), input.accepted_bytes);
+    try std.testing.expectEqual(@as(u64, 1), input.consumed_bytes);
+    try std.testing.expectEqual(@as(u64, 1), input.last_consumed_sequence);
+    try std.testing.expectEqual(@as(u64, 41), input.last_consumed_tick);
+    adapter.notePresent(.presented, 50, 60);
+    try std.testing.expectEqual(@as(u64, 1), adapter.performance.last_visible_input_sequence);
+    try std.testing.expectEqual(@as(u64, 41), adapter.performance.last_visible_input_tick);
+    try std.testing.expectEqual(@as(u64, 60), adapter.performance.last_visible_reaction_ns);
+}
+
+test "input queue overflow preserves sequence tick fill and distinct drop reasons" {
+    var program = try core.compiler.compile(std.testing.allocator, "input-overflow.bas", "First$ = INKEY$\nEND\n");
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+
+    var sequence: u64 = 1;
+    while (sequence <= core.vm.maximum_keyboard_bytes) : (sequence += 1) {
+        const accepted = machine.acceptTextCodepoint('Q', .{ .sequence = sequence, .tick = 1000 + sequence });
+        try std.testing.expect(accepted.accepted);
+    }
+    const overflow = machine.acceptTextCodepoint('R', .{ .sequence = sequence, .tick = 1000 + sequence });
+    try std.testing.expect(!overflow.accepted);
+    try std.testing.expectEqual(core.vm.InputDropReason.queue_full, overflow.reason);
+    try std.testing.expectEqual(core.vm.maximum_keyboard_bytes, machine.queuedInputBytes());
+
+    const before = machine.inputStats();
+    try std.testing.expectEqual(@as(u64, core.vm.maximum_keyboard_bytes), before.accepted_bytes);
+    try std.testing.expectEqual(@as(u64, 1), before.queue_full_drops);
+    try std.testing.expectEqual(@as(u64, core.vm.maximum_keyboard_bytes), before.maximum_queue_depth);
+    try std.testing.expectEqual(sequence, before.last_dropped_sequence);
+    try std.testing.expectEqual(1000 + sequence, before.last_dropped_tick);
+    try std.testing.expectEqual(core.vm.InputDropReason.queue_full, before.last_drop_reason);
+
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(32, 8));
+    try expectString(&machine, "First$", "Q");
+    const after = machine.inputStats();
+    try std.testing.expectEqual(@as(u64, 1), after.consumed_bytes);
+    try std.testing.expectEqual(@as(u64, 1), after.last_consumed_sequence);
+    try std.testing.expectEqual(@as(u64, 1001), after.last_consumed_tick);
+}
+
+test "input adapter preserves every VM drop category without hot logging" {
+    var program = try core.compiler.compile(std.testing.allocator, "input-drops.bas", "END\n");
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    var adapter = core.runtime_adapter.Adapter.init(&machine);
+
+    try std.testing.expectEqual(
+        core.runtime_adapter.InputDeliveryStatus.control,
+        adapter.handleInput(.{ .focus = .{ .focused = false, .tick = 1, .sequence = 1 } }).status,
+    );
+    try std.testing.expectEqual(
+        core.vm.InputDropReason.unfocused,
+        adapter.handleInput(.{ .text = .{ .codepoint = 'A', .modifiers = 0, .tick = 2, .sequence = 2 } }).reason,
+    );
+    try std.testing.expectEqual(
+        core.runtime_adapter.InputDeliveryStatus.control,
+        adapter.handleInput(.{ .focus = .{ .focused = true, .tick = 3, .sequence = 3 } }).status,
+    );
+    try std.testing.expectEqual(
+        core.vm.InputDropReason.invalid_codepoint,
+        adapter.handleInput(.{ .text = .{ .codepoint = 0x100, .modifiers = 0, .tick = 4, .sequence = 4 } }).reason,
+    );
+    try std.testing.expectEqual(
+        core.vm.InputDropReason.unsupported_key,
+        adapter.handleInput(.{ .key_down = .{ .code = 27, .modifiers = 0, .tick = 5, .sequence = 5 } }).reason,
+    );
+    try std.testing.expectEqual(
+        core.vm.InputDropReason.unsupported_event,
+        adapter.handleInput(.{ .mouse = .{
+            .action = .move,
+            .client_x = 0,
+            .client_y = 0,
+            .guest = null,
+            .buttons = 0,
+            .modifiers = 0,
+            .tick = 6,
+            .sequence = 6,
+        } }).reason,
+    );
+
+    var no_memory: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(no_memory[0..]);
+    machine.allocator = fixed.allocator();
+    const out_of_memory = adapter.handleInput(.{ .text = .{ .codepoint = 'B', .modifiers = 0, .tick = 7, .sequence = 7 } });
+    machine.allocator = std.testing.allocator;
+    try std.testing.expectEqual(core.vm.InputDropReason.out_of_memory, out_of_memory.reason);
+
+    const input = machine.inputStats();
+    try std.testing.expectEqual(@as(u64, 7), input.logical_events);
+    try std.testing.expectEqual(@as(u64, 2), input.control_events);
+    try std.testing.expectEqual(@as(u64, 5), input.dropped_events);
+    try std.testing.expectEqual(@as(u64, 1), input.unfocused_drops);
+    try std.testing.expectEqual(@as(u64, 1), input.invalid_codepoint_drops);
+    try std.testing.expectEqual(@as(u64, 1), input.unsupported_key_drops);
+    try std.testing.expectEqual(@as(u64, 1), input.unsupported_event_drops);
+    try std.testing.expectEqual(@as(u64, 1), input.out_of_memory_drops);
+    try std.testing.expectEqual(@as(u64, 7), input.last_dropped_sequence);
+    try std.testing.expectEqual(@as(u64, 7), input.last_dropped_tick);
 }
 
 test "TIMER SLEEP and RND use injected pause-free guest state" {

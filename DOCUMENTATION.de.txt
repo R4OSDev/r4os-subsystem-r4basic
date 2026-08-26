@@ -6,7 +6,7 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.69.59
+Stand 0.69.63
 ------------
 
 Diese Ausbaustufe ist der produktive R4BASIC-v1-Subsystemhost. Explorer
@@ -228,9 +228,14 @@ einen sequentiellen Ausgabepuffer schreiben, ohne punktweise GUI-Aufrufe zu
 erzeugen.
 
 Pro VM existiert ein fokussierter Tastaturpuffer fuer hoechstens 4.096 Byte.
-Der gastneutrale Subsystemhost liefert druckbare Zeichen, Enter, Backspace
-und Fokuswechsel. INKEY$ entnimmt hoechstens ein Byte und kehrt bei leerem
-Puffer sofort mit einer leeren Zeichenkette zurueck. INPUT und LINE INPUT
+R4BASIC konfiguriert den gastneutralen Subsystemhost explizit fuer genau ein
+Text-Ereignis je druckbarer Taste, einzelne Key-Ereignisse fuer Enter und
+Backspace sowie ohne Mausabbildung. Jedes gelieferte Ereignis behaelt seine
+Raw-Sequenz und seinen Tick bis zur VM; angenommene Bytes tragen beides bis
+zur Entnahme. Unfokussiert, ungueltiger Codepoint, nicht unterstuetzter Key
+oder Event, volle Queue und Speichermangel bleiben getrennte Dropgruende.
+INKEY$ entnimmt hoechstens ein Byte und kehrt bei leerem Puffer sofort mit
+einer leeren Zeichenkette zurueck. INPUT und LINE INPUT
 geben dagegen kooperativ ab, bearbeiten und spiegeln eine maximal 255 Byte
 lange Zeile und weisen erst dann alle Ziele atomar zu. Ein ungueltiger Wert
 meldet `Redo from start`, ohne bereits gueltige Ziele vorzeitig zu aendern.

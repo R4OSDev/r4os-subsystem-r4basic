@@ -1,6 +1,6 @@
 ﻿# R4BASIC v1 core VM contract
 
-Contract version: `1.9.0`
+Contract version: `1.10.0`
 
 This document freezes the executable R4BASIC language layers. The broader
 source syntax accepted by the frontend remains defined in
@@ -198,8 +198,17 @@ guest address can become an R4OS or host pointer.
   zones, applies one-based `TAB`, and emits a newline only without a trailing
   separator. Positive numbers carry leading and trailing spaces; negative
   numbers carry the sign and trailing space.
-- Each VM owns a focused keyboard byte queue of at most 4,096 bytes.
-  Printable text, Enter, and Backspace are accepted only while focused.
+- Each VM owns a focused keyboard byte queue of at most 4,096 bytes. Every
+  queued byte retains the stable host-input sequence and raw tick until it is
+  consumed. Printable text, Enter, and Backspace are accepted only while
+  focused.
+- R4BASIC requests text-only printable keys and no pointer mapping from the
+  generic subsystem host. Printable keys therefore enter the guest exactly
+  once; Enter and Backspace retain their key form. Unfocused, invalid
+  codepoint, unsupported key/event, full-queue, and allocation failures are
+  distinct bounded drop results. Passive counters preserve raw/logical/
+  accepted/consumed counts, queue high water and the last accepted, dropped,
+  consumed and visibly presented input stamps without a hot-path log.
   `INKEY$` consumes at most one byte and returns an allocated empty string
   immediately when the queue is empty.
 - Console `INPUT` and `LINE INPUT` retry the same instruction without

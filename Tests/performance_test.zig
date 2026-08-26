@@ -120,6 +120,90 @@ test "console input uses an event-only wake deadline" {
     try std.testing.expectEqual(core.runtime_adapter.api.StepStatus.completed, completed.status);
 }
 
+test "paused runtime retains ordered input and reports ignored drops before resume" {
+    var program = try core.compiler.compile(std.testing.allocator, "paused-input.bas", "First$ = INKEY$\nSecond$ = INKEY$\nEND\n");
+    defer program.deinit();
+    try std.testing.expect(program.ok());
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    var adapter = core.runtime_adapter.Adapter.init(&machine);
+    var host = PausedInputHost{ .adapter = &adapter };
+    var runtime = try core.runtime_adapter.api.Runtime.init(.{}, 1000, 0, null);
+
+    _ = runtime.cycle(0, adapter.driver(), host.driver());
+    try std.testing.expectEqual(core.runtime_adapter.api.LifecycleState.paused, runtime.state);
+    try std.testing.expectEqual(@as(u64, 0), machine.total_instructions);
+
+    _ = runtime.cycle(1, adapter.driver(), host.driver());
+    try std.testing.expectEqual(core.runtime_adapter.api.LifecycleState.paused, runtime.state);
+    try std.testing.expectEqual(@as(usize, 2), machine.queuedInputBytes());
+    try std.testing.expectEqual(@as(u64, 0), machine.inputStats().consumed_bytes);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats.ignored_input_events);
+
+    _ = runtime.cycle(2, adapter.driver(), host.driver());
+    try std.testing.expectEqual(core.runtime_adapter.api.LifecycleState.completed, runtime.state);
+    try std.testing.expectEqualStrings("A", machine.global("First$").?.string);
+    try std.testing.expectEqualStrings("B", machine.global("Second$").?.string);
+    try std.testing.expectEqual(@as(u64, 2), machine.inputStats().last_consumed_sequence);
+    try std.testing.expectEqual(@as(u64, 102), machine.inputStats().last_consumed_tick);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats.resumes);
+}
+
+const PausedInputHost = struct {
+    adapter: *core.runtime_adapter.Adapter,
+    stage: u8 = 0,
+    input_index: u8 = 0,
+    idle_after_stage: bool = false,
+
+    fn driver(self: *PausedInputHost) core.runtime_adapter.api.HostDriver {
+        return .{
+            .context = self,
+            .poll_fn = poll,
+            .present_fn = present,
+        };
+    }
+
+    fn poll(context: *anyopaque) core.runtime_adapter.api.HostPollResult {
+        const self: *PausedInputHost = @ptrCast(@alignCast(context));
+        if (self.idle_after_stage) {
+            self.idle_after_stage = false;
+            return .idle;
+        }
+        return switch (self.stage) {
+            0 => blk: {
+                self.stage = 1;
+                self.idle_after_stage = true;
+                break :blk .{ .command = .pause };
+            },
+            1 => blk: {
+                const sequence: u64 = @as(u64, self.input_index) + 1;
+                const tick = 100 + sequence;
+                const delivered = switch (self.input_index) {
+                    0 => self.adapter.handleInput(.{ .text = .{ .codepoint = 'A', .modifiers = 0, .tick = tick, .sequence = sequence } }),
+                    1 => self.adapter.handleInput(.{ .text = .{ .codepoint = 'B', .modifiers = 0, .tick = tick, .sequence = sequence } }),
+                    else => self.adapter.handleInput(.{ .text = .{ .codepoint = 0x100, .modifiers = 0, .tick = tick, .sequence = sequence } }),
+                };
+                self.input_index += 1;
+                if (self.input_index == 3) {
+                    self.stage = 2;
+                    self.idle_after_stage = true;
+                }
+                break :blk if (delivered.wakesGuest()) .handled else .ignored;
+            },
+            2 => blk: {
+                self.stage = 3;
+                self.idle_after_stage = true;
+                break :blk .{ .command = .resume_running };
+            },
+            else => .idle,
+        };
+    }
+
+    fn present(_: *anyopaque) i32 {
+        return core.runtime_adapter.api.host_present_unchanged;
+    }
+};
+
 const FakeClock = struct {
     tick: u64 = 0,
     reads: u32 = 0,

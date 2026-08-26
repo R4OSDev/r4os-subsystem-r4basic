@@ -21,6 +21,24 @@ pub const PresentFeedback = enum {
     failed,
 };
 
+pub const InputDeliveryStatus = enum {
+    accepted,
+    control,
+    dropped,
+};
+
+pub const InputDelivery = struct {
+    status: InputDeliveryStatus,
+    reason: vm.InputDropReason = .none,
+    sequence: u64,
+    tick: u64,
+    queued_bytes: usize,
+
+    pub fn wakesGuest(self: InputDelivery) bool {
+        return self.status != .dropped;
+    }
+};
+
 pub const SliceClock = struct {
     context: *anyopaque,
     ticks_fn: *const fn (*anyopaque) u64,
@@ -69,6 +87,15 @@ pub const PerformanceStats = struct {
     maximum_present_ns: u64 = 0,
     maximum_frame_age_start_ns: u64 = 0,
     maximum_frame_age_end_ns: u64 = 0,
+    input_logical_events: u64 = 0,
+    input_accepted_bytes: u64 = 0,
+    input_control_events: u64 = 0,
+    input_dropped_events: u64 = 0,
+    last_input_sequence: u64 = 0,
+    last_input_tick: u64 = 0,
+    last_visible_input_sequence: u64 = 0,
+    last_visible_input_tick: u64 = 0,
+    last_visible_reaction_ns: u64 = 0,
 };
 
 pub const Adapter = struct {
@@ -130,19 +157,50 @@ pub const Adapter = struct {
         };
     }
 
-    pub fn handleInput(self: *Adapter, event: host.InputEvent) bool {
-        return switch (event) {
+    pub fn handleInput(self: *Adapter, event: host.InputEvent) InputDelivery {
+        const host_stamp = event.stamp();
+        const stamp = vm.InputStamp{ .sequence = host_stamp.sequence, .tick = host_stamp.tick };
+        self.performance.input_logical_events +%= 1;
+        self.performance.last_input_sequence = stamp.sequence;
+        self.performance.last_input_tick = stamp.tick;
+        const delivery: InputDelivery = switch (event) {
             .close => blk: {
                 self.machine.requestCancel();
-                break :blk true;
+                self.machine.noteInputControl(stamp);
+                break :blk self.makeDelivery(.control, .none, stamp);
             },
             .focus => |focus| blk: {
                 self.machine.setInputFocused(focus.focused);
-                break :blk true;
+                self.machine.noteInputControl(stamp);
+                break :blk self.makeDelivery(.control, .none, stamp);
             },
-            .key_down => |key| self.machine.enqueueKeyCode(key.code) catch false,
-            .text => |text_event| self.machine.enqueueTextCodepoint(text_event.codepoint) catch false,
-            .resize, .mouse => false,
+            .key_down => |key| self.deliveryFromVm(self.machine.acceptKeyCode(key.code, stamp), stamp),
+            .text => |text_event| self.deliveryFromVm(self.machine.acceptTextCodepoint(text_event.codepoint, stamp), stamp),
+            .resize => blk: {
+                self.machine.noteInputControl(stamp);
+                break :blk self.makeDelivery(.control, .none, stamp);
+            },
+            .mouse => self.deliveryFromVm(self.machine.noteInputDrop(stamp, .unsupported_event), stamp),
+        };
+        switch (delivery.status) {
+            .accepted => self.performance.input_accepted_bytes +%= 1,
+            .control => self.performance.input_control_events +%= 1,
+            .dropped => self.performance.input_dropped_events +%= 1,
+        }
+        return delivery;
+    }
+
+    fn deliveryFromVm(self: *Adapter, result: vm.InputResult, stamp: vm.InputStamp) InputDelivery {
+        return self.makeDelivery(if (result.accepted) .accepted else .dropped, result.reason, stamp);
+    }
+
+    fn makeDelivery(self: *Adapter, status: InputDeliveryStatus, reason: vm.InputDropReason, stamp: vm.InputStamp) InputDelivery {
+        return .{
+            .status = status,
+            .reason = reason,
+            .sequence = stamp.sequence,
+            .tick = stamp.tick,
+            .queued_bytes = self.machine.queuedInputBytes(),
         };
     }
 
@@ -153,7 +211,15 @@ pub const Adapter = struct {
     pub fn notePresent(self: *Adapter, feedback: PresentFeedback, started_ns: u64, ended_ns: u64) void {
         self.performance.present_attempts +%= 1;
         switch (feedback) {
-            .presented => self.performance.presents +%= 1,
+            .presented => {
+                self.performance.presents +%= 1;
+                const input = self.machine.inputStats();
+                if (input.last_consumed_sequence > self.performance.last_visible_input_sequence) {
+                    self.performance.last_visible_input_sequence = input.last_consumed_sequence;
+                    self.performance.last_visible_input_tick = input.last_consumed_tick;
+                    self.performance.last_visible_reaction_ns = ended_ns;
+                }
+            },
             .unchanged => self.performance.unchanged_presents +%= 1,
             .hidden => self.performance.hidden_presents +%= 1,
             .dropped => self.performance.dropped_presents +%= 1,

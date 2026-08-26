@@ -90,6 +90,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         if (trace.baseline) return writeBaselineFailure(&files, trace, "compile-window", error_host_video);
         return error_host_video;
     };
+    window_host.setInputPolicy(.text_only_no_pointer);
     _ = window_host.setMinimumSize(320, 200);
     var compile_progress = CompileProgressView.init(
         sys,
@@ -828,8 +829,12 @@ const RuntimeHost = struct {
         if (self.runtime) |runtime| if (runtime.audio.state == .degraded) self.applyDegradedTitle();
         const event = self.window.pollInput() orelse return .idle;
         return switch (event) {
-            .close => .{ .command = .close },
+            .close => blk: {
+                _ = self.guest.handleInput(event);
+                break :blk .{ .command = .close };
+            },
             .resize => blk: {
+                _ = self.guest.handleInput(event);
                 self.window.video.invalidateAll();
                 break :blk .present;
             },
@@ -837,7 +842,7 @@ const RuntimeHost = struct {
                 _ = self.guest.handleInput(event);
                 break :blk if (focus.focused) .present else .handled;
             },
-            else => if (self.guest.handleInput(event)) .handled else .handled,
+            else => if (self.guest.handleInput(event).wakesGuest()) .handled else .ignored,
         };
     }
 
@@ -1034,6 +1039,58 @@ const RuntimeHost = struct {
             ns_per_instruction,
         }) catch return false;
         report_len += adapter_line.len;
+        const input_translation = self.window.input.stats;
+        const host_stats = self.window.stats;
+        const input = vm_stats.input;
+        const input_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC input: raw={d} translated={d} filtered={d} pending_created={d} pending_emitted={d} mouse_events={d} mouse_moves={d} mouse_mappings={d} window_info={d} input_window_info={d} viewport_calculations={d} adapter_events={d} accepted={d} controls={d} dropped={d} runtime_input={d} runtime_ignored={d} queue={d} queue_max={d} consumed={d} unfocused={d} invalid_codepoint={d} unsupported_key={d} unsupported_event={d} queue_full={d} oom={d}\r\n", .{
+            input_translation.raw_events,
+            input_translation.logical_events,
+            input_translation.filtered_events,
+            input_translation.pending_text_created,
+            input_translation.pending_text_emitted,
+            input_translation.mouse_events,
+            input_translation.mouse_moves,
+            input_translation.mouse_mappings,
+            host_stats.window_info_calls,
+            host_stats.input_window_info_calls,
+            host_stats.viewport_calculations,
+            self.guest.performance.input_logical_events,
+            input.accepted_bytes,
+            input.control_events,
+            input.dropped_events,
+            runtime.stats.input_events,
+            runtime.stats.ignored_input_events,
+            self.guest.machine.queuedInputBytes(),
+            input.maximum_queue_depth,
+            input.consumed_bytes,
+            input.unfocused_drops,
+            input.invalid_codepoint_drops,
+            input.unsupported_key_drops,
+            input.unsupported_event_drops,
+            input.queue_full_drops,
+            input.out_of_memory_drops,
+        }) catch return false;
+        report_len += input_line.len;
+        const input_correlation_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC input-correlation: last_raw_sequence={d} last_raw_tick={d} last_filter_sequence={d} last_filter_tick={d} last_filter_reason={s} last_event_sequence={d} last_event_tick={d} last_accepted_sequence={d} last_accepted_tick={d} last_dropped_sequence={d} last_dropped_tick={d} last_drop_reason={s} last_consumed_sequence={d} last_consumed_tick={d} visible_sequence={d} visible_tick={d} visible_reaction_ns={d}\r\n", .{
+            input_translation.last_raw_sequence,
+            input_translation.last_raw_tick,
+            input_translation.last_filtered_sequence,
+            input_translation.last_filtered_tick,
+            @tagName(input_translation.last_filter_reason),
+            input.last_event_sequence,
+            input.last_event_tick,
+            input.last_accepted_sequence,
+            input.last_accepted_tick,
+            input.last_dropped_sequence,
+            input.last_dropped_tick,
+            @tagName(input.last_drop_reason),
+            input.last_consumed_sequence,
+            input.last_consumed_tick,
+            self.guest.performance.last_visible_input_sequence,
+            self.guest.performance.last_visible_input_tick,
+            self.guest.performance.last_visible_reaction_ns,
+        }) catch return false;
+        report_len += input_correlation_line.len;
         const frame_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC frame-cycle: cadence_deferred={d} missed_deadlines={d} max_backlog={d} attempts={d} published={d} unchanged={d} hidden={d} dropped={d} failed={d} present_ns={d} max_present_ns={d} max_age_start_ns={d} max_age_end_ns={d}\r\n", .{
             self.guest.performance.cadence_deferred_steps,
             self.guest.performance.missed_frame_deadlines,
@@ -1269,6 +1326,7 @@ fn showStatus(
     const surface = host_api.Surface.initIndexed8(view.pixels, view.palette, view.width, view.height) catch return error_host_video;
     var scratch: [host_api.tile_max_pixels]u32 = undefined;
     var window = host_api.Host.init(desk, draw, surface, scratch[0..]) catch return error_host_video;
+    window.setInputPolicy(.text_only_no_pointer);
     _ = window.setTitle(title);
     _ = window.setMinimumSize(320, 200);
     window.video.invalidateAll();
