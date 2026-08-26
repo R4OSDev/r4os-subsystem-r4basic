@@ -734,7 +734,7 @@ pub const Vm = struct {
         return self.graphics.pixels != null;
     }
 
-    pub fn takeGraphicsDamage(self: *Vm) ?graphics_screen.Rect {
+    pub fn takeGraphicsDamage(self: *Vm) graphics_screen.Damage {
         self.syncTextToGraphics();
         return self.graphics.takeDamage();
     }
@@ -1746,9 +1746,10 @@ pub const Vm = struct {
     fn syncTextToGraphics(self: *Vm) void {
         self.text_sync_checks +%= 1;
         if (self.graphics.view() == null) return;
-        if (self.text.takeDirty()) |dirty| {
+        const dirty = self.text.takeDirty();
+        if (dirty.count != 0) {
             self.text_sync_renders +%= 1;
-            self.graphics.renderText(&self.text, dirty);
+            for (dirty.slice()) |region| self.graphics.renderText(&self.text, region);
         }
     }
 

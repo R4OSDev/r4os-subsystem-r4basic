@@ -15,6 +15,65 @@ pub const Rect = struct {
     h: u32,
 };
 
+pub const max_damage_regions: usize = 8;
+
+pub const Damage = struct {
+    regions: [max_damage_regions]Rect = .{Rect{ .x = 0, .y = 0, .w = 0, .h = 0 }} ** max_damage_regions,
+    count: usize = 0,
+    merges: u32 = 0,
+    overflow_merges: u32 = 0,
+
+    pub fn slice(self: *const Damage) []const Rect {
+        return self.regions[0..self.count];
+    }
+
+    fn clear(self: *Damage) void {
+        self.* = .{};
+    }
+
+    fn full(self: *Damage, width: u32, height: u32) void {
+        self.* = .{};
+        if (width == 0 or height == 0) return;
+        self.regions[0] = .{ .x = 0, .y = 0, .w = width, .h = height };
+        self.count = 1;
+    }
+
+    fn note(self: *Damage, requested: Rect) void {
+        if (requested.w == 0 or requested.h == 0) return;
+        var merged = requested;
+        var index: usize = 0;
+        while (index < self.count) {
+            if (!rectsTouchOrOverlap(self.regions[index], merged)) {
+                index += 1;
+                continue;
+            }
+            merged = mergeRect(self.regions[index], merged);
+            self.count -= 1;
+            self.regions[index] = self.regions[self.count];
+            self.merges +|= 1;
+        }
+        if (self.count < self.regions.len) {
+            self.regions[self.count] = merged;
+            self.count += 1;
+            return;
+        }
+
+        var best_index: usize = 0;
+        var best_growth: u64 = std.math.maxInt(u64);
+        for (self.regions[0..self.count], 0..) |existing, candidate| {
+            const combined = mergeRect(existing, merged);
+            const growth = rectArea(combined) - rectArea(existing);
+            if (growth < best_growth) {
+                best_growth = growth;
+                best_index = candidate;
+            }
+        }
+        self.regions[best_index] = mergeRect(self.regions[best_index], merged);
+        self.merges +|= 1;
+        self.overflow_merges +|= 1;
+    }
+};
+
 pub const Point = struct {
     x: i32,
     y: i32,
@@ -38,6 +97,10 @@ pub const PerformanceStats = struct {
     span_operations: u64 = 0,
     span_pixels: u64 = 0,
     damage_commits: u64 = 0,
+    damage_regions: u64 = 0,
+    damage_merges: u64 = 0,
+    damage_overflow_merges: u64 = 0,
+    full_damage_commits: u64 = 0,
     text_cells: u64 = 0,
     text_rows: u64 = 0,
     line_segments: u64 = 0,
@@ -82,7 +145,7 @@ const ega_16_codes = [_]u8{ 0, 1, 2, 3, 4, 5, 20, 7, 56, 57, 58, 59, 60, 61, 62,
 const screen_1_defaults = [_]u8{ 0, 11, 13, 15 };
 
 const Mutation = struct {
-    damage: ?Rect = null,
+    damage: Damage = .{},
 
     fn notePoint(self: *Mutation, x: u32, y: u32) void {
         self.noteRect(.{ .x = x, .y = y, .w = 1, .h = 1 });
@@ -93,16 +156,7 @@ const Mutation = struct {
     }
 
     fn noteRect(self: *Mutation, requested: Rect) void {
-        if (requested.w == 0 or requested.h == 0) return;
-        if (self.damage) |current| {
-            const x = @min(current.x, requested.x);
-            const y = @min(current.y, requested.y);
-            const right = @max(current.x + current.w, requested.x + requested.w);
-            const bottom = @max(current.y + current.h, requested.y + requested.h);
-            self.damage = .{ .x = x, .y = y, .w = right - x, .h = bottom - y };
-        } else {
-            self.damage = requested;
-        }
+        self.damage.note(requested);
     }
 };
 
@@ -126,7 +180,7 @@ pub const Screen = struct {
     current: Point = .{ .x = 0, .y = 0 },
     mode_revision: u64 = 1,
     content_revision: u64 = 1,
-    damage: ?Rect = null,
+    damage: Damage = .{},
     stats: PerformanceStats = .{},
 
     pub fn deinit(self: *Screen, allocator: std.mem.Allocator) void {
@@ -174,8 +228,10 @@ pub const Screen = struct {
         self.mode = mode;
         self.current = .{ .x = 0, .y = 0 };
         self.resetPalette();
-        self.damage = .{ .x = 0, .y = 0, .w = width, .h = height };
+        self.damage.full(width, height);
         self.stats.damage_commits +%= 1;
+        self.stats.damage_regions +%= 1;
+        self.stats.full_damage_commits +%= 1;
         self.mode_revision +%= 1;
         self.content_revision +%= 1;
     }
@@ -196,9 +252,9 @@ pub const Screen = struct {
         };
     }
 
-    pub fn takeDamage(self: *Screen) ?Rect {
+    pub fn takeDamage(self: *Screen) Damage {
         const result = self.damage;
-        self.damage = null;
+        self.damage.clear();
         return result;
     }
 
@@ -819,30 +875,53 @@ pub const Screen = struct {
 
     fn markFull(self: *Screen) void {
         if (self.width == 0 or self.height == 0) return;
-        self.damage = .{ .x = 0, .y = 0, .w = self.width, .h = self.height };
+        self.damage.full(self.width, self.height);
         self.stats.damage_commits +%= 1;
+        self.stats.damage_regions +%= 1;
+        self.stats.full_damage_commits +%= 1;
         self.content_revision +%= 1;
     }
 
     fn commitMutation(self: *Screen, mutation: Mutation) void {
-        if (mutation.damage) |damage| self.mark(damage);
+        if (mutation.damage.count == 0) return;
+        self.stats.damage_merges +%= mutation.damage.merges;
+        self.stats.damage_overflow_merges +%= mutation.damage.overflow_merges;
+        for (mutation.damage.slice()) |damage| self.mark(damage);
+        self.stats.damage_commits +%= 1;
+        self.stats.damage_regions +%= mutation.damage.count;
+        self.content_revision +%= 1;
     }
 
     fn mark(self: *Screen, requested: Rect) void {
         if (requested.w == 0 or requested.h == 0) return;
-        if (self.damage) |current| {
-            const x = @min(current.x, requested.x);
-            const y = @min(current.y, requested.y);
-            const right = @max(current.x + current.w, requested.x + requested.w);
-            const bottom = @max(current.y + current.h, requested.y + requested.h);
-            self.damage = .{ .x = x, .y = y, .w = right - x, .h = bottom - y };
-        } else {
-            self.damage = requested;
-        }
-        self.stats.damage_commits +%= 1;
-        self.content_revision +%= 1;
+        const before_merges = self.damage.merges;
+        const before_overflow = self.damage.overflow_merges;
+        self.damage.note(requested);
+        self.stats.damage_merges +%= self.damage.merges - before_merges;
+        self.stats.damage_overflow_merges +%= self.damage.overflow_merges - before_overflow;
     }
 };
+
+fn mergeRect(a: Rect, b: Rect) Rect {
+    const x = @min(a.x, b.x);
+    const y = @min(a.y, b.y);
+    const right = @max(@as(u64, a.x) + a.w, @as(u64, b.x) + b.w);
+    const bottom = @max(@as(u64, a.y) + a.h, @as(u64, b.y) + b.h);
+    return .{ .x = x, .y = y, .w = @intCast(right - x), .h = @intCast(bottom - y) };
+}
+
+fn rectArea(value: Rect) u64 {
+    return @as(u64, value.w) * value.h;
+}
+
+fn rectsTouchOrOverlap(a: Rect, b: Rect) bool {
+    const a_right = @as(u64, a.x) + a.w;
+    const a_bottom = @as(u64, a.y) + a.h;
+    const b_right = @as(u64, b.x) + b.w;
+    const b_bottom = @as(u64, b.y) + b.h;
+    return @as(u64, a.x) <= b_right and @as(u64, b.x) <= a_right and
+        @as(u64, a.y) <= b_bottom and @as(u64, b.y) <= a_bottom;
+}
 
 fn saturatingAdd(first: i32, second: i32) i32 {
     const result = @as(i64, first) + second;

@@ -13,6 +13,55 @@ pub const CellRect = struct {
     h: usize,
 };
 
+pub const max_dirty_regions: usize = 8;
+
+pub const CellDamage = struct {
+    regions: [max_dirty_regions]CellRect = .{CellRect{ .x = 0, .y = 0, .w = 0, .h = 0 }} ** max_dirty_regions,
+    count: usize = 0,
+
+    fn full(width: usize, height: usize) CellDamage {
+        var result = CellDamage{};
+        result.regions[0] = .{ .x = 0, .y = 0, .w = width, .h = height };
+        result.count = @intFromBool(width != 0 and height != 0);
+        return result;
+    }
+
+    pub fn slice(self: *const CellDamage) []const CellRect {
+        return self.regions[0..self.count];
+    }
+
+    fn note(self: *CellDamage, value: CellRect) void {
+        if (value.w == 0 or value.h == 0) return;
+        var merged = value;
+        var index: usize = 0;
+        while (index < self.count) {
+            if (!cellRectsTouchOrOverlap(self.regions[index], merged)) {
+                index += 1;
+                continue;
+            }
+            merged = mergeCellRect(self.regions[index], merged);
+            self.count -= 1;
+            self.regions[index] = self.regions[self.count];
+        }
+        if (self.count < self.regions.len) {
+            self.regions[self.count] = merged;
+            self.count += 1;
+            return;
+        }
+        var best_index: usize = 0;
+        var best_growth: usize = std.math.maxInt(usize);
+        for (self.regions[0..self.count], 0..) |existing, candidate| {
+            const combined = mergeCellRect(existing, merged);
+            const growth = combined.w * combined.h - existing.w * existing.h;
+            if (growth < best_growth) {
+                best_growth = growth;
+                best_index = candidate;
+            }
+        }
+        self.regions[best_index] = mergeCellRect(self.regions[best_index], merged);
+    }
+};
+
 pub const Cell = struct {
     character: u8 = ' ',
     foreground: u8 = 7,
@@ -32,7 +81,7 @@ pub const Screen = struct {
     view_top: usize = 0,
     view_bottom: usize = rows - 1,
     revision: u64 = 1,
-    dirty: ?CellRect = .{ .x = 0, .y = 0, .w = columns, .h = rows },
+    dirty: CellDamage = CellDamage.full(columns, rows),
 
     pub fn reset(self: *Screen) void {
         self.* = .{};
@@ -40,7 +89,7 @@ pub const Screen = struct {
 
     pub fn configure(self: *Screen, requested_columns: usize) Error!void {
         if (requested_columns != 40 and requested_columns != columns) return error.IllegalFunctionCall;
-        self.* = .{ .active_columns = requested_columns, .dirty = .{ .x = 0, .y = 0, .w = requested_columns, .h = rows } };
+        self.* = .{ .active_columns = requested_columns, .dirty = CellDamage.full(requested_columns, rows) };
     }
 
     pub fn setWidth(self: *Screen, requested_columns: i32, requested_rows: ?i32) Error!void {
@@ -188,9 +237,9 @@ pub const Screen = struct {
         self.revision +%= 1;
     }
 
-    pub fn takeDirty(self: *Screen) ?CellRect {
+    pub fn takeDirty(self: *Screen) CellDamage {
         const result = self.dirty;
-        self.dirty = null;
+        self.dirty = .{};
         return result;
     }
 
@@ -232,18 +281,22 @@ pub const Screen = struct {
     }
 
     fn markDirty(self: *Screen, value: CellRect) void {
-        if (value.w == 0 or value.h == 0) return;
-        if (self.dirty) |current| {
-            const x = @min(current.x, value.x);
-            const y = @min(current.y, value.y);
-            const right = @max(current.x + current.w, value.x + value.w);
-            const bottom = @max(current.y + current.h, value.y + value.h);
-            self.dirty = .{ .x = x, .y = y, .w = right - x, .h = bottom - y };
-        } else {
-            self.dirty = value;
-        }
+        self.dirty.note(value);
     }
 };
+
+fn mergeCellRect(a: CellRect, b: CellRect) CellRect {
+    const x = @min(a.x, b.x);
+    const y = @min(a.y, b.y);
+    const right = @max(a.x + a.w, b.x + b.w);
+    const bottom = @max(a.y + a.h, b.y + b.h);
+    return .{ .x = x, .y = y, .w = right - x, .h = bottom - y };
+}
+
+fn cellRectsTouchOrOverlap(a: CellRect, b: CellRect) bool {
+    return a.x <= b.x + b.w and b.x <= a.x + a.w and
+        a.y <= b.y + b.h and b.y <= a.y + a.h;
+}
 
 test "text screen scrolls only its active viewport" {
     var screen = Screen{};
@@ -278,14 +331,27 @@ test "40-column graphics text mode reports bounded dirty cells" {
     var screen = Screen{};
     _ = screen.takeDirty();
     try screen.configure(40);
-    const configured = screen.takeDirty() orelse return error.MissingConfiguredDamage;
-    try std.testing.expectEqual(CellRect{ .x = 0, .y = 0, .w = 40, .h = rows }, configured);
+    const configured = screen.takeDirty();
+    try std.testing.expectEqual(@as(usize, 1), configured.count);
+    try std.testing.expectEqual(CellRect{ .x = 0, .y = 0, .w = 40, .h = rows }, configured.regions[0]);
     try screen.setWidth(40, rows);
     try std.testing.expectError(error.IllegalFunctionCall, screen.setWidth(80, rows));
 
     try screen.locate(1, 40, null, null, null);
     screen.write("X");
-    const changed = screen.takeDirty() orelse return error.MissingCellDamage;
-    try std.testing.expectEqual(CellRect{ .x = 39, .y = 0, .w = 1, .h = 1 }, changed);
+    const changed = screen.takeDirty();
+    try std.testing.expectEqual(@as(usize, 1), changed.count);
+    try std.testing.expectEqual(CellRect{ .x = 39, .y = 0, .w = 1, .h = 1 }, changed.regions[0]);
     try std.testing.expectEqual(@as(u8, 'X'), screen.cell(0, 39).?.character);
+}
+
+test "sparse text writes remain separate dirty cell regions" {
+    var screen = Screen{};
+    _ = screen.takeDirty();
+    try screen.locate(1, 1, null, null, null);
+    screen.write("A");
+    try screen.locate(25, 80, null, null, null);
+    screen.write("Z");
+    const dirty = screen.takeDirty();
+    try std.testing.expectEqual(@as(usize, 2), dirty.count);
 }

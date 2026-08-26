@@ -27,6 +27,7 @@ const FakeBackend = struct {
             .begin_damage_fn = beginDamage,
             .clear_fn = clear,
             .raster_fn = raster,
+            .indexed8_fn = indexed8,
             .commit_full_fn = commit,
             .commit_damage_fn = commit,
             .cancel_fn = cancel,
@@ -42,7 +43,7 @@ const FakeBackend = struct {
         return 0;
     }
 
-    fn beginDamage(context: *anyopaque) i32 {
+    fn beginDamage(context: *anyopaque, _: []const r4os.abi.DisplayDamageRect) i32 {
         state(context).damage_begins += 1;
         return 0;
     }
@@ -60,6 +61,10 @@ const FakeBackend = struct {
             self.invalid_raster = true;
         }
         return 0;
+    }
+
+    fn indexed8(_: *anyopaque, _: host.IndexedBatch) i32 {
+        return -1;
     }
 
     fn commit(context: *anyopaque) i32 {
@@ -202,7 +207,9 @@ test "text raster has a pixel-exact reference image" {
     try screen.setMode(std.testing.allocator, 0);
     _ = screen.takeDamage();
     const before = screen.performanceStats();
-    screen.renderText(&text, text.takeDirty() orelse return error.MissingTextDamage);
+    const text_damage = text.takeDirty();
+    if (text_damage.count == 0) return error.MissingTextDamage;
+    for (text_damage.slice()) |region| screen.renderText(&text, region);
     const after = screen.performanceStats();
     const view = screen.view() orelse return error.MissingTextRaster;
     try std.testing.expectEqual(@as(u64, 0xa533e9d9dcbd63f1), imageHash(view.pixels));
@@ -218,7 +225,7 @@ test "text raster has a pixel-exact reference image" {
     screen.renderText(&text, .{ .x = 0, .y = 0, .w = 80, .h = 25 });
     const unchanged = screen.performanceStats();
     try std.testing.expectEqual(after.damage_commits, unchanged.damage_commits);
-    try std.testing.expect(screen.takeDamage() == null);
+    try std.testing.expectEqual(@as(usize, 0), screen.takeDamage().count);
 }
 
 test "graphics primitives and packed images have pixel-exact references" {
@@ -274,6 +281,22 @@ test "filled regions and PAINT use one damage commit and bounded spans" {
     try std.testing.expectEqual(@as(u64, 1), paint_after.damage_commits - paint_before.damage_commits);
 }
 
+test "sparse graphics changes remain separate damage regions" {
+    var screen: core.graphics_screen.Screen = .{};
+    defer screen.deinit(std.testing.allocator);
+    try screen.setMode(std.testing.allocator, 9);
+    _ = screen.takeDamage();
+    try screen.pset(.{ .x = 2, .y = 3 }, 1);
+    try screen.pset(.{ .x = 600, .y = 320 }, 2);
+    const damage = screen.takeDamage();
+    try std.testing.expectEqual(@as(usize, 2), damage.count);
+    try std.testing.expect(!rectsOverlap(damage.regions[0], damage.regions[1]));
+}
+
+fn rectsOverlap(a: core.graphics_screen.Rect, b: core.graphics_screen.Rect) bool {
+    return a.x < b.x + b.w and b.x < a.x + a.w and a.y < b.y + b.h and b.y < a.y + a.h;
+}
+
 test "invisible huge circles skip their complete trigonometric segment set" {
     var screen: core.graphics_screen.Screen = .{};
     defer screen.deinit(std.testing.allocator);
@@ -287,7 +310,7 @@ test "invisible huge circles skip their complete trigonometric segment set" {
     try std.testing.expectEqual(before.circle_segments, after.circle_segments);
     try std.testing.expectEqual(before.pixel_changes, after.pixel_changes);
     try std.testing.expectEqual(before.damage_commits, after.damage_commits);
-    try std.testing.expect(screen.takeDamage() == null);
+    try std.testing.expectEqual(@as(usize, 0), screen.takeDamage().count);
 }
 
 test "same-mode SCREEN reuses and clears its pixel allocation" {

@@ -258,14 +258,18 @@ liest dasselbe Format mit PSET oder attributweisem XOR. Dadurch bleiben auch
 negative LONG-Werte aus DATA bitgenau und eine per XOR bewegte Banane kann
 ohne Sonderfallcode gezeichnet und wieder entfernt werden.
 
-Pixel-, Palette- und Textaenderungen vereinigen sich in einem Damage-Rechteck.
-`src/runtime_adapter.zig` uebergibt die fertige Indexed8-Oberflaeche an
-`r4os.subsystem_host`; kein BASIC-Primitiv ruft R4DRAW punktweise auf. Ein
-voller 640x350-Frame wird in 15 Bloecke von hoechstens 128x128 Pixeln
-zerlegt. Damageframes bleiben kleiner, ein unveraendertes Gastbild erzeugt
-keinen neuen Frame. Modusrevisionen bleiben auch ueber einen VM-Reset hinweg
-eindeutig, damit ein Presenter vor dem naechsten Frame stets den neuen
-Pixelpuffer bindet.
+Pixel-, Palette- und Textaenderungen bleiben in bis zu acht getrennten
+Damage-Rechtecken erhalten. Beruehrende Regionen werden vereinigt; erst die
+neunte getrennte Region wird mit dem kleinsten Flaechenzuwachs in die
+begrenzte Liste aufgenommen. `src/runtime_adapter.zig` uebergibt jede Region
+mit der fertigen Indexed8-Oberflaeche an `r4os.subsystem_host`; kein BASIC-
+Primitiv ruft R4DRAW punktweise auf. Ein voller 640x350-Frame wird in 15
+indizierte Quellbloecke von hoechstens 128x128 Pixeln zerlegt. Palette und
+Indices passieren R4DRAW ohne vorherige XRGB-Vervierfachung; integer und
+fraktional skalierte Damageframes bleiben append-only bis zum Desktop
+regional. Ein unveraendertes Gastbild erzeugt keinen neuen Frame.
+Modusrevisionen bleiben auch ueber einen VM-Reset hinweg eindeutig, damit ein
+Presenter vor dem naechsten Frame stets den neuen Pixelpuffer bindet.
 
 Gastzeit, Zufall und Pacing
 --------------------------
@@ -389,7 +393,9 @@ und Skips. Im GUI-Modus entsteht einmalig `C:\TEMP\R4BASIC.LAST`; die
 Headless-Abnahme schreibt `C:\TEMP\R4BASIC.BASELINE` und beendet nur diese
 Instanz nach dem ersten produktiven Frame. Es gibt keine Ausgabe pro Frame.
 Der Bericht enthaelt zusaetzlich den ersten sichtbaren Compileframe, die Zahl
-der Fortschrittsframes und die strukturellen Compilerzaehler.
+der Fortschrittsframes, die strukturellen Compilerzaehler sowie getrennte
+Damage-Regionen, Presenter-Voll-/Deltaframes, Indexed8-Bloecke und -Bytes,
+Kettenverdichtungen und XRGB-Fallbacks.
 
 R4BASIC verwendet gezielt `OPTIMIZE=speed`; andere R4X-Module bleiben bei
 ihrer jeweiligen Manifestentscheidung. Der identische Standard-QEMU-Lauf mit
@@ -422,9 +428,10 @@ Zusaetzlich werden exakte Laufzeitpositionen und Fehlernummern, Rekursion,
 verschachteltes ByRef, Hostfehler, Reset, Nullbudget-Abbruch, Fokus- und
 Instanztrennung, pausierte Wartezeit, Fensterereignisse waehrend SLEEP,
 absolute und relative Dateipfade sowie Storage-Fehler direkt getestet. Der
-Grafikhosttest prueft die 15 Bloecke eines Vollframes, Damageframes,
-Unterdrueckung unveraenderter Frames, mindestens 20 Bilder pro Sekunde sowie
-Resize und Letterboxing.
+Grafikhosttest prueft pixelidentische Integer- und Fractionalbilder,
+Indexed8-ABI- und XRGB-Fallbackpfad, die 15 Bloecke eines Vollframes, getrennte
+sparse Damage-Regionen, Unterdrueckung unveraenderter Frames, mindestens 20
+Bilder pro Sekunde sowie Resize und Letterboxing.
 
 Ein synthetischer Compiler-Stresstest bindet 128 TYPEs mit Feldern, 512
 Arrays, 256 Prozeduren und 1.024 Label-Fixups zweimal bytecodeidentisch. Er

@@ -610,26 +610,52 @@ const CompileProgressView = struct {
     }
 
     fn render(self: *CompileProgressView, phase: compiler.CompilePhase, percent: u8) void {
-        self.text.reset();
-        self.text.setColor(15, 1) catch {};
-        self.text.locate(null, null, 0, null, null) catch {};
-        self.text.write("R4BASIC\r\n\r\n");
-        self.text.write("Kompiliere: ");
-        self.text.write(self.guest_name);
-        self.text.write("\r\n\r\nPhase: ");
-        self.text.write(switch (phase) {
+        const phase_text = switch (phase) {
             .lexical => "Quelltext und Schluesselwoerter",
             .binding => "Anweisungen und Symbole",
             .resolution => "Sprungziele und Datenmarken",
-        });
-        var percent_storage: [48]u8 = undefined;
-        const percent_text = std.fmt.bufPrint(percent_storage[0..], "\r\nFortschritt: {d}%\r\n\r\n[", .{percent}) catch "\r\nFortschritt\r\n\r\n[";
-        self.text.write(percent_text);
+        };
         const filled: usize = @min(50, (@as(usize, percent) * 50) / 100);
-        for (0..50) |index| self.text.writeByte(if (index < filled) 219 else 176);
-        self.text.write("]\r\n\r\nFenster schliessen oder Escape druecken, um abzubrechen.");
-        if (self.text.takeDirty()) |dirty| self.display.renderText(self.text, dirty);
-        self.window.video.invalidateAll();
+        if (self.last_phase == null) {
+            self.text.reset();
+            self.text.setColor(15, 1) catch {};
+            self.text.locate(null, null, 0, null, null) catch {};
+            self.text.write("R4BASIC\r\n\r\n");
+            self.text.write("Kompiliere: ");
+            self.text.write(self.guest_name);
+            self.text.write("\r\n\r\nPhase: ");
+            self.text.write(phase_text);
+            var percent_storage: [48]u8 = undefined;
+            const percent_text = std.fmt.bufPrint(percent_storage[0..], "\r\nFortschritt: {d}%\r\n\r\n[", .{percent}) catch "\r\nFortschritt\r\n\r\n[";
+            self.text.write(percent_text);
+            for (0..50) |index| self.text.writeByte(if (index < filled) 219 else 176);
+            self.text.write("]\r\n\r\nFenster schliessen oder Escape druecken, um abzubrechen.");
+        } else {
+            var phase_storage: [text_screen.columns]u8 = [_]u8{' '} ** text_screen.columns;
+            const phase_line = std.fmt.bufPrint(phase_storage[0..], "Phase: {s}", .{phase_text}) catch phase_storage[0..0];
+            @memset(phase_storage[phase_line.len..], ' ');
+            self.writeLine(5, phase_storage[0..]);
+
+            var percent_storage: [text_screen.columns]u8 = [_]u8{' '} ** text_screen.columns;
+            const percent_line = std.fmt.bufPrint(percent_storage[0..], "Fortschritt: {d}%", .{percent}) catch percent_storage[0..0];
+            @memset(percent_storage[percent_line.len..], ' ');
+            self.writeLine(6, percent_storage[0..]);
+
+            var bar: [text_screen.columns]u8 = [_]u8{' '} ** text_screen.columns;
+            bar[0] = '[';
+            for (0..50) |index| bar[index + 1] = if (index < filled) 219 else 176;
+            bar[51] = ']';
+            self.writeLine(8, bar[0..]);
+        }
+        const dirty = self.text.takeDirty();
+        for (dirty.slice()) |region| self.display.renderText(self.text, region);
+        const damage = self.display.takeDamage();
+        for (damage.slice()) |region| self.window.video.invalidate(.{
+            .x = region.x,
+            .y = region.y,
+            .w = region.w,
+            .h = region.h,
+        });
         const title = std.fmt.bufPrintZ(self.title[0..], "R4BASIC - Kompiliert {s} ({d}%)", .{ self.guest_name, percent }) catch "R4BASIC - Kompiliert";
         _ = self.window.setTitle(title.ptr);
         switch (self.window.present()) {
@@ -640,6 +666,11 @@ const CompileProgressView = struct {
             },
             .hidden, .unchanged => {},
         }
+    }
+
+    fn writeLine(self: *CompileProgressView, row: i32, line: []const u8) void {
+        self.text.locate(row, 1, null, null, null) catch return;
+        self.text.write(line);
     }
 
     fn progressPercent(progress: compiler.CompileProgress) u8 {
@@ -1072,6 +1103,14 @@ const RuntimeHost = struct {
             raster.put_bytes,
         }) catch return false;
         report_len += raster_line.len;
+        const damage_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC damage: commits={d} regions={d} merges={d} overflow_merges={d} full_commits={d}\r\n", .{
+            raster.damage_commits,
+            raster.damage_regions,
+            raster.damage_merges,
+            raster.damage_overflow_merges,
+            raster.full_damage_commits,
+        }) catch return false;
+        report_len += damage_line.len;
         const ownership_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC ownership: compile_borrowed={d} string_clones={d} string_clone_bytes={d} builtin_borrowed={d} builtin_owned={d} procedure_calls={d} local_pool_grows={d} local_pool_reuses={d} local_initializations={d} local_initialization_bytes={d} local_aggregate_initializations={d} format_stack_uses={d} str_result_allocations={d} val_direct={d} val_stack={d} val_scratch={d} val_scratch_grows={d}\r\n", .{
             self.compile_stats.borrowed_builtin_arguments,
             vm_stats.string_clones,
@@ -1116,11 +1155,17 @@ const RuntimeHost = struct {
             self.storage.stats.failures,
         }) catch return false;
         report_len += file_host_line.len;
-        const presenter_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC presenter: published_frames={d} skipped_frames={d} full_frames={d} damage_frames={d} raster_blocks={d} sampled_pixels={d}\r\n", .{
+        const presenter_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC presenter: published_frames={d} skipped_frames={d} full_frames={d} damage_frames={d} compacted_frames={d} damage_regions={d} indexed8_frames={d} indexed8_blocks={d} indexed8_resource_bytes={d} xrgb_fallback_frames={d} raster_blocks={d} sampled_pixels={d}\r\n", .{
             presenter.published_frames,
             presenter.skipped_frames,
             presenter.full_frames,
             presenter.damage_frames,
+            presenter.compacted_frames,
+            presenter.damage_regions,
+            presenter.indexed8_frames,
+            presenter.indexed8_blocks,
+            presenter.indexed8_resource_bytes,
+            presenter.xrgb_fallback_frames,
             presenter.raster_blocks,
             presenter.sampled_pixels,
         }) catch return false;
@@ -1218,7 +1263,8 @@ fn showStatus(
     var display: graphics_screen.Screen = .{};
     defer display.deinit(allocator);
     display.setMode(allocator, 0) catch return error_host_video;
-    if (text.takeDirty()) |dirty| display.renderText(&text, dirty);
+    const dirty = text.takeDirty();
+    for (dirty.slice()) |region| display.renderText(&text, region);
     const view = display.view() orelse return error_host_video;
     const surface = host_api.Surface.initIndexed8(view.pixels, view.palette, view.width, view.height) catch return error_host_video;
     var scratch: [host_api.tile_max_pixels]u32 = undefined;

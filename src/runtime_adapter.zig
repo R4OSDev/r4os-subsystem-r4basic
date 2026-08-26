@@ -114,8 +114,9 @@ pub const Adapter = struct {
             _ = self.machine.takeGraphicsDamage();
             return true;
         }
-        const damage = self.machine.takeGraphicsDamage() orelse return false;
-        presenter.invalidate(.{ .x = damage.x, .y = damage.y, .w = damage.w, .h = damage.h });
+        const damage = self.machine.takeGraphicsDamage();
+        if (damage.count == 0) return false;
+        for (damage.slice()) |region| presenter.invalidate(.{ .x = region.x, .y = region.y, .w = region.w, .h = region.h });
         self.presented_content_revision = view.content_revision;
         return true;
     }
