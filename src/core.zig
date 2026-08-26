@@ -4,6 +4,7 @@ pub const compiler = @import("compiler.zig");
 pub const frontend = @import("frontend.zig");
 pub const graphics_screen = @import("graphics_screen.zig");
 pub const runtime_adapter = @import("runtime_adapter.zig");
+pub const source_loader = @import("source_loader.zig");
 pub const storage_adapter = @import("storage_adapter.zig");
 pub const text_screen = @import("text_screen.zig");
 pub const value = @import("value.zig");

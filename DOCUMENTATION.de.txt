@@ -6,12 +6,13 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.69.63
+Stand 0.69.65
 ------------
 
 Diese Ausbaustufe ist der produktive R4BASIC-v1-Subsystemhost. Explorer
 uebergibt eine absolute BAS-Datei ueber `R4SUBSYS1`; das R4X liest sie durch
-die Storage-Fassade, kompiliert sie einmal und fuehrt eine getrennte VM in
+die Storage-Fassade exakt einmal in eine passend grosse Allokation, uebergibt
+diese Allokation ohne Quellkopie an den Compiler und fuehrt eine getrennte VM in
 einem verschiebbaren, skalierbaren und maximierbaren Fenster aus. Der Kern
 umfasst Textbildschirm, Eingabe, Gastzeit, Zufall, sequentielle Dateien,
 instanzlokale Indexed8-Grafik und gepufferte Audioausgabe. Der Compiler
@@ -374,8 +375,12 @@ Produktiver Fensterhost
 -----------------------
 
 `src/main.zig` validiert den `R4SUBSYS1`-Startvertrag und den absoluten
-Gastpfad, liest hoechstens 256 KiB und zeigt Lade-, Syntax- und Laufzeitfehler
-mit Datei und Quellposition im Fenster. `SCREEN 0` wird als 640x400-Textbild
+Gastpfad. `src/source_loader.zig` fragt die Dateigroesse genau einmal ab,
+weist Uebergroesse vor einer Inhaltslesung ab, allokiert die exakte Groesse
+und fuellt denselben Puffer mit `readAt` bis hoechstens 256 KiB. Teilreads
+bleiben erlaubt, EOF vor der gemeldeten Groesse ist ein sichtbarer Fehler.
+Lade-, Syntax- und Laufzeitfehler erscheinen mit Datei und Quellposition im
+Fenster. `SCREEN 0` wird als 640x400-Textbild
 sichtbar; SCREEN 1 und 9 verwenden die bisherigen Gastpixelpuffer.
 
 Vor dem Binden wird dasselbe Programmfenster mit Dateiname, Compilephase und
@@ -414,6 +419,11 @@ maximalen Aufruf pro Hostzyklus sowie aktive, stille, pausierte und gemutete
 Arbeit. `R4BASIC audio-guest` trennt geplante, angenommene, unterdrueckte,
 verworfene, aufgeloeste und offene Quellframes; Hardware-Playback bleibt
 ausdruecklich unbekannt.
+`R4BASIC source-load` nennt getrennt Metadatenaufrufe, Bereichslesungen,
+gelesene Bytes, Quellgroesse und die 256-KiB-Grenze. Zusammen mit dem
+vorgelagerten `source-probe`-Marker ist damit im Gast nachweisbar, dass eine
+bekannte BAS-Datei vor dem Start nicht vollstaendig und im R4Basic-Host nur
+einmal geladen wird.
 
 R4BASIC verwendet gezielt `OPTIMIZE=speed`; andere R4X-Module bleiben bei
 ihrer jeweiligen Manifestentscheidung. Der identische Standard-QEMU-Lauf mit
@@ -460,6 +470,10 @@ dass derselbe Quelltext waehrend des Lexens kooperativ und leckfrei
 abgebrochen werden kann. Der Frontendtest klassifiziert jede zugesagte und
 reservierte Keywordschreibweise gemischt gross/klein innerhalb der statischen
 Probegrenze.
+Der Source-Loader-Test prueft zusaetzlich 128 KiB minus ein Byte, genau
+128 KiB, 128 KiB plus ein Byte und genau 256 KiB mit jeweils einer
+Metadatenabfrage, einer Inhaltslesung und identischen Bytezahlen. 256 KiB plus
+ein Byte werden vor jeder Inhaltslesung abgewiesen.
 
 Die lokale Realprogrammabnahme lautet:
 

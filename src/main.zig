@@ -5,6 +5,7 @@ const compiler = @import("compiler.zig");
 const frontend = @import("frontend.zig");
 const graphics_screen = @import("graphics_screen.zig");
 const runtime_adapter = @import("runtime_adapter.zig");
+const source_loader = @import("source_loader.zig");
 const storage_adapter = @import("storage_adapter.zig");
 const text_screen = @import("text_screen.zig");
 const vm = @import("vm.zig");
@@ -56,7 +57,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         });
     };
     timeline.source_begin_ns = monotonicNow(sys);
-    const source = loadSource(allocator, &files, guest_path.asZ()) catch |fault| {
+    const loaded_source = source_loader.load(allocator, &files, guest_path.asZ()) catch |fault| {
         if (trace.baseline) return writeBaselineFailure(&files, trace, @errorName(fault), 66);
         return showStatus(allocator, sys, desk, draw, "R4BASIC - Ladefehler", &.{
             "Die BASIC-Datei konnte nicht geladen werden.",
@@ -64,6 +65,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
             @errorName(fault),
         });
     };
+    const source = loaded_source.bytes;
     var source_owned = true;
     defer if (source_owned) allocator.free(source);
     timeline.source_end_ns = monotonicNow(sys);
@@ -182,6 +184,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         trace,
         launch.guest_path,
         source.len,
+        loaded_source.stats,
         program.instructions.len,
         program.compile_stats,
         compile_vm_memory,
@@ -465,40 +468,6 @@ fn containsIgnoreCase(value: []const u8, needle: []const u8) bool {
     return false;
 }
 
-const LoadError = error{
-    OutOfMemory,
-    Missing,
-    Directory,
-    TooLarge,
-    ReadFailure,
-    ShortRead,
-};
-
-fn loadSource(allocator: std.mem.Allocator, files: *const r4os.Files, path: r4os.app_storage.PathZ) LoadError![]u8 {
-    const info = switch (files.info(path)) {
-        .value => |value| value,
-        .missing => return error.Missing,
-        .failure => return error.ReadFailure,
-    };
-    if (info.is_dir != 0) return error.Directory;
-    if (info.size > frontend.maximum_source_bytes or info.size > std.math.maxInt(usize)) return error.TooLarge;
-    const source = try allocator.alloc(u8, @intCast(info.size));
-    errdefer allocator.free(source);
-    var offset: usize = 0;
-    while (offset < source.len) {
-        const read_offset: u32 = std.math.cast(u32, offset) orelse return error.TooLarge;
-        switch (files.readAt(path, read_offset, source[offset..])) {
-            .bytes => |count| {
-                if (count == 0 or count > source.len - offset) return error.ReadFailure;
-                offset += count;
-            },
-            .end => return error.ShortRead,
-            .failure => return error.ReadFailure,
-        }
-    }
-    return source;
-}
-
 const LaunchTrace = struct {
     active: bool = false,
     baseline: bool = false,
@@ -746,6 +715,7 @@ const RuntimeHost = struct {
     trace: LaunchTrace,
     guest_path: []const u8,
     source_bytes: usize,
+    source_load: source_loader.Stats,
     program_instructions: usize,
     compile_stats: @import("bytecode.zig").CompileStats,
     compile_vm_memory: CompileVmMemory,
@@ -768,6 +738,7 @@ const RuntimeHost = struct {
         trace: LaunchTrace,
         guest_path: []const u8,
         source_bytes: usize,
+        source_load: source_loader.Stats,
         program_instructions: usize,
         compile_stats: @import("bytecode.zig").CompileStats,
         compile_vm_memory: CompileVmMemory,
@@ -783,6 +754,7 @@ const RuntimeHost = struct {
             .trace = trace,
             .guest_path = guest_path,
             .source_bytes = source_bytes,
+            .source_load = source_load,
             .program_instructions = program_instructions,
             .compile_stats = compile_stats,
             .compile_vm_memory = compile_vm_memory,
@@ -927,6 +899,14 @@ const RuntimeHost = struct {
             self.program_instructions,
         }) catch return false;
         report_len += header.len;
+        const source_load_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC source-load: info_calls={d} read_calls={d} read_bytes={d} source_bytes={d} limit_bytes={d}\r\n", .{
+            self.source_load.info_calls,
+            self.source_load.read_calls,
+            self.source_load.read_bytes,
+            self.source_bytes,
+            frontend.maximum_source_bytes,
+        }) catch return false;
+        report_len += source_load_line.len;
         const timeline = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC timeline: start_ns={d} probe_ns={d} resolve_ns={d} desktop_ns={d} app_ns={d} source_begin_ns={d} source_end_ns={d} compile_begin_ns={d} compile_visible_ns={d} compile_end_ns={d} compile_updates={d} vm_begin_ns={d} vm_end_ns={d} host_ready_ns={d} initial_frame_ns={d} runtime_begin_ns={d} first_instruction_ns={d} audio_open_ns={d} first_frame_ns={d}\r\n", .{
             self.trace.start_ns,
             self.trace.probe_ns,

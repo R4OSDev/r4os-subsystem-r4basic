@@ -21,6 +21,72 @@ const fixture_paths = struct {
     const audio = "Tests/Fixtures/vm_audio.bas";
 };
 
+const SourceInfo = struct {
+    is_dir: u8 = 0,
+    size: u64 = 0,
+};
+
+const SourceInfoResult = union(enum) {
+    value: SourceInfo,
+    missing,
+    failure: i32,
+};
+
+const SourceTransfer = union(enum) {
+    bytes: u32,
+    end,
+    failure: i32,
+};
+
+const SourceReader = struct {
+    size: u64,
+    info_calls: u32 = 0,
+    read_calls: u32 = 0,
+    read_bytes: u64 = 0,
+
+    pub fn info(self: *@This(), _: []const u8) SourceInfoResult {
+        self.info_calls += 1;
+        return .{ .value = .{ .size = self.size } };
+    }
+
+    pub fn readAt(self: *@This(), _: []const u8, offset: u32, out: []u8) SourceTransfer {
+        self.read_calls += 1;
+        if (offset >= self.size) return .end;
+        const count: usize = @intCast(@min(self.size - offset, out.len));
+        @memset(out[0..count], 'P');
+        self.read_bytes += count;
+        return .{ .bytes = @intCast(count) };
+    }
+};
+
+test "source loader performs one exact load across the 128 KiB boundary through 256 KiB" {
+    const sizes = [_]usize{
+        128 * 1024 - 1,
+        128 * 1024,
+        128 * 1024 + 1,
+        core.frontend.maximum_source_bytes,
+    };
+    for (sizes) |size| {
+        var reader = SourceReader{ .size = size };
+        const loaded = try core.source_loader.load(std.testing.allocator, &reader, "C:\\TEMP\\BOUNDARY.BAS");
+        defer std.testing.allocator.free(loaded.bytes);
+        try std.testing.expectEqual(size, loaded.bytes.len);
+        try std.testing.expectEqual(@as(u8, 'P'), loaded.bytes[0]);
+        try std.testing.expectEqual(@as(u8, 'P'), loaded.bytes[loaded.bytes.len - 1]);
+        try std.testing.expectEqual(@as(u32, 1), loaded.stats.info_calls);
+        try std.testing.expectEqual(@as(u32, 1), loaded.stats.read_calls);
+        try std.testing.expectEqual(@as(u64, size), loaded.stats.read_bytes);
+        try std.testing.expectEqual(@as(u32, 1), reader.info_calls);
+        try std.testing.expectEqual(@as(u32, 1), reader.read_calls);
+        try std.testing.expectEqual(@as(u64, size), reader.read_bytes);
+    }
+
+    var oversized = SourceReader{ .size = core.frontend.maximum_source_bytes + 1 };
+    try std.testing.expectError(error.TooLarge, core.source_loader.load(std.testing.allocator, &oversized, "C:\\TEMP\\TOO-LARGE.BAS"));
+    try std.testing.expectEqual(@as(u32, 1), oversized.info_calls);
+    try std.testing.expectEqual(@as(u32, 0), oversized.read_calls);
+}
+
 test "core compiler emits a bound instruction program" {
     var program = try core.compiler.compile(std.testing.allocator, "smoke.bas", "DEFINT A-Z\nAnswer = 6 * 7\nEND\n");
     defer program.deinit();
