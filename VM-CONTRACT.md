@@ -1,6 +1,6 @@
 ﻿# R4BASIC v1 core VM contract
 
-Contract version: `1.5.0`
+Contract version: `1.6.0`
 
 This document freezes the executable R4BASIC language layers. The broader
 source syntax accepted by the frontend remains defined in
@@ -14,9 +14,11 @@ source syntax accepted by the frontend remains defined in
   resolution, and instruction emission then operate on that token stream.
 - A successful program records one parse pass and one bind pass. VM
   instances reference the prepared program and never tokenize or parse it.
-- Instructions contain an opcode, two bounded operands, and the exact source
-  span responsible for the operation. Branch operands are resolved
-  instruction indices, not source labels or text offsets.
+- The hot instruction stream contains only an opcode and two bounded
+  operands (12 bytes). A parallel, equally long metadata stream contains the
+  exact source span and statement bounds (24 bytes). Both streams use the
+  same O(1) instruction index; branch operands are resolved instruction
+  indices, not source labels or text offsets.
 - A program with any compile diagnostic cannot initialize a VM.
 
 ## Symbols and scopes
@@ -77,8 +79,11 @@ aliases, and error-handler state belong to each VM instance.
   its quotient toward zero.
 - Division by zero and numeric overflow are visible runtime errors. Numeric
   and string categories never convert implicitly into one another.
-- Comparisons return INTEGER `-1` for true and `0` for false. Conditions
-  accept every nonzero numeric value as true and reject strings.
+- Comparisons return INTEGER `-1` for true and `0` for false. The compiler
+  records the bound operand type: INTEGER/LONG pairs compare without a
+  floating conversion, while SINGLE/DOUBLE and mixed floating pairs retain
+  the established binary64 comparison path. Conditions accept every nonzero
+  numeric value as true and reject strings.
 - `NOT`, `AND`, `OR`, and `XOR` use signed LONG bit operations. Power is
   right-associative, is evaluated by the injected math host, and rejects a
   negative base with a non-integral exponent.
@@ -257,9 +262,12 @@ guest address can become an R4OS or host pointer.
   Positive values also wake for a new key. Host input and lifecycle commands
   continue to be polled while the VM waits.
 - The runtime adapter uses the shared budget of at most 4,096 instructions.
-  It checks the production monotonic clock every 64 instructions and ends a
-  scheduled step after 8 milliseconds. Runnable code returns `progress`
-  without an artificial wake deadline.
+  It checks one production monotonic clock source every 256 instructions and
+  ends a scheduled step after 8 milliseconds. A full budget therefore needs
+  at most 17 clock reads and can overshoot only by one bounded 256-operation
+  block. Runnable code returns `progress` without an artificial wake
+  deadline; zero-operation progress is treated as idle polling and blocks for
+  one bounded host tick.
 - Scheduled TIMER reads are admitted at most once per guest millisecond. An
   earlier repeated poll returns a cooperative wait until that deadline. This
   keeps historical `CalcDelay`/`Rest` loops reproducible without throttling
@@ -302,9 +310,9 @@ guest address can become an R4OS or host pointer.
 
 - Each module or active procedure can install one handler. A catchable fault
   searches the current invocation path and never affects another VM.
-- Instructions carry their containing statement start and successor.
-  `RESUME` therefore rebuilds the complete failing statement, including its
-  operands, while `RESUME NEXT` skips exactly that statement.
+- Parallel instruction metadata carries the containing statement start and
+  successor. `RESUME` therefore rebuilds the complete failing statement,
+  including its operands, while `RESUME NEXT` skips exactly that statement.
 - A handler is inactive until `ON ERROR GOTO` executes and cannot catch a
   second error while it is already handling one. `ON ERROR GOTO 0` disables
   it; inside the active handler it rethrows the original fault.
@@ -315,15 +323,22 @@ guest address can become an R4OS or host pointer.
 
 - `runSlice` executes no more than its caller-provided instruction budget and
   returns `yielded` when work remains. Scheduled execution combines successive
-  64-instruction VM chunks into one GuestDriver step until the shared budget,
+  256-instruction VM chunks into one GuestDriver step until the shared budget,
   the 8-ms limit, a guest wait, cancellation, or a terminal state is reached.
-- Cancellation is checked before the first instruction and between every
-  instruction, including for a zero budget. Cancellation exits with code
-  130.
+- The directly set cancellation flag is checked before the first instruction
+  and between every instruction, including for a zero budget. The injected
+  host callback is checked once at each `runSlice`/256-operation chunk
+  boundary. Cancellation exits with code 130; host Close is polled before the
+  next GuestDriver step and also sets the direct flag.
 - `runtime_adapter.Adapter` implements the SDK `subsystem_runtime.GuestDriver`.
   The shared runtime polls bounded host events before invoking exactly one VM
   slice, so a Close command wins over the next guest instruction. A waiting
   VM supplies its next guest-time wake deadline instead of busy-polling.
+- Opcode performance groups use a complete compact lookup table. Text cells
+  are synchronized after text operations and at host display boundaries, not
+  after unrelated numeric instructions. VM, adapter, and runtime statistics
+  expose observer, metadata, cell-resolution, conversion, comparison, TIMER,
+  clock, yield, sleep, zero-progress, and ns/instruction evidence.
 - Reset constructs a fresh global-value and aggregate set before discarding
   the old state, then clears stacks, DATA cursor, handlers, trapped error,
   private segment and byte, text screen, keyboard and input line, guest-time

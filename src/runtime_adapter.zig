@@ -6,7 +6,7 @@ const vm = @import("vm.zig");
 pub const api = runtime;
 pub const reset_error_out_of_memory: i32 = -9801;
 pub const slice_time_limit_ns: u64 = 8 * @import("std").time.ns_per_ms;
-pub const slice_clock_check_instructions: u32 = 64;
+pub const slice_clock_check_instructions: u32 = 256;
 
 pub const SliceClock = struct {
     context: *anyopaque,
@@ -35,6 +35,12 @@ pub const PerformanceStats = struct {
     first_instruction_ns: u64 = 0,
     last_elapsed_ticks: u64 = 0,
     maximum_elapsed_ticks: u64 = 0,
+    elapsed_ns: u64 = 0,
+    last_elapsed_ns: u64 = 0,
+    maximum_elapsed_ns: u64 = 0,
+    clock_reads: u64 = 0,
+    last_clock_reads: u32 = 0,
+    maximum_clock_reads: u32 = 0,
 };
 
 pub const Adapter = struct {
@@ -115,9 +121,21 @@ fn step(context: *anyopaque, budget: u32, guest_now_ns: u64) runtime.StepResult 
     self.machine.setGuestTime(guest_now_ns);
     const allowed = @min(budget, vm.default_instruction_budget);
     const clock = self.slice_clock;
-    const start_tick = if (clock) |value| value.ticks() else 0;
-    const start_ns = if (clock) |value| value.nanoseconds() orelse 0 else 0;
+    var clock_reads: u32 = 0;
+    const start_ns_optional = if (clock) |value| blk: {
+        if (value.nanoseconds_fn == null) break :blk null;
+        clock_reads += 1;
+        break :blk value.nanoseconds();
+    } else null;
+    const uses_nanoseconds = start_ns_optional != null;
+    const start_ns = start_ns_optional orelse 0;
+    const start_tick = if (clock) |value| if (uses_nanoseconds) 0 else blk: {
+        clock_reads += 1;
+        break :blk value.ticks();
+    } else 0;
     const tick_limit = if (clock) |value| ticksForNanoseconds(value.frequency_hz, slice_time_limit_ns) else 0;
+    var last_ns = start_ns;
+    var last_tick = start_tick;
     var result: vm.SliceResult = .{ .status = .yielded, .instructions = 0 };
     var executed: u32 = 0;
     var time_limited = false;
@@ -126,21 +144,50 @@ fn step(context: *anyopaque, budget: u32, guest_now_ns: u64) runtime.StepResult 
         const current = self.machine.runSlice(chunk);
         executed += current.instructions;
         result = .{ .status = current.status, .instructions = executed, .wake_guest_ns = current.wake_guest_ns };
-        if (current.status != .yielded or current.instructions == 0) break;
         if (clock) |value| {
-            if (value.ticks() -| start_tick >= tick_limit) {
+            clock_reads += 1;
+            if (uses_nanoseconds) {
+                last_ns = value.nanoseconds() orelse {
+                    time_limited = true;
+                    break;
+                };
+            } else {
+                last_tick = value.ticks();
+            }
+        }
+        if (current.status != .yielded or current.instructions == 0) break;
+        if (clock != null) {
+            const limit_reached = if (uses_nanoseconds)
+                last_ns -| start_ns >= slice_time_limit_ns
+            else
+                last_tick -| start_tick >= tick_limit;
+            if (limit_reached) {
                 time_limited = true;
                 break;
             }
         }
     }
-    const elapsed_ticks = if (clock) |value| value.ticks() -| start_tick else 0;
+    const direct_elapsed_ns = if (uses_nanoseconds) last_ns -| start_ns else 0;
+    const elapsed_ticks = if (clock) |value| if (uses_nanoseconds)
+        ticksForElapsedNanoseconds(value.frequency_hz, direct_elapsed_ns)
+    else
+        last_tick -| start_tick else 0;
+    const elapsed_ns = if (clock) |value| if (uses_nanoseconds)
+        direct_elapsed_ns
+    else
+        nanosecondsForTicks(value.frequency_hz, elapsed_ticks) else 0;
     self.performance.steps +%= 1;
     self.performance.instructions +%= executed;
     self.performance.last_instructions = executed;
     self.performance.maximum_instructions = @max(self.performance.maximum_instructions, executed);
     self.performance.last_elapsed_ticks = elapsed_ticks;
     self.performance.maximum_elapsed_ticks = @max(self.performance.maximum_elapsed_ticks, elapsed_ticks);
+    self.performance.elapsed_ns +|= elapsed_ns;
+    self.performance.last_elapsed_ns = elapsed_ns;
+    self.performance.maximum_elapsed_ns = @max(self.performance.maximum_elapsed_ns, elapsed_ns);
+    self.performance.clock_reads +%= clock_reads;
+    self.performance.last_clock_reads = clock_reads;
+    self.performance.maximum_clock_reads = @max(self.performance.maximum_clock_reads, clock_reads);
     if (executed != 0 and self.performance.first_instruction_ns == 0) {
         self.performance.first_instruction_ns = start_ns;
     }
@@ -164,6 +211,15 @@ fn ticksForNanoseconds(frequency_hz: u32, nanoseconds: u64) u64 {
     const product = @as(u128, frequency_hz) * nanoseconds;
     const ticks = (product + @import("std").time.ns_per_s - 1) / @import("std").time.ns_per_s;
     return @max(@as(u64, 1), @as(u64, @intCast(ticks)));
+}
+
+fn ticksForElapsedNanoseconds(frequency_hz: u32, nanoseconds: u64) u64 {
+    return @intCast((@as(u128, frequency_hz) * nanoseconds) / @import("std").time.ns_per_s);
+}
+
+fn nanosecondsForTicks(frequency_hz: u32, ticks: u64) u64 {
+    const value = (@as(u128, ticks) * @import("std").time.ns_per_s) / frequency_hz;
+    return if (value > @import("std").math.maxInt(u64)) @import("std").math.maxInt(u64) else @intCast(value);
 }
 
 fn systemTicks(context: *anyopaque) u64 {

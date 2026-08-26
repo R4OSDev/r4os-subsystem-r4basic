@@ -173,14 +173,25 @@ pub fn binary(
     };
 }
 
-pub fn compare(left: Value, right: Value, operation: Comparison) Fault!Value {
-    const ordering = if (left.valueType() == .string and right.valueType() == .string)
-        std.mem.order(u8, left.string, right.string)
-    else if (left.valueType().isNumeric() and right.valueType().isNumeric()) blk: {
-        const first = try toDouble(left);
-        const second = try toDouble(right);
-        break :blk if (first < second) std.math.Order.lt else if (first > second) std.math.Order.gt else std.math.Order.eq;
-    } else return error.TypeMismatch;
+pub fn compare(left: Value, right: Value, operation: Comparison, bound_type: bytecode.ValueType) Fault!Value {
+    const ordering = switch (bound_type) {
+        .string => if (left.valueType() == .string and right.valueType() == .string)
+            std.mem.order(u8, left.string, right.string)
+        else
+            return error.TypeMismatch,
+        .integer, .long => blk: {
+            if (!left.valueType().isNumeric() or !right.valueType().isNumeric()) return error.TypeMismatch;
+            const first: i64 = try toLong(left);
+            const second: i64 = try toLong(right);
+            break :blk if (first < second) std.math.Order.lt else if (first > second) std.math.Order.gt else std.math.Order.eq;
+        },
+        .single, .double => blk: {
+            if (!left.valueType().isNumeric() or !right.valueType().isNumeric()) return error.TypeMismatch;
+            const first = try toDouble(left);
+            const second = try toDouble(right);
+            break :blk if (first < second) std.math.Order.lt else if (first > second) std.math.Order.gt else std.math.Order.eq;
+        },
+    };
 
     const matched = switch (operation) {
         .equal => ordering == .eq,

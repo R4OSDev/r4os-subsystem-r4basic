@@ -283,8 +283,14 @@ fn runPerformanceSelfTest(app: *r4os.App) i32 {
     machine.requestCancel();
     _ = adapter.driver().step(runtime_api.default_slice_budget, 0);
     const stats = machine.performanceStats();
+    const ns_per_instruction = if (instructions == 0) @as(u64, 0) else adapter.performance.elapsed_ns / instructions;
     const ok = machine.status == .cancelled and no_fixed_sleep and ips >= 52_000 and
         adapter.performance.maximum_instructions <= runtime_api.default_slice_budget and
+        adapter.performance.maximum_clock_reads <= 17 and ns_per_instruction != 0 and
+        stats.cancel_callback_checks != 0 and stats.cancel_callback_checks < instructions and
+        stats.instruction_metadata_reads != 0 and stats.instruction_metadata_reads < instructions and
+        stats.text_sync_checks != 0 and stats.text_sync_checks < instructions and
+        stats.cell_resolve_calls != 0 and
         stats.group(.value) != 0 and stats.group(.arithmetic) != 0 and stats.group(.control) != 0;
 
     sys.print("R4BASIC performance: instructions=");
@@ -301,6 +307,22 @@ fn runPerformanceSelfTest(app: *r4os.App) i32 {
     sys.printU64(adapter.performance.time_limited_steps);
     sys.print(" noFixedSleep=");
     sys.printU64(if (no_fixed_sleep) 1 else 0);
+    sys.print(" clockReads=");
+    sys.printU64(adapter.performance.clock_reads);
+    sys.print(" maxClockReads=");
+    sys.printU64(adapter.performance.maximum_clock_reads);
+    sys.print(" nsPerInstruction=");
+    sys.printU64(ns_per_instruction);
+    sys.print(" cancelCallbacks=");
+    sys.printU64(stats.cancel_callback_checks);
+    sys.print(" metadataReads=");
+    sys.printU64(stats.instruction_metadata_reads);
+    sys.print(" textSyncChecks=");
+    sys.printU64(stats.text_sync_checks);
+    sys.print(" cellResolves=");
+    sys.printU64(stats.cell_resolve_calls);
+    sys.print(" conversions=");
+    sys.printU64(stats.value_conversions);
     sys.print(" result=");
     sys.println(if (ok) "OK" else "FAILED");
     return if (ok) 0 else 1;
@@ -685,8 +707,13 @@ const RuntimeHost = struct {
         self.observeRuntime();
         const runtime = self.runtime orelse return false;
         const presenter = self.window.video.stats;
-        var report_storage: [4096]u8 = undefined;
+        var report_storage: [8192]u8 = undefined;
         var report_len: usize = 0;
+        const vm_stats = self.guest.machine.performanceStats();
+        const ns_per_instruction = if (self.guest.performance.instructions == 0)
+            @as(u64, 0)
+        else
+            self.guest.performance.elapsed_ns / self.guest.performance.instructions;
         const header = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC {s}: OK id={s} mode={s} guest={s} source_bytes={d} bytecode={d}\r\n", .{
             if (self.trace.baseline) "baseline" else "trace",
             self.trace.id,
@@ -740,9 +767,11 @@ const RuntimeHost = struct {
             self.compile_stats.progress_updates,
         }) catch return false;
         report_len += compiler_line.len;
-        const compiler_memory_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC compiler-memory: token_bytes={d} initial_list_bytes={d} allocations={d} reallocations={d} copy_bytes={d} peak_bytes={d} program_bytes={d} adopted_source_bytes={d} diagnostics_total={d} diagnostics_stored={d} diagnostics_truncated={d}\r\n", .{
+        const compiler_memory_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC compiler-memory: token_bytes={d} initial_list_bytes={d} instruction_hot_bytes={d} instruction_metadata_bytes={d} allocations={d} reallocations={d} copy_bytes={d} peak_bytes={d} program_bytes={d} adopted_source_bytes={d} diagnostics_total={d} diagnostics_stored={d} diagnostics_truncated={d}\r\n", .{
             self.compile_stats.token_bytes,
             self.compile_stats.initial_list_bytes,
+            self.compile_stats.instruction_hot_bytes,
+            self.compile_stats.instruction_metadata_bytes,
             self.compile_stats.allocator_allocations,
             self.compile_stats.allocator_reallocations,
             self.compile_stats.allocator_copy_bytes,
@@ -766,26 +795,50 @@ const RuntimeHost = struct {
             self.compile_vm_memory.committed_after,
         }) catch return false;
         report_len += compiler_vm_line.len;
-        const runtime_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC runtime: requested_operations={d} executed_operations={d} slices={d} yields={d} sleeps={d} present_attempts={d} presents={d} skipped_presents={d}\r\n", .{
+        const runtime_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC runtime: requested_operations={d} executed_operations={d} slices={d} yields={d} sleeps={d} zero_progress_waits={d} present_attempts={d} presents={d} skipped_presents={d}\r\n", .{
             runtime.stats.requested_operations,
             runtime.stats.executed_operations,
             runtime.stats.slices,
             runtime.stats.yields,
             runtime.stats.sleeps,
+            runtime.stats.zero_progress_waits,
             runtime.stats.present_attempts,
             runtime.stats.presents,
             runtime.stats.skipped_presents,
         }) catch return false;
         report_len += runtime_line.len;
-        const adapter_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC adapter: steps={d} instructions={d} max_slice={d} budget_limited={d} time_limited={d} frame_ready={d}\r\n", .{
+        const adapter_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC adapter: steps={d} instructions={d} max_slice={d} budget_limited={d} time_limited={d} frame_ready={d} clock_reads={d} max_clock_reads={d} elapsed_ns={d} ns_per_instruction={d}\r\n", .{
             self.guest.performance.steps,
             self.guest.performance.instructions,
             self.guest.performance.maximum_instructions,
             self.guest.performance.budget_limited_steps,
             self.guest.performance.time_limited_steps,
             self.guest.performance.frame_ready_steps,
+            self.guest.performance.clock_reads,
+            self.guest.performance.maximum_clock_reads,
+            self.guest.performance.elapsed_ns,
+            ns_per_instruction,
         }) catch return false;
         report_len += adapter_line.len;
+        const vm_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC vm: cancel_flag_checks={d} cancel_callback_checks={d} group_lookups={d} text_sync_checks={d} text_sync_renders={d} metadata_reads={d} cell_resolves={d} alias_hops={d} same_type_store_moves={d} conversions={d} integer_comparisons={d} floating_comparisons={d} string_comparisons={d} timer_calls={d} timer_waits={d} timer_max_wake_lateness_ns={d}\r\n", .{
+            vm_stats.cancel_flag_checks,
+            vm_stats.cancel_callback_checks,
+            vm_stats.operation_group_lookups,
+            vm_stats.text_sync_checks,
+            vm_stats.text_sync_renders,
+            vm_stats.instruction_metadata_reads,
+            vm_stats.cell_resolve_calls,
+            vm_stats.cell_alias_hops,
+            vm_stats.same_type_store_moves,
+            vm_stats.value_conversions,
+            vm_stats.integer_comparisons,
+            vm_stats.floating_comparisons,
+            vm_stats.string_comparisons,
+            vm_stats.timer_calls,
+            vm_stats.timer_waits,
+            vm_stats.maximum_timer_wake_lateness_ns,
+        }) catch return false;
+        report_len += vm_line.len;
         const presenter_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC presenter: published_frames={d} skipped_frames={d} full_frames={d} damage_frames={d} raster_blocks={d} sampled_pixels={d}\r\n", .{
             presenter.published_frames,
             presenter.skipped_frames,

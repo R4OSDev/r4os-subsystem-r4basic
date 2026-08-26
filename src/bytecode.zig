@@ -1,7 +1,7 @@
 const std = @import("std");
 const frontend = @import("frontend.zig");
 
-pub const contract_version = "1.3.0";
+pub const contract_version = "1.4.0";
 pub const invalid_index: u32 = std.math.maxInt(u32);
 pub const unknown_dimensions: u8 = std.math.maxInt(u8);
 
@@ -251,6 +251,9 @@ pub const Instruction = struct {
     op: OpCode,
     a: u32 = 0,
     b: u32 = 0,
+};
+
+pub const InstructionMetadata = struct {
     span: frontend.Span,
     statement_start: u32 = invalid_index,
     statement_next: u32 = invalid_index,
@@ -351,6 +354,8 @@ pub const CompileStats = struct {
     maximum_expression_depth: u16 = 0,
     list_reservations: u16 = 0,
     initial_list_bytes: u64 = 0,
+    instruction_hot_bytes: u64 = 0,
+    instruction_metadata_bytes: u64 = 0,
     allocator_allocations: u64 = 0,
     allocator_reallocations: u64 = 0,
     allocator_copy_bytes: u64 = 0,
@@ -365,6 +370,7 @@ pub const Program = struct {
     file_name: []u8,
     source: []u8,
     instructions: []Instruction,
+    instruction_metadata: []InstructionMetadata,
     constants: []Constant,
     globals: []Variable,
     procedures: []Procedure,
@@ -397,6 +403,7 @@ pub const Program = struct {
         self.allocator.free(self.procedures);
         self.allocator.free(self.globals);
         self.allocator.free(self.constants);
+        self.allocator.free(self.instruction_metadata);
         self.allocator.free(self.instructions);
         self.allocator.free(self.diagnostics);
         self.allocator.free(self.source);

@@ -270,11 +270,22 @@ und Close werden waehrenddessen weiter gepollt. Eine neue Taste kann SLEEP
 vorzeitig beenden. Pausenzeit wird weder TIMER noch der Deadline zugerechnet.
 
 Der R4BASIC-Adapter nutzt bis zu 4.096 Instruktionen aus dem gemeinsamen
-Runtime-Budget. Er prueft nach jeweils 64 Instruktionen den produktiven
-monotonen Takt und beendet eine Scheibe nach acht Millisekunden. Lauffaehiger
-Code erhaelt keine pauschale Wartezeit. Eine fruehe wiederholte TIMER-Abfrage
-gibt dagegen bis zur naechsten Gastmillisekunde kooperativ ab. Dadurch bleiben
-CalcDelay-/Rest-Muster reproduzierbar, ohne Grafik und Berechnung mitzubremsen.
+Runtime-Budget. Er prueft nach jeweils 256 Instruktionen genau eine produktive
+monotone Zeitquelle und beendet eine Scheibe nach acht Millisekunden. Eine
+volle Scheibe benoetigt damit hoechstens 17 Clock-Abfragen. Lauffaehiger Code
+erhaelt keine pauschale Wartezeit; ein Fortschrittsresultat ohne ausgefuehrte
+Operation blockiert dagegen fuer einen begrenzten Hosttick statt aktiv zu
+yielden. Eine fruehe wiederholte TIMER-Abfrage gibt bis zur naechsten
+Gastmillisekunde kooperativ ab. Dadurch bleiben CalcDelay-/Rest-Muster
+reproduzierbar, ohne Grafik und Berechnung mitzubremsen.
+
+Der 12-Byte-Instruktionsstrom enthaelt nur Opcode und zwei Operanden. Exakte
+Quellposition und Statementgrenzen liegen in einer parallelen 24-Byte-Tabelle,
+die nur an Statement- und Fehlergrenzen gelesen wird. INTEGER-/LONG-Vergleiche
+nutzen die bereits gebundene Typinformation ohne den bisherigen Umweg ueber
+DOUBLE. Bereits aufgeloeste Cell-Zeiger werden im Load-/Store-Pfad nicht ein
+zweites Mal aufgeloest; gleich typisierte Stores uebernehmen den Stackwert
+ohne zusaetzliche Konvertierungskopie.
 
 RND besitzt einen privaten 24-Bit-Zustand und den letzten Wert. Positive oder
 fehlende Argumente ziehen weiter, null wiederholt und ein negatives Argument

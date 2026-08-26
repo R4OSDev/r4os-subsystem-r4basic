@@ -564,6 +564,7 @@ const Builder = struct {
     tokens: []const frontend.Token,
     index: usize = 0,
     instructions: std.ArrayList(bytecode.Instruction) = .empty,
+    instruction_metadata: std.ArrayList(bytecode.InstructionMetadata) = .empty,
     constants: std.ArrayList(bytecode.Constant) = .empty,
     globals: std.ArrayList(bytecode.Variable) = .empty,
     procedures: std.ArrayList(ProcedureBuilder) = .empty,
@@ -596,6 +597,7 @@ const Builder = struct {
         for (self.procedures.items) |*procedure| procedure.deinit(self.allocator);
         for (self.record_types.items) |*record_type| record_type.deinit(self.allocator);
         for (self.blocks.items) |*block| block.deinit(self.allocator);
+        self.instruction_metadata.deinit(self.allocator);
         self.instructions.deinit(self.allocator);
         self.constants.deinit(self.allocator);
         self.globals.deinit(self.allocator);
@@ -618,6 +620,7 @@ const Builder = struct {
 
     fn reserve(self: *Builder, hints: CapacityHints) !void {
         try self.instructions.ensureTotalCapacityPrecise(self.allocator, hints.instructions);
+        try self.instruction_metadata.ensureTotalCapacityPrecise(self.allocator, hints.instructions);
         try self.constants.ensureTotalCapacityPrecise(self.allocator, hints.constants);
         try self.globals.ensureTotalCapacityPrecise(self.allocator, hints.globals);
         try self.procedures.ensureTotalCapacityPrecise(self.allocator, hints.procedures);
@@ -628,9 +631,10 @@ const Builder = struct {
         try self.label_fixups.ensureTotalCapacityPrecise(self.allocator, hints.label_fixups);
         try self.data_fixups.ensureTotalCapacityPrecise(self.allocator, hints.data_fixups);
         try self.blocks.ensureTotalCapacityPrecise(self.allocator, hints.blocks);
-        self.stats.list_reservations = 11;
+        self.stats.list_reservations = 12;
         self.stats.initial_list_bytes = @intCast(
             self.instructions.capacity * @sizeOf(bytecode.Instruction) +
+                self.instruction_metadata.capacity * @sizeOf(bytecode.InstructionMetadata) +
                 self.constants.capacity * @sizeOf(bytecode.Constant) +
                 self.globals.capacity * @sizeOf(bytecode.Variable) +
                 self.procedures.capacity * @sizeOf(ProcedureBuilder) +
@@ -696,10 +700,10 @@ const Builder = struct {
         const start = self.currentIp();
         const result = try self.parseStatement(inline_statement);
         const next = self.currentIp();
-        for (self.instructions.items[start..next]) |*instruction| {
-            if (instruction.statement_start == bytecode.invalid_index) {
-                instruction.statement_start = start;
-                instruction.statement_next = next;
+        for (self.instruction_metadata.items[start..next]) |*metadata| {
+            if (metadata.statement_start == bytecode.invalid_index) {
+                metadata.statement_start = start;
+                metadata.statement_next = next;
             }
         }
         return result;
@@ -2305,7 +2309,7 @@ const Builder = struct {
             const operator = self.advance();
             const right = (try self.parseAdditive()) orelse return null;
             if ((left == .string) != (right == .string)) try self.addDiagnostic(.type_mismatch, operator.span);
-            _ = try self.emit(op, 0, 0, operator.span);
+            _ = try self.emit(op, bytecode.encodeValueType(comparisonValueType(left, right)), 0, operator.span);
             left = .integer;
         }
         return left;
@@ -2701,14 +2705,29 @@ const Builder = struct {
             const lower_type = (try self.parseExpression()) orelse return false;
             if (!typesCompatible(selector.value_type, lower_type)) try self.addDiagnostic(.type_mismatch, statement.span);
             if (self.consumeKeyword(.to)) {
-                _ = try self.emit(.compare_greater_equal, 0, 0, statement.span);
+                _ = try self.emit(
+                    .compare_greater_equal,
+                    bytecode.encodeValueType(comparisonValueType(selector.value_type, lower_type)),
+                    0,
+                    statement.span,
+                );
                 try self.emitLoad(selector, statement.span);
                 const upper_type = (try self.parseExpression()) orelse return false;
                 if (!typesCompatible(selector.value_type, upper_type)) try self.addDiagnostic(.type_mismatch, statement.span);
-                _ = try self.emit(.compare_less_equal, 0, 0, statement.span);
+                _ = try self.emit(
+                    .compare_less_equal,
+                    bytecode.encodeValueType(comparisonValueType(selector.value_type, upper_type)),
+                    0,
+                    statement.span,
+                );
                 _ = try self.emit(.logical_and, bytecode.encodeValueType(.long), 0, statement.span);
             } else {
-                _ = try self.emit(.compare_equal, 0, 0, statement.span);
+                _ = try self.emit(
+                    .compare_equal,
+                    bytecode.encodeValueType(comparisonValueType(selector.value_type, lower_type)),
+                    0,
+                    statement.span,
+                );
             }
             if (!first_condition) _ = try self.emit(.logical_or, bytecode.encodeValueType(.long), 0, statement.span);
             first_condition = false;
@@ -2752,17 +2771,17 @@ const Builder = struct {
         const check_ip = self.currentIp();
         try self.emitLoad(step, statement.span);
         try self.emitNumericZero(control.value_type, statement.span);
-        _ = try self.emit(.compare_greater_equal, 0, 0, statement.span);
+        _ = try self.emit(.compare_greater_equal, bytecode.encodeValueType(control.value_type), 0, statement.span);
         const negative_jump = try self.emit(.jump_if_false, bytecode.invalid_index, 0, statement.span);
         try self.emitLoad(control, statement.span);
         try self.emitLoad(limit, statement.span);
-        _ = try self.emit(.compare_less_equal, 0, 0, statement.span);
+        _ = try self.emit(.compare_less_equal, bytecode.encodeValueType(control.value_type), 0, statement.span);
         const positive_exit = try self.emit(.jump_if_false, bytecode.invalid_index, 0, statement.span);
         const body_jump = try self.emit(.jump, bytecode.invalid_index, 0, statement.span);
         self.patchJump(negative_jump, self.currentIp());
         try self.emitLoad(control, statement.span);
         try self.emitLoad(limit, statement.span);
-        _ = try self.emit(.compare_greater_equal, 0, 0, statement.span);
+        _ = try self.emit(.compare_greater_equal, bytecode.encodeValueType(control.value_type), 0, statement.span);
         const negative_exit = try self.emit(.jump_if_false, bytecode.invalid_index, 0, statement.span);
         self.patchJump(body_jump, self.currentIp());
 
@@ -3000,6 +3019,9 @@ const Builder = struct {
     }
 
     fn finish(self: *Builder) !bytecode.Program {
+        std.debug.assert(self.instructions.items.len == self.instruction_metadata.items.len);
+        self.stats.instruction_hot_bytes = @as(u64, @intCast(self.instructions.items.len)) * @sizeOf(bytecode.Instruction);
+        self.stats.instruction_metadata_bytes = @as(u64, @intCast(self.instruction_metadata.items.len)) * @sizeOf(bytecode.InstructionMetadata);
         self.stats.label_fixups = @intCast(self.label_fixups.items.len);
         self.stats.data_fixups = @intCast(self.data_fixups.items.len);
         self.stats.diagnostics_total = self.diagnostics_total;
@@ -3046,6 +3068,8 @@ const Builder = struct {
 
         const instructions = try self.instructions.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(instructions);
+        const instruction_metadata = try self.instruction_metadata.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(instruction_metadata);
         const constants = try self.constants.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(constants);
         const globals = try self.globals.toOwnedSlice(self.allocator);
@@ -3085,6 +3109,7 @@ const Builder = struct {
             .file_name = self.file_name,
             .source = self.source,
             .instructions = instructions,
+            .instruction_metadata = instruction_metadata,
             .constants = constants,
             .globals = globals,
             .procedures = procedures,
@@ -3137,7 +3162,9 @@ const Builder = struct {
             return bytecode.invalid_index;
         }
         const index: u32 = @intCast(self.instructions.items.len);
-        try self.instructions.append(self.allocator, .{ .op = op, .a = a, .b = b, .span = span });
+        try self.instructions.append(self.allocator, .{ .op = op, .a = a, .b = b });
+        errdefer _ = self.instructions.pop();
+        try self.instruction_metadata.append(self.allocator, .{ .span = span });
         return index;
     }
 
@@ -3365,6 +3392,11 @@ fn comparisonOp(kind: frontend.TokenKind) ?bytecode.OpCode {
         .greater_equal => .compare_greater_equal,
         else => null,
     };
+}
+
+fn comparisonValueType(left: bytecode.ValueType, right: bytecode.ValueType) bytecode.ValueType {
+    if (left == .string and right == .string) return .string;
+    return values.numericResultType(left, right) catch .double;
 }
 
 fn typesCompatible(target: bytecode.ValueType, source: bytecode.ValueType) bool {

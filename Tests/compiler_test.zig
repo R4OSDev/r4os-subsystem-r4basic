@@ -103,6 +103,11 @@ test "compiler indices scale across symbols records procedures and label fixups"
     defer repeated.deinit();
     try expectProgramOk(&repeated);
     try std.testing.expectEqualSlices(core.bytecode.Instruction, program.instructions, repeated.instructions);
+    try std.testing.expectEqualSlices(
+        core.bytecode.InstructionMetadata,
+        program.instruction_metadata,
+        repeated.instruction_metadata,
+    );
     try std.testing.expectEqual(program.compile_stats.name_lookups, repeated.compile_stats.name_lookups);
     try std.testing.expectEqual(program.compile_stats.name_probes, repeated.compile_stats.name_probes);
 
@@ -200,6 +205,17 @@ test "compiler storage follows token demand and bounds the dense 256 KiB case" {
         dense_program.compile_stats.token_capacity,
     );
     try std.testing.expectEqual(@as(usize, 196_609), dense_program.instructions.len);
+    try std.testing.expectEqual(dense_program.instructions.len, dense_program.instruction_metadata.len);
+    try std.testing.expectEqual(@as(usize, 12), @sizeOf(core.bytecode.Instruction));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(core.bytecode.InstructionMetadata));
+    try std.testing.expectEqual(
+        @as(u64, @intCast(dense_program.instructions.len * @sizeOf(core.bytecode.Instruction))),
+        dense_program.compile_stats.instruction_hot_bytes,
+    );
+    try std.testing.expectEqual(
+        @as(u64, @intCast(dense_program.instruction_metadata.len * @sizeOf(core.bytecode.InstructionMetadata))),
+        dense_program.compile_stats.instruction_metadata_bytes,
+    );
     try std.testing.expectEqual(@as(usize, 1), dense_program.constants.len);
     try std.testing.expectEqual(@as(u32, 65_536), dense_program.compile_stats.constant_lookups);
     try std.testing.expectEqual(@as(u32, 65_535), dense_program.compile_stats.constant_reuses);

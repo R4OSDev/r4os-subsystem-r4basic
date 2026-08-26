@@ -6,7 +6,7 @@ const graphics_screen = @import("graphics_screen.zig");
 const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "1.5.0";
+pub const contract_version = "1.6.0";
 pub const default_instruction_budget: u32 = 4096;
 pub const timer_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
@@ -149,9 +149,25 @@ pub const OperationGroup = enum(u8) {
 pub const operation_group_count: usize = 6;
 
 pub const PerformanceStats = struct {
-    instructions: u64,
-    groups: [operation_group_count]u64,
-    timer_yields: u64,
+    instructions: u64 = 0,
+    groups: [operation_group_count]u64 = .{0} ** operation_group_count,
+    timer_yields: u64 = 0,
+    cancel_flag_checks: u64 = 0,
+    cancel_callback_checks: u64 = 0,
+    operation_group_lookups: u64 = 0,
+    text_sync_checks: u64 = 0,
+    text_sync_renders: u64 = 0,
+    instruction_metadata_reads: u64 = 0,
+    cell_resolve_calls: u64 = 0,
+    cell_alias_hops: u64 = 0,
+    same_type_store_moves: u64 = 0,
+    value_conversions: u64 = 0,
+    integer_comparisons: u64 = 0,
+    floating_comparisons: u64 = 0,
+    string_comparisons: u64 = 0,
+    timer_calls: u64 = 0,
+    timer_waits: u64 = 0,
+    maximum_timer_wake_lateness_ns: u64 = 0,
 
     pub fn group(self: *const PerformanceStats, operation_group: OperationGroup) u64 {
         return self.groups[@intFromEnum(operation_group)];
@@ -248,6 +264,24 @@ const Cell = union(enum) {
     }
 };
 
+const ResolvedCell = struct {
+    pointer: *Cell,
+
+    fn scalar(self: ResolvedCell) ExecutionError!*const values.Value {
+        return switch (self.pointer.owned) {
+            .scalar => |*value| value,
+            else => error.TypeMismatch,
+        };
+    }
+
+    fn scalarMutable(self: ResolvedCell) ExecutionError!*values.Value {
+        return switch (self.pointer.owned) {
+            .scalar => |*value| value,
+            else => error.TypeMismatch,
+        };
+    }
+};
+
 const Frame = struct {
     procedure_id: u32,
     return_ip: u32,
@@ -326,6 +360,22 @@ pub const Vm = struct {
     total_instructions: u64 = 0,
     operation_groups: [operation_group_count]u64 = .{0} ** operation_group_count,
     timer_yield_count: u64 = 0,
+    cancel_flag_checks: u64 = 0,
+    cancel_callback_checks: u64 = 0,
+    operation_group_lookups: u64 = 0,
+    text_sync_checks: u64 = 0,
+    text_sync_renders: u64 = 0,
+    instruction_metadata_reads: u64 = 0,
+    cell_resolve_calls: u64 = 0,
+    cell_alias_hops: u64 = 0,
+    same_type_store_moves: u64 = 0,
+    value_conversions: u64 = 0,
+    integer_comparisons: u64 = 0,
+    floating_comparisons: u64 = 0,
+    string_comparisons: u64 = 0,
+    timer_calls: u64 = 0,
+    timer_waits: u64 = 0,
+    maximum_timer_wake_lateness_ns: u64 = 0,
     status: Status = .ready,
     exit_code: i32 = 0,
     runtime_diagnostic: ?RuntimeDiagnostic = null,
@@ -361,6 +411,7 @@ pub const Vm = struct {
     active_print_file: ?u8 = null,
     statement_stack_base: usize = 0,
     current_statement_start: u32 = bytecode.invalid_index,
+    current_statement_next: u32 = bytecode.invalid_index,
     cancel_requested: bool = false,
 
     pub fn init(
@@ -368,7 +419,7 @@ pub const Vm = struct {
         program: *const bytecode.Program,
         host: HostServices,
     ) InitError!Vm {
-        if (!program.ok()) return error.InvalidProgram;
+        if (!program.ok() or program.instructions.len != program.instruction_metadata.len) return error.InvalidProgram;
         const globals = try allocateGlobals(allocator, program);
         return .{
             .allocator = allocator,
@@ -498,6 +549,22 @@ pub const Vm = struct {
         self.total_instructions = 0;
         self.operation_groups = .{0} ** operation_group_count;
         self.timer_yield_count = 0;
+        self.cancel_flag_checks = 0;
+        self.cancel_callback_checks = 0;
+        self.operation_group_lookups = 0;
+        self.text_sync_checks = 0;
+        self.text_sync_renders = 0;
+        self.instruction_metadata_reads = 0;
+        self.cell_resolve_calls = 0;
+        self.cell_alias_hops = 0;
+        self.same_type_store_moves = 0;
+        self.value_conversions = 0;
+        self.integer_comparisons = 0;
+        self.floating_comparisons = 0;
+        self.string_comparisons = 0;
+        self.timer_calls = 0;
+        self.timer_waits = 0;
+        self.maximum_timer_wake_lateness_ns = 0;
         self.status = .ready;
         self.exit_code = 0;
         self.runtime_diagnostic = null;
@@ -532,6 +599,7 @@ pub const Vm = struct {
         self.active_print_file = null;
         self.statement_stack_base = 0;
         self.current_statement_start = bytecode.invalid_index;
+        self.current_statement_next = bytecode.invalid_index;
         self.cancel_requested = false;
     }
 
@@ -539,7 +607,14 @@ pub const Vm = struct {
         if (self.status == .halted or self.status == .cancelled or self.status == .runtime_error) {
             return .{ .status = self.status, .instructions = 0 };
         }
-        if (self.cancel_requested or self.host.should_cancel(self.host.context)) {
+        self.cancel_flag_checks +%= 1;
+        if (self.cancel_requested) {
+            self.status = .cancelled;
+            self.exit_code = 130;
+            return .{ .status = self.status, .instructions = 0 };
+        }
+        self.cancel_callback_checks +%= 1;
+        if (self.host.should_cancel(self.host.context)) {
             self.status = .cancelled;
             self.exit_code = 130;
             return .{ .status = self.status, .instructions = 0 };
@@ -548,7 +623,8 @@ pub const Vm = struct {
         self.wait_wake_ns = 0;
         var executed: u32 = 0;
         while (executed < instruction_budget) {
-            if (self.cancel_requested or self.host.should_cancel(self.host.context)) {
+            self.cancel_flag_checks +%= 1;
+            if (self.cancel_requested) {
                 self.status = .cancelled;
                 self.exit_code = 130;
                 return .{ .status = self.status, .instructions = executed };
@@ -560,12 +636,7 @@ pub const Vm = struct {
 
             const instruction_index = self.instruction_pointer;
             const instruction = self.program.instructions[instruction_index];
-            const statement_start = if (instruction.statement_start == bytecode.invalid_index) instruction_index else instruction.statement_start;
-            if (self.current_statement_start != statement_start) {
-                self.current_statement_start = statement_start;
-                self.statement_stack_base = self.stack.items.len;
-                self.active_print_file = null;
-            }
+            self.enterInstructionStatement(instruction_index);
             self.instruction_pointer += 1;
             self.execute(instruction_index, instruction) catch |fault| {
                 if (fault == error.WouldBlock) {
@@ -581,8 +652,9 @@ pub const Vm = struct {
                     self.active_error.?.diagnostic.code
                 else
                     runtimeCode(fault);
-                if (fault != error.Rethrow and self.trapError(code, instruction_index, instruction)) {
-                    self.recordOperation(instruction);
+                if (fault != error.Rethrow and self.trapError(code, instruction_index)) {
+                    const group = self.recordOperation(instruction.op);
+                    if (group == .text) self.syncTextToGraphics();
                     executed += 1;
                     self.total_instructions += 1;
                     continue;
@@ -594,8 +666,8 @@ pub const Vm = struct {
                 }
                 return .{ .status = self.status, .instructions = executed };
             };
-            self.recordOperation(instruction);
-            self.syncTextToGraphics();
+            const group = self.recordOperation(instruction.op);
+            if (group == .text) self.syncTextToGraphics();
             executed += 1;
             self.total_instructions += 1;
             if (self.status == .halted) return .{ .status = .halted, .instructions = executed };
@@ -618,6 +690,22 @@ pub const Vm = struct {
             .instructions = self.total_instructions,
             .groups = self.operation_groups,
             .timer_yields = self.timer_yield_count,
+            .cancel_flag_checks = self.cancel_flag_checks,
+            .cancel_callback_checks = self.cancel_callback_checks,
+            .operation_group_lookups = self.operation_group_lookups,
+            .text_sync_checks = self.text_sync_checks,
+            .text_sync_renders = self.text_sync_renders,
+            .instruction_metadata_reads = self.instruction_metadata_reads,
+            .cell_resolve_calls = self.cell_resolve_calls,
+            .cell_alias_hops = self.cell_alias_hops,
+            .same_type_store_moves = self.same_type_store_moves,
+            .value_conversions = self.value_conversions,
+            .integer_comparisons = self.integer_comparisons,
+            .floating_comparisons = self.floating_comparisons,
+            .string_comparisons = self.string_comparisons,
+            .timer_calls = self.timer_calls,
+            .timer_waits = self.timer_waits,
+            .maximum_timer_wake_lateness_ns = self.maximum_timer_wake_lateness_ns,
         };
     }
 
@@ -702,8 +790,46 @@ pub const Vm = struct {
         return self.gosub_stack.items.len;
     }
 
-    fn recordOperation(self: *Vm, instruction: bytecode.Instruction) void {
-        const group: OperationGroup = switch (instruction.op) {
+    const operation_group_table: [std.meta.fields(bytecode.OpCode).len]OperationGroup = blk: {
+        var table: [std.meta.fields(bytecode.OpCode).len]OperationGroup = undefined;
+        for (std.meta.tags(bytecode.OpCode)) |op| table[@intFromEnum(op)] = classifyOperation(op);
+        break :blk table;
+    };
+
+    fn recordOperation(self: *Vm, op: bytecode.OpCode) OperationGroup {
+        const group = operation_group_table[@intFromEnum(op)];
+        self.operation_group_lookups +%= 1;
+        self.operation_groups[@intFromEnum(group)] +%= 1;
+        return group;
+    }
+
+    fn enterInstructionStatement(self: *Vm, instruction_index: u32) void {
+        if (self.current_statement_start != bytecode.invalid_index and
+            instruction_index >= self.current_statement_start and
+            instruction_index < self.current_statement_next)
+        {
+            return;
+        }
+        const metadata = self.readInstructionMetadata(instruction_index);
+        self.current_statement_start = if (metadata.statement_start == bytecode.invalid_index)
+            instruction_index
+        else
+            metadata.statement_start;
+        self.current_statement_next = if (metadata.statement_next == bytecode.invalid_index)
+            instruction_index +| 1
+        else
+            metadata.statement_next;
+        self.statement_stack_base = self.stack.items.len;
+        self.active_print_file = null;
+    }
+
+    fn readInstructionMetadata(self: *Vm, instruction_index: u32) bytecode.InstructionMetadata {
+        self.instruction_metadata_reads +%= 1;
+        return self.program.instruction_metadata[instruction_index];
+    }
+
+    fn classifyOperation(op: bytecode.OpCode) OperationGroup {
+        return switch (op) {
             .push_constant,
             .load_global,
             .load_local,
@@ -797,7 +923,6 @@ pub const Vm = struct {
             .call_builtin,
             => .host,
         };
-        self.operation_groups[@intFromEnum(group)] +%= 1;
     }
 
     fn execute(self: *Vm, instruction_index: u32, instruction: bytecode.Instruction) ExecutionError!void {
@@ -811,8 +936,8 @@ pub const Vm = struct {
             .load_local => try self.load(try self.localCellAt(instruction.a)),
             .store_global, .initialize_global => try self.store(try self.globalCellAt(instruction.a), bytecode.decodeValueType(instruction.b)),
             .store_local, .initialize_local => try self.store(try self.localCellAt(instruction.a), bytecode.decodeValueType(instruction.b)),
-            .push_global_reference => try self.pushReference(try self.globalCellAt(instruction.a)),
-            .push_local_reference => try self.pushReference(try self.localCellAt(instruction.a)),
+            .push_global_reference => try self.pushResolvedReference(try self.globalCellAt(instruction.a)),
+            .push_local_reference => try self.pushResolvedReference(try self.localCellAt(instruction.a)),
             .array_default_lower => try self.arrayDefaultLower(),
             .select_array_element => try self.selectArrayElement(instruction.a),
             .select_record_field => try self.selectRecordField(instruction.a),
@@ -877,14 +1002,14 @@ pub const Vm = struct {
             .logical_or => try self.binary(.logical_or, .long),
             .logical_xor => try self.binary(.logical_xor, .long),
             .power => try self.power(bytecode.decodeValueType(instruction.a)),
-            .compare_equal => try self.comparison(.equal),
-            .compare_not_equal => try self.comparison(.not_equal),
-            .compare_less => try self.comparison(.less),
-            .compare_less_equal => try self.comparison(.less_equal),
-            .compare_greater => try self.comparison(.greater),
-            .compare_greater_equal => try self.comparison(.greater_equal),
+            .compare_equal => try self.comparison(.equal, bytecode.decodeValueType(instruction.a)),
+            .compare_not_equal => try self.comparison(.not_equal, bytecode.decodeValueType(instruction.a)),
+            .compare_less => try self.comparison(.less, bytecode.decodeValueType(instruction.a)),
+            .compare_less_equal => try self.comparison(.less_equal, bytecode.decodeValueType(instruction.a)),
+            .compare_greater => try self.comparison(.greater, bytecode.decodeValueType(instruction.a)),
+            .compare_greater_equal => try self.comparison(.greater_equal, bytecode.decodeValueType(instruction.a)),
             .call_builtin => try self.callBuiltin(@enumFromInt(@as(u8, @intCast(instruction.a))), instruction.b),
-            .call => try self.callProcedure(instruction.a, instruction.b, instruction),
+            .call => try self.callProcedure(instruction.a, instruction.b),
             .return_procedure => try self.returnProcedure(),
             .jump => self.instruction_pointer = instruction.a,
             .jump_if_false => {
@@ -907,28 +1032,46 @@ pub const Vm = struct {
         }
     }
 
-    fn load(self: *Vm, cell: *Cell) ExecutionError!void {
-        const value = try scalarAt(cell);
+    fn load(self: *Vm, cell: ResolvedCell) ExecutionError!void {
+        const value = try cell.scalar();
         try self.pushValue(try value.clone(self.allocator));
     }
 
-    fn store(self: *Vm, cell: *Cell, target: bytecode.ValueType) ExecutionError!void {
+    fn store(self: *Vm, cell: ResolvedCell, target: bytecode.ValueType) ExecutionError!void {
         var incoming = try self.popValue();
-        defer incoming.deinit(self.allocator);
+        var incoming_owned = true;
+        defer if (incoming_owned) incoming.deinit(self.allocator);
+        const destination = try cell.scalarMutable();
+        if (incoming.valueType() == target) {
+            self.same_type_store_moves +%= 1;
+            destination.deinit(self.allocator);
+            destination.* = incoming;
+            incoming_owned = false;
+            return;
+        }
+        self.value_conversions +%= 1;
         var converted = try values.convert(self.allocator, incoming, target);
         errdefer converted.deinit(self.allocator);
-        const destination = try scalarAtMutable(cell);
         destination.deinit(self.allocator);
         destination.* = converted;
     }
 
     fn storeReference(self: *Vm, target: bytecode.ValueType) ExecutionError!void {
         var incoming = try self.popValue();
-        defer incoming.deinit(self.allocator);
+        var incoming_owned = true;
+        defer if (incoming_owned) incoming.deinit(self.allocator);
         const cell = try self.popReference();
+        const destination = try cell.scalarMutable();
+        if (incoming.valueType() == target) {
+            self.same_type_store_moves +%= 1;
+            destination.deinit(self.allocator);
+            destination.* = incoming;
+            incoming_owned = false;
+            return;
+        }
+        self.value_conversions +%= 1;
         var converted = try values.convert(self.allocator, incoming, target);
         errdefer converted.deinit(self.allocator);
-        const destination = try scalarAtMutable(cell);
         destination.deinit(self.allocator);
         destination.* = converted;
     }
@@ -953,7 +1096,7 @@ pub const Vm = struct {
             remaining -= 1;
             indices[remaining] = try values.asLong(index_value);
         }
-        const root = resolveCell(try self.popReference()) orelse return error.InvalidInstruction;
+        const root = (try self.popReference()).pointer;
         const array = switch (root.owned) {
             .array => |*value| value,
             else => return error.TypeMismatch,
@@ -963,7 +1106,7 @@ pub const Vm = struct {
     }
 
     fn selectRecordField(self: *Vm, field_index: u32) ExecutionError!void {
-        const root = resolveCell(try self.popReference()) orelse return error.InvalidInstruction;
+        const root = (try self.popReference()).pointer;
         const record = switch (root.owned) {
             .record => |*value| value,
             else => return error.TypeMismatch,
@@ -974,7 +1117,7 @@ pub const Vm = struct {
 
     fn dimensionArray(self: *Vm, dimension_count: u32, redimension: bool) ExecutionError!void {
         if (dimension_count == 0 or dimension_count > 60) return error.InvalidInstruction;
-        const root = resolveCell(try self.popReference()) orelse return error.InvalidInstruction;
+        const root = (try self.popReference()).pointer;
         const array = switch (root.owned) {
             .array => |*value| value,
             else => return error.TypeMismatch,
@@ -1043,7 +1186,7 @@ pub const Vm = struct {
         if (self.data_pointer >= self.program.data_items.len) return error.OutOfData;
         var converted = try dataValue(self.allocator, self.program.data_items[self.data_pointer], self.program.source, target);
         errdefer converted.deinit(self.allocator);
-        const scalar = try scalarAtMutable(destination);
+        const scalar = try destination.scalarMutable();
         scalar.deinit(self.allocator);
         scalar.* = converted;
         self.data_pointer += 1;
@@ -1080,10 +1223,11 @@ pub const Vm = struct {
         if (self.instruction_pointer >= self.program.instructions.len) return error.InvalidInstruction;
         self.active_error = null;
         self.current_statement_start = bytecode.invalid_index;
+        self.current_statement_next = bytecode.invalid_index;
         self.statement_stack_base = self.stack.items.len;
     }
 
-    fn trapError(self: *Vm, code: RuntimeCode, instruction_index: u32, instruction: bytecode.Instruction) bool {
+    fn trapError(self: *Vm, code: RuntimeCode, instruction_index: u32) bool {
         if (!isCatchable(code)) return false;
         var handler_frame: u32 = module_frame;
         var handler_ip: u32 = bytecode.invalid_index;
@@ -1105,8 +1249,8 @@ pub const Vm = struct {
         }
         if (handler_ip == bytecode.invalid_index) return false;
 
-        var resume_ip = if (instruction.statement_start == bytecode.invalid_index) instruction_index else instruction.statement_start;
-        var resume_next_ip = if (instruction.statement_next == bytecode.invalid_index) self.instruction_pointer else instruction.statement_next;
+        var resume_ip = if (self.current_statement_start == bytecode.invalid_index) instruction_index else self.current_statement_start;
+        var resume_next_ip = if (self.current_statement_next == bytecode.invalid_index) self.instruction_pointer else self.current_statement_next;
         const keep_frames: usize = if (handler_frame == module_frame) 0 else @as(usize, handler_frame) + 1;
         if (self.frames.items.len > keep_frames) {
             const child = self.frames.items[keep_frames];
@@ -1139,6 +1283,7 @@ pub const Vm = struct {
         }
         self.instruction_pointer = handler_ip;
         self.current_statement_start = bytecode.invalid_index;
+        self.current_statement_next = bytecode.invalid_index;
         self.statement_stack_base = self.stack.items.len;
         return true;
     }
@@ -1290,7 +1435,7 @@ pub const Vm = struct {
     }
 
     fn popArrayReference(self: *Vm) ExecutionError!*ArrayValue {
-        const root = resolveCell(try self.popReference()) orelse return error.InvalidInstruction;
+        const root = (try self.popReference()).pointer;
         return switch (root.owned) {
             .array => |*array| if (array.record_type == bytecode.invalid_index and array.value_type.isNumeric()) array else error.TypeMismatch,
             else => error.TypeMismatch,
@@ -1298,7 +1443,11 @@ pub const Vm = struct {
     }
 
     fn syncTextToGraphics(self: *Vm) void {
-        if (self.text.takeDirty()) |dirty| self.graphics.renderText(&self.text, dirty);
+        self.text_sync_checks +%= 1;
+        if (self.text.takeDirty()) |dirty| {
+            self.text_sync_renders +%= 1;
+            self.graphics.renderText(&self.text, dirty);
+        }
     }
 
     fn textWidth(self: *Vm, argument_count: u32) ExecutionError!void {
@@ -1558,23 +1707,26 @@ pub const Vm = struct {
         while (index < count) : (index += 1) _ = try self.inputTargetCell(base + index);
     }
 
-    fn inputTargetCell(self: *Vm, stack_index: usize) ExecutionError!*Cell {
+    fn inputTargetCell(self: *Vm, stack_index: usize) ExecutionError!ResolvedCell {
         if (stack_index >= self.stack.items.len) return error.StackUnderflow;
         const cell = switch (self.stack.items[stack_index]) {
-            .reference => |value| resolveCell(value) orelse return error.InvalidInstruction,
+            .reference => |value| switch (value.*) {
+                .owned => ResolvedCell{ .pointer = value },
+                .alias => return error.InvalidInstruction,
+            },
             .value => return error.InvalidInstruction,
         };
-        _ = try scalarAt(cell);
+        _ = try cell.scalar();
         return cell;
     }
 
     fn inputTargetType(self: *Vm, stack_index: usize) ExecutionError!bytecode.ValueType {
-        return (try scalarAt(try self.inputTargetCell(stack_index))).valueType();
+        return (try (try self.inputTargetCell(stack_index)).scalar()).valueType();
     }
 
     fn assignInputValues(self: *Vm, target_base: usize, parsed: []values.Value) void {
         for (parsed, 0..) |value, index| {
-            const scalar = scalarAtMutable(self.inputTargetCell(target_base + index) catch unreachable) catch unreachable;
+            const scalar = (self.inputTargetCell(target_base + index) catch unreachable).scalarMutable() catch unreachable;
             scalar.deinit(self.allocator);
             scalar.* = value;
         }
@@ -1888,6 +2040,7 @@ pub const Vm = struct {
     fn convertTop(self: *Vm, target: bytecode.ValueType) ExecutionError!void {
         var input = try self.popValue();
         defer input.deinit(self.allocator);
+        self.value_conversions +%= 1;
         try self.pushValue(try values.convert(self.allocator, input, target));
     }
 
@@ -1911,12 +2064,17 @@ pub const Vm = struct {
         try self.pushValue(try values.binary(self.allocator, operation, left, right, target));
     }
 
-    fn comparison(self: *Vm, operation: values.Comparison) ExecutionError!void {
+    fn comparison(self: *Vm, operation: values.Comparison, bound_type: bytecode.ValueType) ExecutionError!void {
         var right = try self.popValue();
         defer right.deinit(self.allocator);
         var left = try self.popValue();
         defer left.deinit(self.allocator);
-        try self.pushValue(try values.compare(left, right, operation));
+        switch (bound_type) {
+            .integer, .long => self.integer_comparisons +%= 1,
+            .single, .double => self.floating_comparisons +%= 1,
+            .string => self.string_comparisons +%= 1,
+        }
+        try self.pushValue(try values.compare(left, right, operation, bound_type));
     }
 
     fn power(self: *Vm, target: bytecode.ValueType) ExecutionError!void {
@@ -1947,7 +2105,6 @@ pub const Vm = struct {
         self: *Vm,
         procedure_id: u32,
         argument_count: u32,
-        call_instruction: bytecode.Instruction,
     ) ExecutionError!void {
         if (procedure_id >= self.program.procedures.len) return error.InvalidInstruction;
         if (self.frames.items.len >= maximum_call_depth) return error.CallDepthExceeded;
@@ -1972,7 +2129,7 @@ pub const Vm = struct {
                 .by_ref => switch (item) {
                     .reference => |cell| {
                         locals[parameter.local_index].deinit(self.allocator);
-                        locals[parameter.local_index] = .{ .alias = resolveCell(cell) orelse return error.InvalidInstruction };
+                        locals[parameter.local_index] = .{ .alias = cell };
                     },
                     .value => |value| {
                         var converted = try values.convert(self.allocator, value, parameter.value_type);
@@ -1996,8 +2153,8 @@ pub const Vm = struct {
             .procedure_id = procedure_id,
             .return_ip = self.instruction_pointer,
             .stack_base = stack_base,
-            .call_resume_ip = call_instruction.statement_start,
-            .call_resume_next = call_instruction.statement_next,
+            .call_resume_ip = self.current_statement_start,
+            .call_resume_next = self.current_statement_next,
             .locals = locals,
         });
         self.discardStackFrom(stack_base);
@@ -2119,12 +2276,22 @@ pub const Vm = struct {
     }
 
     fn timerValue(self: *Vm) ExecutionError!values.Value {
+        self.timer_calls +%= 1;
         if (self.cooperative_timer_pacing and self.guest_now_ns < self.next_timer_poll_ns) {
             self.wait_wake_ns = self.next_timer_poll_ns;
             self.timer_yield_count +%= 1;
+            self.timer_waits +%= 1;
             return error.WouldBlock;
         }
-        if (self.cooperative_timer_pacing) self.next_timer_poll_ns = self.guest_now_ns +| timer_poll_interval_ns;
+        if (self.cooperative_timer_pacing) {
+            if (self.next_timer_poll_ns != 0) {
+                self.maximum_timer_wake_lateness_ns = @max(
+                    self.maximum_timer_wake_lateness_ns,
+                    self.guest_now_ns -| self.next_timer_poll_ns,
+                );
+            }
+            self.next_timer_poll_ns = self.guest_now_ns +| timer_poll_interval_ns;
+        }
         return .{ .single = self.timerSeconds() };
     }
 
@@ -2255,14 +2422,21 @@ pub const Vm = struct {
     }
 
     fn pushReference(self: *Vm, cell: *Cell) ExecutionError!void {
-        if (self.stack.items.len >= maximum_value_stack) return error.StackOverflow;
-        try self.stack.append(self.allocator, .{ .reference = resolveCell(cell) orelse return error.InvalidInstruction });
+        return self.pushResolvedReference(try self.resolveCellTracked(cell));
     }
 
-    fn popReference(self: *Vm) ExecutionError!*Cell {
+    fn pushResolvedReference(self: *Vm, cell: ResolvedCell) ExecutionError!void {
+        if (self.stack.items.len >= maximum_value_stack) return error.StackOverflow;
+        try self.stack.append(self.allocator, .{ .reference = cell.pointer });
+    }
+
+    fn popReference(self: *Vm) ExecutionError!ResolvedCell {
         const item = self.stack.pop() orelse return error.StackUnderflow;
         return switch (item) {
-            .reference => |cell| resolveCell(cell) orelse error.InvalidInstruction,
+            .reference => |cell| switch (cell.*) {
+                .owned => .{ .pointer = cell },
+                .alias => error.InvalidInstruction,
+            },
             .value => |value| blk: {
                 var owned = value;
                 owned.deinit(self.allocator);
@@ -2275,14 +2449,14 @@ pub const Vm = struct {
         const item = self.stack.pop() orelse return error.StackUnderflow;
         return switch (item) {
             .value => |value| value,
-            .reference => |cell| (try scalarAt(cell)).clone(self.allocator),
+            .reference => |cell| (try (ResolvedCell{ .pointer = cell }).scalar()).clone(self.allocator),
         };
     }
 
     fn cloneStackItem(self: *Vm, item: StackItem) ExecutionError!values.Value {
         return switch (item) {
             .value => |value| value.clone(self.allocator),
-            .reference => |cell| (try scalarAt(cell)).clone(self.allocator),
+            .reference => |cell| (try (ResolvedCell{ .pointer = cell }).scalar()).clone(self.allocator),
         };
     }
 
@@ -2293,15 +2467,31 @@ pub const Vm = struct {
         }
     }
 
-    fn localCellAt(self: *Vm, index: u32) ExecutionError!*Cell {
+    fn localCellAt(self: *Vm, index: u32) ExecutionError!ResolvedCell {
         if (self.frames.items.len == 0) return error.InvalidInstruction;
         if (index >= self.frames.items[self.frames.items.len - 1].locals.len) return error.InvalidInstruction;
-        return resolveCell(&self.frames.items[self.frames.items.len - 1].locals[index]) orelse error.InvalidInstruction;
+        return self.resolveCellTracked(&self.frames.items[self.frames.items.len - 1].locals[index]);
     }
 
-    fn globalCellAt(self: *Vm, index: u32) ExecutionError!*Cell {
+    fn globalCellAt(self: *Vm, index: u32) ExecutionError!ResolvedCell {
         if (index >= self.globals.len) return error.InvalidInstruction;
-        return resolveCell(&self.globals[index]) orelse error.InvalidInstruction;
+        return self.resolveCellTracked(&self.globals[index]);
+    }
+
+    fn resolveCellTracked(self: *Vm, original: *Cell) ExecutionError!ResolvedCell {
+        self.cell_resolve_calls +%= 1;
+        var cell = original;
+        var depth: usize = 0;
+        while (depth <= maximum_call_depth) : (depth += 1) {
+            switch (cell.*) {
+                .owned => return .{ .pointer = cell },
+                .alias => |target| {
+                    self.cell_alias_hops +%= 1;
+                    cell = target;
+                },
+            }
+        }
+        return error.InvalidInstruction;
     }
 
     fn recordError(self: *Vm, code: RuntimeCode, instruction: u32) void {
@@ -2314,9 +2504,9 @@ pub const Vm = struct {
         self.exit_code = self.runtime_diagnostic.?.qbasicErrorNumber();
     }
 
-    fn makeDiagnostic(self: *const Vm, code: RuntimeCode, instruction: u32) RuntimeDiagnostic {
+    fn makeDiagnostic(self: *Vm, code: RuntimeCode, instruction: u32) RuntimeDiagnostic {
         const span: frontend.Span = if (instruction < self.program.instructions.len)
-            self.program.instructions[instruction].span
+            self.readInstructionMetadata(instruction).span
         else
             .{ .start = 0, .end = 0, .line = 1, .column = 1 };
         return .{ .code = code, .file_name = self.program.file_name, .span = span, .instruction = instruction };
@@ -2722,7 +2912,7 @@ fn arrayElement(array: *ArrayValue, indices: []const i32) ?*Cell {
         offset += @as(usize, @intCast(index - dimension.lower)) * dimension.stride;
     }
     if (offset >= array.elements.len) return null;
-    return resolveCell(&array.elements[offset]);
+    return &array.elements[offset];
 }
 
 fn arrayElementConst(array: *const ArrayValue, indices: []const i32) ?*const Cell {
@@ -2733,7 +2923,7 @@ fn arrayElementConst(array: *const ArrayValue, indices: []const i32) ?*const Cel
         offset += @as(usize, @intCast(index - dimension.lower)) * dimension.stride;
     }
     if (offset >= array.elements.len) return null;
-    return resolveCellConst(&array.elements[offset]);
+    return &array.elements[offset];
 }
 
 fn dataValue(
