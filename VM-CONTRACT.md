@@ -1,6 +1,6 @@
 ﻿# R4BASIC v1 core VM contract
 
-Contract version: `1.7.0`
+Contract version: `1.8.0`
 
 This document freezes the executable R4BASIC language layers. The broader
 source syntax accepted by the frontend remains defined in
@@ -281,14 +281,18 @@ guest address can become an R4OS or host pointer.
 - `SLEEP` records a guest-time deadline and returns `waiting`; it never spins
   inside one slice. No argument or zero waits for a newly arriving key.
   Positive values also wake for a new key. Host input and lifecycle commands
-  continue to be polled while the VM waits.
-- The runtime adapter uses the shared budget of at most 4,096 instructions.
-  It checks one production monotonic clock source every 256 instructions and
-  ends a scheduled step after 8 milliseconds. A full budget therefore needs
-  at most 17 clock reads and can overshoot only by one bounded 256-operation
-  block. Runnable code returns `progress` without an artificial wake
-  deadline; zero-operation progress is treated as idle polling and blocks for
-  one bounded host tick.
+  wake the blocking Desktop activity wait. Console `INPUT`, bare `RANDOMIZE`,
+  and zero-argument/zero-duration `SLEEP` carry no periodic retry deadline;
+  positive `SLEEP` uses its one exact guest-time deadline.
+- The runtime adapter uses the shared budget of at most 262,144 instructions.
+  One scheduled step begins with a 256-instruction clock block and adapts
+  subsequent blocks toward one millisecond, bounded to 64 through 16,384
+  instructions. It ends at the first observed boundary at or beyond eight
+  milliseconds. The instruction ceiling remains absolute, one adaptive block
+  bounds deadline overshoot, and the production gate permits at most 20 clock
+  reads per step (a full steady fast-budget probe uses 18). Runnable code
+  returns `progress` without an artificial wake deadline. Zero-operation
+  progress alone retains a one-tick defensive retry.
 - Scheduled TIMER reads are admitted at most once per guest millisecond. An
   earlier repeated poll returns a cooperative wait until that deadline. This
   keeps historical `CalcDelay`/`Rest` loops reproducible without throttling
@@ -343,23 +347,32 @@ guest address can become an R4OS or host pointer.
 ## Cooperative execution and lifecycle
 
 - `runSlice` executes no more than its caller-provided instruction budget and
-  returns `yielded` when work remains. Scheduled execution combines successive
-  256-instruction VM chunks into one GuestDriver step until the shared budget,
-  the 8-ms limit, a guest wait, cancellation, or a terminal state is reached.
+  returns `yielded` when work remains. Scheduled execution combines adaptive
+  bounded VM chunks into one GuestDriver step until the shared budget, the
+  8-ms limit, a guest wait, cancellation, or a terminal state is reached.
 - The directly set cancellation flag is checked before the first instruction
   and between every instruction, including for a zero budget. The injected
-  host callback is checked once at each `runSlice`/256-operation chunk
-  boundary. Cancellation exits with code 130; host Close is polled before the
-  next GuestDriver step and also sets the direct flag.
+  host callback is checked once at each `runSlice`/adaptive-block boundary.
+  Cancellation exits with code 130; host Close is polled before the next
+  GuestDriver step and also sets the direct flag.
 - `runtime_adapter.Adapter` implements the SDK `subsystem_runtime.GuestDriver`.
   The shared runtime polls bounded host events before invoking exactly one VM
   slice, so a Close command wins over the next guest instruction. A waiting
-  VM supplies its next guest-time wake deadline instead of busy-polling.
+  VM supplies its next guest-time wake deadline or an event-only wait instead
+  of busy-polling. Active execution requests a cooperative scheduler yield no
+  more often than once per eight host milliseconds; paused and event-only
+  states block on the existing Desktop activity sequence.
+- The initial VM owns no pixel allocation. Text output or an explicit SCREEN
+  mode prepares the first surface after guest execution; a still-running
+  display-silent guest receives a delayed SCREEN 0 fallback, and an immediate
+  terminal guest receives no unused blank frame. Reset still installs a fresh
+  surface before the old presenter can be used again.
 - Opcode performance groups use a complete compact lookup table. Text cells
   are synchronized after text operations and at host display boundaries, not
   after unrelated numeric instructions. VM, adapter, and runtime statistics
   expose observer, metadata, cell-resolution, conversion, comparison, TIMER,
-  clock, yield, sleep, zero-progress, and ns/instruction evidence.
+  clock, adaptive-block, host-cycle, event-wait, yield, zero-progress,
+  frame-age/backlog/result, file-host, and ns/instruction evidence.
 - Reset constructs a fresh global-value and aggregate set before discarding
   the old state, then clears stacks, DATA cursor, handlers, trapped error,
   private segment and byte, text screen, keyboard and input line, guest-time

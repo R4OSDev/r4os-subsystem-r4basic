@@ -5,8 +5,21 @@ const vm = @import("vm.zig");
 
 pub const api = runtime;
 pub const reset_error_out_of_memory: i32 = -9801;
+pub const display_error_out_of_memory: i32 = -9802;
 pub const slice_time_limit_ns: u64 = 8 * @import("std").time.ns_per_ms;
 pub const slice_clock_check_instructions: u32 = 256;
+pub const slice_clock_target_ns: u64 = @import("std").time.ns_per_ms;
+pub const slice_clock_max_instructions: u32 = 16_384;
+pub const initial_display_delay_ns: u64 = 33 * @import("std").time.ns_per_ms;
+pub const frame_interval_ns: u64 = 33 * @import("std").time.ns_per_ms;
+
+pub const PresentFeedback = enum {
+    presented,
+    unchanged,
+    hidden,
+    dropped,
+    failed,
+};
 
 pub const SliceClock = struct {
     context: *anyopaque,
@@ -41,6 +54,21 @@ pub const PerformanceStats = struct {
     clock_reads: u64 = 0,
     last_clock_reads: u32 = 0,
     maximum_clock_reads: u32 = 0,
+    maximum_clock_chunk: u32 = 0,
+    display_prepares: u64 = 0,
+    cadence_deferred_steps: u64 = 0,
+    missed_frame_deadlines: u64 = 0,
+    maximum_frame_backlog: u64 = 0,
+    present_attempts: u64 = 0,
+    presents: u64 = 0,
+    unchanged_presents: u64 = 0,
+    hidden_presents: u64 = 0,
+    dropped_presents: u64 = 0,
+    failed_presents: u64 = 0,
+    present_elapsed_ns: u64 = 0,
+    maximum_present_ns: u64 = 0,
+    maximum_frame_age_start_ns: u64 = 0,
+    maximum_frame_age_end_ns: u64 = 0,
 };
 
 pub const Adapter = struct {
@@ -48,6 +76,8 @@ pub const Adapter = struct {
     presented_mode_revision: u64 = 0,
     presented_content_revision: u64 = 0,
     next_video_guest_ns: u64 = 0,
+    pending_frame_due_guest_ns: u64 = 0,
+    pending_frame_due_host_ns: u64 = 0,
     slice_clock: ?SliceClock = null,
     performance: PerformanceStats = .{},
 
@@ -114,6 +144,36 @@ pub const Adapter = struct {
             .resize, .mouse => false,
         };
     }
+
+    pub fn hasHostDisplay(self: *const Adapter) bool {
+        return self.machine.hasHostDisplay();
+    }
+
+    pub fn notePresent(self: *Adapter, feedback: PresentFeedback, started_ns: u64, ended_ns: u64) void {
+        self.performance.present_attempts +%= 1;
+        switch (feedback) {
+            .presented => self.performance.presents +%= 1,
+            .unchanged => self.performance.unchanged_presents +%= 1,
+            .hidden => self.performance.hidden_presents +%= 1,
+            .dropped => self.performance.dropped_presents +%= 1,
+            .failed => self.performance.failed_presents +%= 1,
+        }
+        const elapsed = ended_ns -| started_ns;
+        self.performance.present_elapsed_ns +|= elapsed;
+        self.performance.maximum_present_ns = @max(self.performance.maximum_present_ns, elapsed);
+        if (self.pending_frame_due_host_ns != 0 and started_ns != 0) {
+            self.performance.maximum_frame_age_start_ns = @max(
+                self.performance.maximum_frame_age_start_ns,
+                started_ns -| self.pending_frame_due_host_ns,
+            );
+            self.performance.maximum_frame_age_end_ns = @max(
+                self.performance.maximum_frame_age_end_ns,
+                ended_ns -| self.pending_frame_due_host_ns,
+            );
+        }
+        self.pending_frame_due_guest_ns = 0;
+        self.pending_frame_due_host_ns = 0;
+    }
 };
 
 fn step(context: *anyopaque, budget: u32, guest_now_ns: u64) runtime.StepResult {
@@ -139,8 +199,10 @@ fn step(context: *anyopaque, budget: u32, guest_now_ns: u64) runtime.StepResult 
     var result: vm.SliceResult = .{ .status = .yielded, .instructions = 0 };
     var executed: u32 = 0;
     var time_limited = false;
+    var next_chunk: u32 = slice_clock_check_instructions;
     while (executed < allowed) {
-        const chunk = @min(slice_clock_check_instructions, allowed - executed);
+        const chunk = @min(next_chunk, allowed - executed);
+        self.performance.maximum_clock_chunk = @max(self.performance.maximum_clock_chunk, chunk);
         const current = self.machine.runSlice(chunk);
         executed += current.instructions;
         result = .{ .status = current.status, .instructions = executed, .wake_guest_ns = current.wake_guest_ns };
@@ -165,6 +227,13 @@ fn step(context: *anyopaque, budget: u32, guest_now_ns: u64) runtime.StepResult 
                 time_limited = true;
                 break;
             }
+            const observed_ns = if (uses_nanoseconds)
+                last_ns -| start_ns
+            else if (clock) |value|
+                nanosecondsForTicks(value.frequency_hz, last_tick -| start_tick)
+            else
+                0;
+            next_chunk = adaptiveClockChunk(executed, observed_ns);
         }
     }
     const direct_elapsed_ns = if (uses_nanoseconds) last_ns -| start_ns else 0;
@@ -194,17 +263,29 @@ fn step(context: *anyopaque, budget: u32, guest_now_ns: u64) runtime.StepResult 
     if (time_limited) self.performance.time_limited_steps +%= 1 else if (result.status == .yielded and executed == allowed) self.performance.budget_limited_steps +%= 1;
     if (result.status == .waiting) self.performance.waiting_steps +%= 1;
     const terminal = result.status == .halted or result.status == .cancelled or result.status == .runtime_error;
-    const frame_ready = frameReady(self, guest_now_ns, terminal);
+    const frame_ready = frameReady(
+        self,
+        guest_now_ns,
+        if (uses_nanoseconds) last_ns else 0,
+        result.status == .waiting,
+        terminal,
+    ) catch return runtime.StepResult.fail(display_error_out_of_memory).withOperations(executed);
     if (frame_ready) self.performance.frame_ready_steps +%= 1;
     return switch (result.status) {
         .ready, .yielded => runtime.StepResult.progress(frame_ready).withOperations(executed),
-        .waiting => runtime.StepResult.waitUntil(
-            if (result.wake_guest_ns == 0) guest_now_ns +| vm.input_poll_interval_ns else result.wake_guest_ns,
-            frame_ready,
-        ).withOperations(executed),
+        .waiting => runtime.StepResult.waitUntil(result.wake_guest_ns, frame_ready).withOperations(executed),
         .halted, .cancelled => runtime.StepResult.complete(self.machine.exit_code, frame_ready).withOperations(executed),
         .runtime_error => runtime.StepResult.fail(self.machine.exit_code).withOperations(executed),
     };
+}
+
+fn adaptiveClockChunk(executed: u32, elapsed_ns: u64) u32 {
+    if (elapsed_ns == 0) return slice_clock_max_instructions;
+    const projected = (@as(u128, executed) * slice_clock_target_ns) / elapsed_ns;
+    return @intCast(@min(
+        @as(u128, slice_clock_max_instructions),
+        @max(@as(u128, 64), projected),
+    ));
 }
 
 fn ticksForNanoseconds(frequency_hz: u32, nanoseconds: u64) u64 {
@@ -232,12 +313,35 @@ fn systemNanoseconds(context: *anyopaque) ?u64 {
     return system.monotonicNanoseconds();
 }
 
-fn frameReady(self: *Adapter, guest_now_ns: u64, terminal: bool) bool {
+fn frameReady(self: *Adapter, guest_now_ns: u64, host_now_ns: u64, waiting: bool, terminal: bool) vm.InitError!bool {
+    if (!self.machine.hasHostDisplay()) {
+        var prepared = try self.machine.prepareRequestedHostDisplay();
+        if (!prepared and !terminal and (waiting or guest_now_ns >= initial_display_delay_ns)) {
+            try self.machine.prepareHostDisplay();
+            prepared = true;
+        }
+        if (!prepared) return false;
+        self.performance.display_prepares +%= 1;
+    }
     const view = self.machine.graphicsView() orelse return false;
     const changed = self.presented_mode_revision != view.mode_revision or
         self.presented_content_revision != view.content_revision;
-    if (!changed or (!terminal and guest_now_ns < self.next_video_guest_ns)) return false;
-    self.next_video_guest_ns = guest_now_ns +| 33 * @import("std").time.ns_per_ms;
+    if (!changed) return false;
+    if (!terminal and guest_now_ns < self.next_video_guest_ns) {
+        self.performance.cadence_deferred_steps +%= 1;
+        return false;
+    }
+
+    const due_guest_ns = if (self.next_video_guest_ns == 0) guest_now_ns else self.next_video_guest_ns;
+    const backlog = (guest_now_ns -| due_guest_ns) / frame_interval_ns;
+    self.performance.missed_frame_deadlines +%= backlog;
+    self.performance.maximum_frame_backlog = @max(self.performance.maximum_frame_backlog, backlog);
+    self.pending_frame_due_guest_ns = due_guest_ns;
+    self.pending_frame_due_host_ns = if (host_now_ns == 0)
+        0
+    else
+        host_now_ns -| (guest_now_ns -| due_guest_ns);
+    self.next_video_guest_ns = due_guest_ns +| ((backlog + 1) *| frame_interval_ns);
     return true;
 }
 
@@ -245,9 +349,12 @@ fn reset(context: *anyopaque) i32 {
     const self: *Adapter = @ptrCast(@alignCast(context));
     self.machine.reset() catch return reset_error_out_of_memory;
     self.machine.prepareHostDisplay() catch return reset_error_out_of_memory;
+    self.performance.display_prepares +%= 1;
     self.presented_mode_revision = 0;
     self.presented_content_revision = 0;
     self.next_video_guest_ns = 0;
+    self.pending_frame_due_guest_ns = 0;
+    self.pending_frame_due_host_ns = 0;
     return 0;
 }
 

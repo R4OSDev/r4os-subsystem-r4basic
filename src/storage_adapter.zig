@@ -3,6 +3,15 @@ const vm = @import("vm.zig");
 
 pub const Adapter = struct {
     files: r4os.Files,
+    stats: Stats = .{},
+
+    pub const Stats = struct {
+        read_calls: u64 = 0,
+        read_bytes: u64 = 0,
+        write_calls: u64 = 0,
+        write_bytes: u64 = 0,
+        failures: u64 = 0,
+    };
 
     pub fn init(files: r4os.Files) Adapter {
         return .{ .files = files };
@@ -16,25 +25,51 @@ pub const Adapter = struct {
 
     fn read(context: ?*anyopaque, raw_path: []const u8, offset: u32, out: []u8) vm.FileReadResult {
         const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
-        var path = r4os.AbsoluteFilePath.parse(raw_path) catch return .{ .failure = .path_error };
+        self.stats.read_calls +%= 1;
+        var path = r4os.AbsoluteFilePath.parse(raw_path) catch {
+            self.stats.failures +%= 1;
+            return .{ .failure = .path_error };
+        };
         return switch (self.files.readAt(path.asZ(), offset, out)) {
-            .bytes => |count| .{ .bytes = count },
+            .bytes => |count| blk: {
+                self.stats.read_bytes +%= @intCast(count);
+                break :blk .{ .bytes = count };
+            },
             .end => .end,
-            .failure => |raw| .{ .failure = mapReadFailure(raw) },
+            .failure => |raw| blk: {
+                self.stats.failures +%= 1;
+                break :blk .{ .failure = mapReadFailure(raw) };
+            },
         };
     }
 
     fn write(context: ?*anyopaque, raw_path: []const u8, bytes: []const u8, append: bool) vm.FileWriteResult {
         const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
-        var path = r4os.AbsoluteFilePath.parse(raw_path) catch return .{ .failure = .path_error };
+        self.stats.write_calls +%= 1;
+        var path = r4os.AbsoluteFilePath.parse(raw_path) catch {
+            self.stats.failures +%= 1;
+            return .{ .failure = .path_error };
+        };
         const result = if (append)
             self.files.append(path.asZ(), bytes)
         else
             self.files.write(path.asZ(), bytes);
         return switch (result) {
-            .bytes => |count| if (count == bytes.len) .ok else .{ .failure = .io_error },
-            .end => .{ .failure = .io_error },
-            .failure => |raw| .{ .failure = mapWriteFailure(raw) },
+            .bytes => |count| if (count == bytes.len) blk: {
+                self.stats.write_bytes +%= @intCast(count);
+                break :blk .ok;
+            } else blk: {
+                self.stats.failures +%= 1;
+                break :blk .{ .failure = .io_error };
+            },
+            .end => blk: {
+                self.stats.failures +%= 1;
+                break :blk .{ .failure = .io_error };
+            },
+            .failure => |raw| blk: {
+                self.stats.failures +%= 1;
+                break :blk .{ .failure = mapWriteFailure(raw) };
+            },
         };
     }
 };

@@ -34,22 +34,24 @@ test "runnable BASIC consumes the bounded runtime budget without a fixed sleep" 
     try std.testing.expectEqual(core.vm.default_instruction_budget, adapter.performance.last_instructions);
     try std.testing.expect(adapter.performance.last_instructions >= 4 * 26);
     try std.testing.expectEqual(@as(u64, 1), adapter.performance.budget_limited_steps);
-    try std.testing.expectEqual(@as(u32, 17), clock.reads);
+    try std.testing.expectEqual(@as(u32, 18), clock.reads);
     try std.testing.expectEqual(clock.reads, adapter.performance.last_clock_reads);
-    try std.testing.expect(adapter.performance.maximum_clock_reads <= 17);
+    try std.testing.expect(adapter.performance.maximum_clock_reads <= 20);
+    try std.testing.expectEqual(core.runtime_adapter.slice_clock_max_instructions, adapter.performance.maximum_clock_chunk);
 
     const counters = machine.performanceStats();
     try std.testing.expectEqual(@as(u64, core.vm.default_instruction_budget), counters.instructions);
     try std.testing.expect(counters.group(.value) != 0);
     try std.testing.expect(counters.group(.arithmetic) != 0);
     try std.testing.expect(counters.group(.control) != 0);
-    try std.testing.expectEqual(@as(u64, 16), counters.cancel_callback_checks);
+    try std.testing.expectEqual(@as(u64, 17), counters.cancel_callback_checks);
     try std.testing.expectEqual(counters.cancel_callback_checks, cancel_probe.calls);
     try std.testing.expectEqual(@as(u64, core.vm.default_instruction_budget) + counters.cancel_callback_checks, counters.cancel_flag_checks);
     try std.testing.expectEqual(counters.instructions, counters.operation_group_lookups);
     try std.testing.expect(counters.instruction_metadata_reads < counters.instructions);
-    try std.testing.expectEqual(@as(u64, 1), counters.text_sync_checks);
-    try std.testing.expectEqual(@as(u64, 1), counters.text_sync_renders);
+    try std.testing.expectEqual(@as(u64, 0), counters.text_sync_checks);
+    try std.testing.expectEqual(@as(u64, 0), counters.text_sync_renders);
+    try std.testing.expect(!machine.hasHostDisplay());
 }
 
 test "timed BASIC slices stop at a clock boundary and remain resumable" {
@@ -73,11 +75,49 @@ test "timed BASIC slices stop at a clock boundary and remain resumable" {
     try std.testing.expect(adapter.performance.last_instructions < core.vm.default_instruction_budget);
     try std.testing.expect(adapter.performance.last_elapsed_ticks >= 8);
     try std.testing.expectEqual(clock.reads, adapter.performance.last_clock_reads);
-    try std.testing.expect(adapter.performance.last_clock_reads <= 17);
+    try std.testing.expect(adapter.performance.last_clock_reads <= 20);
 
     const before = machine.total_instructions;
     _ = adapter.driver().step(core.vm.default_instruction_budget, 1 * std.time.ns_per_ms);
     try std.testing.expect(machine.total_instructions > before);
+}
+
+test "first guest output prepares the display only after BASIC has executed" {
+    var program = try core.compiler.compile(std.testing.allocator, "lazy-display.bas", "PRINT \"READY\"\nEND\n");
+    defer program.deinit();
+    try std.testing.expect(program.ok());
+
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expect(!machine.hasHostDisplay());
+
+    var adapter = core.runtime_adapter.Adapter.init(&machine);
+    const result = adapter.driver().step(core.vm.default_instruction_budget, 0);
+    try std.testing.expectEqual(core.runtime_adapter.api.StepStatus.completed, result.status);
+    try std.testing.expect(result.operations != 0);
+    try std.testing.expect(result.frame_ready);
+    try std.testing.expect(machine.hasHostDisplay());
+    try std.testing.expectEqual(@as(u64, 1), adapter.performance.display_prepares);
+}
+
+test "console input uses an event-only wake deadline" {
+    var program = try core.compiler.compile(std.testing.allocator, "event-input.bas", "INPUT A%\nEND\n");
+    defer program.deinit();
+    try std.testing.expect(program.ok());
+
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    var adapter = core.runtime_adapter.Adapter.init(&machine);
+
+    const waiting = adapter.driver().step(core.vm.default_instruction_budget, 0);
+    try std.testing.expectEqual(core.runtime_adapter.api.StepStatus.waiting, waiting.status);
+    try std.testing.expectEqual(@as(u64, 0), waiting.wake_guest_ns);
+    try std.testing.expect(waiting.frame_ready);
+
+    try std.testing.expect(try machine.enqueueTextCodepoint('7'));
+    try std.testing.expect(try machine.enqueueKeyCode(13));
+    const completed = adapter.driver().step(core.vm.default_instruction_budget, 0);
+    try std.testing.expectEqual(core.runtime_adapter.api.StepStatus.completed, completed.status);
 }
 
 const FakeClock = struct {

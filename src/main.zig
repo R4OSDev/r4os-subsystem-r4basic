@@ -135,26 +135,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         });
     };
     defer machine.deinit();
-    machine.prepareHostDisplay() catch {
-        if (trace.baseline) return writeBaselineFailure(&files, trace, "display-init", 71);
-        return showStatus(allocator, sys, desk, draw, "R4BASIC - Anzeigefehler", &.{
-            "Der virtuelle BASIC-Bildschirm konnte nicht angelegt werden.",
-        });
-    };
     timeline.vm_end_ns = monotonicNow(sys);
-
-    const view = machine.graphicsView() orelse {
-        if (trace.baseline) return writeBaselineFailure(&files, trace, "display-view", error_host_video);
-        return error_host_video;
-    };
-    const surface = host_api.Surface.initIndexed8(view.pixels, view.palette, view.width, view.height) catch {
-        if (trace.baseline) return writeBaselineFailure(&files, trace, "display-surface", error_host_video);
-        return error_host_video;
-    };
-    window_host.video.setSurface(surface) catch {
-        if (trace.baseline) return writeBaselineFailure(&files, trace, "window-surface", error_host_video);
-        return error_host_video;
-    };
     var guest_adapter = runtime_adapter.Adapter.initSystem(&machine, &sys);
 
     var audio_sink_storage: runtime_api.R4AudioSink = undefined;
@@ -194,6 +175,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         &files,
         &window_host,
         &guest_adapter,
+        &storage,
         &timeline,
         trace,
         launch.guest_path,
@@ -206,12 +188,6 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     runtime_host.runtime = &runtime;
     runtime_host.applyNormalTitle();
     _ = window_host.setMinimumSize(320, 200);
-    const initial_present = RuntimeHost.present(&runtime_host);
-    if (initial_present < 0) {
-        if (trace.baseline) return writeBaselineFailure(&files, trace, "initial-present", initial_present);
-        return initial_present;
-    }
-    timeline.initial_frame_ns = monotonicNow(sys);
     runtime_host.trace_armed = true;
     timeline.runtime_begin_ns = monotonicNow(sys);
 
@@ -387,7 +363,6 @@ fn runPerformanceWorkload(allocator: std.mem.Allocator, sys: *const r4os.r4sys.C
         if (result.status != .progress) return null;
         if (result.wake_guest_ns != 0) no_fixed_sleep = false;
         slices +%= 1;
-        sys.taskYield();
     }
     const elapsed = @max(sys.ticks() -| start_tick, 1);
     const instructions = machine.total_instructions;
@@ -398,7 +373,7 @@ fn runPerformanceWorkload(allocator: std.mem.Allocator, sys: *const r4os.r4sys.C
     const ns_per_instruction = if (instructions == 0) @as(u64, 0) else adapter.performance.elapsed_ns / instructions;
     const common_ok = machine.status == .cancelled and no_fixed_sleep and ips != 0 and
         adapter.performance.maximum_instructions <= runtime_api.default_slice_budget and
-        adapter.performance.maximum_clock_reads <= 17 and ns_per_instruction != 0 and
+        adapter.performance.maximum_clock_reads <= 20 and ns_per_instruction != 0 and
         stats.cancel_callback_checks != 0 and stats.cancel_callback_checks < instructions and
         stats.instruction_metadata_reads != 0 and stats.instruction_metadata_reads < instructions and
         stats.text_sync_checks != 0 and stats.text_sync_checks < instructions and
@@ -733,6 +708,7 @@ const RuntimeHost = struct {
     files: *const r4os.Files,
     window: *host_api.Host,
     guest: *runtime_adapter.Adapter,
+    storage: *const storage_adapter.Adapter,
     timeline: *LaunchTimeline,
     trace: LaunchTrace,
     guest_path: []const u8,
@@ -747,12 +723,14 @@ const RuntimeHost = struct {
     trace_armed: bool = false,
     snapshot_pending: bool = false,
     snapshot_written: bool = false,
+    activity_sequence: u64 = 0,
 
     fn init(
         sys: r4os.r4sys.Context,
         files: *const r4os.Files,
         window: *host_api.Host,
         guest: *runtime_adapter.Adapter,
+        storage: *const storage_adapter.Adapter,
         timeline: *LaunchTimeline,
         trace: LaunchTrace,
         guest_path: []const u8,
@@ -767,6 +745,7 @@ const RuntimeHost = struct {
             .files = files,
             .window = window,
             .guest = guest,
+            .storage = storage,
             .timeline = timeline,
             .trace = trace,
             .guest_path = guest_path,
@@ -781,7 +760,13 @@ const RuntimeHost = struct {
     }
 
     fn driver(self: *RuntimeHost) runtime_api.HostDriver {
-        return .{ .context = self, .poll_fn = poll, .present_fn = present };
+        return .{
+            .context = self,
+            .poll_fn = poll,
+            .present_fn = present,
+            .wait_fn = if (self.window.desk.hasFn("desktop_activity_wait")) wait else null,
+            .should_close_fn = shouldClose,
+        };
     }
 
     fn applyNormalTitle(self: *RuntimeHost) void {
@@ -809,7 +794,6 @@ const RuntimeHost = struct {
             if (!self.snapshot_written and self.trace.baseline) return .{ .failure = error_trace_write };
             if (self.trace.baseline) return .{ .command = .close };
         }
-        if (self.sys.programShouldClose()) return .{ .command = .close };
         if (self.runtime) |runtime| if (runtime.audio.state == .degraded) self.applyDegradedTitle();
         const event = self.window.pollInput() orelse return .idle;
         return switch (event) {
@@ -818,22 +802,61 @@ const RuntimeHost = struct {
                 self.window.video.invalidateAll();
                 break :blk .present;
             },
+            .focus => |focus| blk: {
+                _ = self.guest.handleInput(event);
+                break :blk if (focus.focused) .present else .handled;
+            },
             else => if (self.guest.handleInput(event)) .handled else .handled,
         };
     }
 
+    fn shouldClose(context: *anyopaque) bool {
+        const self: *RuntimeHost = @ptrCast(@alignCast(context));
+        return self.sys.programShouldClose();
+    }
+
+    fn wait(context: *anyopaque, timeout_ticks: u64) i32 {
+        const self: *RuntimeHost = @ptrCast(@alignCast(context));
+        var sequence = self.activity_sequence;
+        const raw = self.window.desk.desktopActivityWait(self.activity_sequence, timeout_ticks, &sequence);
+        self.activity_sequence = sequence;
+        return raw;
+    }
+
     fn present(context: *anyopaque) i32 {
         const self: *RuntimeHost = @ptrCast(@alignCast(context));
-        _ = self.guest.syncVideo(&self.window.video) catch return error_host_video;
+        const started_ns = monotonicNow(self.sys);
+        _ = self.guest.syncVideo(&self.window.video) catch {
+            const ended_ns = monotonicNow(self.sys);
+            self.guest.notePresent(.failed, started_ns, ended_ns);
+            return error_host_video;
+        };
+        if (!self.guest.hasHostDisplay()) {
+            const ended_ns = monotonicNow(self.sys);
+            self.guest.notePresent(.unchanged, started_ns, ended_ns);
+            return runtime_api.host_present_unchanged;
+        }
         return switch (self.window.present()) {
-            .failure => |raw| raw,
-            .hidden, .unchanged => 0,
+            .failure => |raw| blk: {
+                self.guest.notePresent(.failed, started_ns, monotonicNow(self.sys));
+                break :blk raw;
+            },
+            .hidden => blk: {
+                self.guest.notePresent(.hidden, started_ns, monotonicNow(self.sys));
+                break :blk runtime_api.host_present_hidden;
+            },
+            .unchanged => blk: {
+                self.guest.notePresent(.unchanged, started_ns, monotonicNow(self.sys));
+                break :blk runtime_api.host_present_unchanged;
+            },
             .presented => blk: {
+                const ended_ns = monotonicNow(self.sys);
+                self.guest.notePresent(.presented, started_ns, ended_ns);
                 if (self.trace_armed and self.trace.active and self.guest.performance.instructions != 0 and self.timeline.first_frame_ns == 0) {
-                    self.timeline.first_frame_ns = monotonicNow(self.sys);
+                    self.timeline.first_frame_ns = ended_ns;
                     self.snapshot_pending = true;
                 }
-                break :blk 1;
+                break :blk runtime_api.host_presented;
             },
         };
     }
@@ -851,7 +874,7 @@ const RuntimeHost = struct {
         self.observeRuntime();
         const runtime = self.runtime orelse return false;
         const presenter = self.window.video.stats;
-        var report_storage: [8192]u8 = undefined;
+        var report_storage: [12 * 1024]u8 = undefined;
         var report_len: usize = 0;
         const vm_stats = self.guest.machine.performanceStats();
         const ns_per_instruction = if (self.guest.performance.instructions == 0)
@@ -939,31 +962,63 @@ const RuntimeHost = struct {
             self.compile_vm_memory.committed_after,
         }) catch return false;
         report_len += compiler_vm_line.len;
-        const runtime_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC runtime: requested_operations={d} executed_operations={d} slices={d} yields={d} sleeps={d} zero_progress_waits={d} present_attempts={d} presents={d} skipped_presents={d}\r\n", .{
+        const runtime_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC runtime: cycles={d} close_checks={d} host_polls={d} poll_budget_exhaustions={d} active_cycles={d} waiting_cycles={d} paused_cycles={d} requested_operations={d} executed_operations={d} slices={d} active_continues={d} yields={d} sleeps={d} event_waits={d} event_wakes={d} event_timeouts={d} wait_failures={d} zero_progress_waits={d} present_attempts={d} presents={d} unchanged_presents={d} hidden_presents={d} dropped_presents={d}\r\n", .{
+            runtime.stats.cycles,
+            runtime.stats.close_checks,
+            runtime.stats.host_polls,
+            runtime.stats.poll_budget_exhaustions,
+            runtime.stats.active_cycles,
+            runtime.stats.waiting_cycles,
+            runtime.stats.paused_cycles,
             runtime.stats.requested_operations,
             runtime.stats.executed_operations,
             runtime.stats.slices,
+            runtime.stats.active_continues,
             runtime.stats.yields,
             runtime.stats.sleeps,
+            runtime.stats.event_waits,
+            runtime.stats.event_wakes,
+            runtime.stats.event_timeouts,
+            runtime.stats.event_wait_failures,
             runtime.stats.zero_progress_waits,
             runtime.stats.present_attempts,
             runtime.stats.presents,
-            runtime.stats.skipped_presents,
+            runtime.stats.unchanged_presents,
+            runtime.stats.hidden_presents,
+            runtime.stats.dropped_presents,
         }) catch return false;
         report_len += runtime_line.len;
-        const adapter_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC adapter: steps={d} instructions={d} max_slice={d} budget_limited={d} time_limited={d} frame_ready={d} clock_reads={d} max_clock_reads={d} elapsed_ns={d} ns_per_instruction={d}\r\n", .{
+        const adapter_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC adapter: steps={d} instructions={d} max_slice={d} budget_limited={d} time_limited={d} frame_ready={d} display_prepares={d} clock_reads={d} max_clock_reads={d} max_clock_chunk={d} active_vm_ns={d} ns_per_instruction={d}\r\n", .{
             self.guest.performance.steps,
             self.guest.performance.instructions,
             self.guest.performance.maximum_instructions,
             self.guest.performance.budget_limited_steps,
             self.guest.performance.time_limited_steps,
             self.guest.performance.frame_ready_steps,
+            self.guest.performance.display_prepares,
             self.guest.performance.clock_reads,
             self.guest.performance.maximum_clock_reads,
+            self.guest.performance.maximum_clock_chunk,
             self.guest.performance.elapsed_ns,
             ns_per_instruction,
         }) catch return false;
         report_len += adapter_line.len;
+        const frame_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC frame-cycle: cadence_deferred={d} missed_deadlines={d} max_backlog={d} attempts={d} published={d} unchanged={d} hidden={d} dropped={d} failed={d} present_ns={d} max_present_ns={d} max_age_start_ns={d} max_age_end_ns={d}\r\n", .{
+            self.guest.performance.cadence_deferred_steps,
+            self.guest.performance.missed_frame_deadlines,
+            self.guest.performance.maximum_frame_backlog,
+            self.guest.performance.present_attempts,
+            self.guest.performance.presents,
+            self.guest.performance.unchanged_presents,
+            self.guest.performance.hidden_presents,
+            self.guest.performance.dropped_presents,
+            self.guest.performance.failed_presents,
+            self.guest.performance.present_elapsed_ns,
+            self.guest.performance.maximum_present_ns,
+            self.guest.performance.maximum_frame_age_start_ns,
+            self.guest.performance.maximum_frame_age_end_ns,
+        }) catch return false;
+        report_len += frame_line.len;
         const vm_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC vm: cancel_flag_checks={d} cancel_callback_checks={d} group_lookups={d} text_sync_checks={d} text_sync_renders={d} metadata_reads={d} cell_resolves={d} alias_hops={d} same_type_store_moves={d} conversions={d} integer_comparisons={d} floating_comparisons={d} string_comparisons={d} timer_calls={d} timer_waits={d} timer_max_wake_lateness_ns={d}\r\n", .{
             vm_stats.cancel_flag_checks,
             vm_stats.cancel_callback_checks,
@@ -1019,6 +1074,14 @@ const RuntimeHost = struct {
             vm_stats.maximum_open_files,
         }) catch return false;
         report_len += storage_line.len;
+        const file_host_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC file-host: reads={d} read_bytes={d} writes={d} write_bytes={d} failures={d}\r\n", .{
+            self.storage.stats.read_calls,
+            self.storage.stats.read_bytes,
+            self.storage.stats.write_calls,
+            self.storage.stats.write_bytes,
+            self.storage.stats.failures,
+        }) catch return false;
+        report_len += file_host_line.len;
         const presenter_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC presenter: published_frames={d} skipped_frames={d} full_frames={d} damage_frames={d} raster_blocks={d} sampled_pixels={d}\r\n", .{
             presenter.published_frames,
             presenter.skipped_frames,
@@ -1130,16 +1193,21 @@ fn showStatus(
     _ = window.setMinimumSize(320, 200);
     window.video.invalidateAll();
     var present_pending = true;
+    var activity_sequence: u64 = 0;
     while (!sys.programShouldClose()) {
-        if (window.pollInput()) |event| switch (event) {
-            .close => return 0,
-            .resize => {
-                window.video.invalidateAll();
-                present_pending = true;
-            },
-            .key_down => |key| if (key.code == 27) return 0,
-            else => {},
-        };
+        var event_count: u16 = 0;
+        while (event_count < runtime_api.default_max_input_events) : (event_count += 1) {
+            const event = window.pollInput() orelse break;
+            switch (event) {
+                .close => return 0,
+                .resize => {
+                    window.video.invalidateAll();
+                    present_pending = true;
+                },
+                .key_down => |key| if (key.code == 27) return 0,
+                else => {},
+            }
+        }
         if (present_pending) {
             switch (window.present()) {
                 .failure => |raw| return raw,
@@ -1147,7 +1215,15 @@ fn showStatus(
                 else => present_pending = false,
             }
         }
-        sys.sleepTicks(1);
+        if (event_count == runtime_api.default_max_input_events) continue;
+        if (desk.hasFn("desktop_activity_wait")) {
+            var sequence = activity_sequence;
+            const raw = desk.desktopActivityWait(activity_sequence, r4os.abi.io_wait_forever, &sequence);
+            activity_sequence = sequence;
+            if (raw < 0) return raw;
+        } else {
+            sys.sleepTicks(1);
+        }
     }
     return 0;
 }

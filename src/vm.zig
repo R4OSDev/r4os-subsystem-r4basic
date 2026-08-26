@@ -6,8 +6,8 @@ const graphics_screen = @import("graphics_screen.zig");
 const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "1.7.0";
-pub const default_instruction_budget: u32 = 4096;
+pub const contract_version = "1.8.0";
+pub const default_instruction_budget: u32 = 262_144;
 pub const timer_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
 pub const maximum_call_depth: usize = 256;
@@ -19,7 +19,6 @@ pub const maximum_keyboard_bytes: usize = 4096;
 pub const maximum_input_line_bytes: usize = 255;
 pub const maximum_sequential_file_bytes: usize = 4 * 1024 * 1024;
 pub const maximum_file_number: usize = 255;
-pub const input_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const random_mask: u32 = 0x00FF_FFFF;
 pub const default_random_seed: u32 = 0x0050_0000;
 pub const numeric_format_buffer_bytes: usize = 128;
@@ -580,6 +579,7 @@ pub const Vm = struct {
     text: text_screen.Screen = .{},
     graphics: graphics_screen.Screen = .{},
     screen_mode: i32 = 0,
+    host_display_requested: bool = false,
     keyboard: std.ArrayList(u8) = .empty,
     keyboard_head: usize = 0,
     keyboard_generation: u64 = 0,
@@ -706,6 +706,7 @@ pub const Vm = struct {
     }
 
     pub fn graphicsView(self: *Vm) ?graphics_screen.View {
+        if (self.graphics.view() == null) return null;
         self.syncTextToGraphics();
         return self.graphics.view();
     }
@@ -718,6 +719,18 @@ pub const Vm = struct {
             };
         }
         self.syncTextToGraphics();
+        self.host_display_requested = false;
+    }
+
+    pub fn prepareRequestedHostDisplay(self: *Vm) InitError!bool {
+        if (self.graphics.view() != null) return true;
+        if (!self.host_display_requested) return false;
+        try self.prepareHostDisplay();
+        return true;
+    }
+
+    pub fn hasHostDisplay(self: *const Vm) bool {
+        return self.graphics.pixels != null;
     }
 
     pub fn takeGraphicsDamage(self: *Vm) ?graphics_screen.Rect {
@@ -800,6 +813,7 @@ pub const Vm = struct {
         self.text.reset();
         self.graphics.reset(self.allocator);
         self.screen_mode = 0;
+        self.host_display_requested = false;
         self.keyboard.clearRetainingCapacity();
         self.keyboard_head = 0;
         self.keyboard_generation = 0;
@@ -877,7 +891,10 @@ pub const Vm = struct {
                     runtimeCode(fault);
                 if (fault != error.Rethrow and self.trapError(code, instruction_index)) {
                     const group = self.recordOperation(instruction.op);
-                    if (group == .text) self.syncTextToGraphics();
+                    if (group == .text) {
+                        self.host_display_requested = true;
+                        self.syncTextToGraphics();
+                    }
                     executed += 1;
                     self.total_instructions += 1;
                     continue;
@@ -890,7 +907,10 @@ pub const Vm = struct {
                 return .{ .status = self.status, .instructions = executed };
             };
             const group = self.recordOperation(instruction.op);
-            if (group == .text) self.syncTextToGraphics();
+            if (group == .text) {
+                self.host_display_requested = true;
+                self.syncTextToGraphics();
+            }
             executed += 1;
             self.total_instructions += 1;
             if (self.status == .halted) return .{ .status = .halted, .instructions = executed };
@@ -1606,6 +1626,7 @@ pub const Vm = struct {
         };
         self.text.configure(if (mode == 1) 40 else 80) catch return error.IllegalFunctionCall;
         self.screen_mode = mode;
+        self.host_display_requested = false;
     }
 
     fn graphicsPalette(self: *Vm) ExecutionError!void {
@@ -1724,6 +1745,7 @@ pub const Vm = struct {
 
     fn syncTextToGraphics(self: *Vm) void {
         self.text_sync_checks +%= 1;
+        if (self.graphics.view() == null) return;
         if (self.text.takeDirty()) |dirty| {
             self.text_sync_renders +%= 1;
             self.graphics.renderText(&self.text, dirty);
@@ -1901,7 +1923,7 @@ pub const Vm = struct {
             error.TypeMismatch, error.Overflow, error.IllegalFunctionCall => {
                 self.text.write("Redo from start\r\n? ");
                 self.input_line.clearRetainingCapacity();
-                self.wait_wake_ns = self.guest_now_ns +| input_poll_interval_ns;
+                self.wait_wake_ns = if (self.queuedInputBytes() == 0) 0 else self.guest_now_ns;
                 return error.WouldBlock;
             },
             else => return fault,
@@ -1934,7 +1956,7 @@ pub const Vm = struct {
                 else => {},
             }
         }
-        self.wait_wake_ns = self.guest_now_ns +| input_poll_interval_ns;
+        self.wait_wake_ns = 0;
         return false;
     }
 
@@ -2077,13 +2099,13 @@ pub const Vm = struct {
         const seed = std.fmt.parseFloat(f64, trimmed) catch {
             self.text.write("Redo from start\r\n? ");
             self.input_line.clearRetainingCapacity();
-            self.wait_wake_ns = self.guest_now_ns +| input_poll_interval_ns;
+            self.wait_wake_ns = if (self.queuedInputBytes() == 0) 0 else self.guest_now_ns;
             return error.WouldBlock;
         };
         if (!std.math.isFinite(seed) or seed < -32768 or seed > 32767) {
             self.text.write("Redo from start\r\n? ");
             self.input_line.clearRetainingCapacity();
-            self.wait_wake_ns = self.guest_now_ns +| input_poll_interval_ns;
+            self.wait_wake_ns = if (self.queuedInputBytes() == 0) 0 else self.guest_now_ns;
             return error.WouldBlock;
         }
         self.seedRandom(seed);
@@ -2129,7 +2151,7 @@ pub const Vm = struct {
             self.sleep_deadline_ns = 0;
             return;
         }
-        self.wait_wake_ns = @min(self.sleep_deadline_ns, self.guest_now_ns +| input_poll_interval_ns);
+        self.wait_wake_ns = if (self.sleep_deadline_ns == std.math.maxInt(u64)) 0 else self.sleep_deadline_ns;
         return error.WouldBlock;
     }
 
