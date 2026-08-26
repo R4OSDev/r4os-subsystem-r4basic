@@ -6,7 +6,7 @@ const graphics_screen = @import("graphics_screen.zig");
 const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "1.12.0";
+pub const contract_version = "2.0.0";
 pub const default_instruction_budget: u32 = 262_144;
 pub const timer_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
@@ -34,8 +34,6 @@ pub const MathOperation = enum(u8) {
 
 pub const HostMathError = error{MathFault};
 pub const ScreenModeError = error{ModeUnavailable};
-pub const DeferredStatementError = error{Unsupported};
-
 pub const FileHostError = enum(u8) {
     unavailable,
     not_found,
@@ -62,7 +60,6 @@ pub const HostServices = struct {
     context: ?*anyopaque = null,
     math: *const fn (?*anyopaque, MathOperation, f64, f64) HostMathError!f64 = defaultMath,
     screen_mode: *const fn (?*anyopaque, i32) ScreenModeError!void = acceptScreenMode,
-    deferred_statement: *const fn (?*anyopaque, frontend.Keyword) DeferredStatementError!void = rejectDeferredStatement,
     should_cancel: *const fn (?*anyopaque) bool = neverCancel,
     file_context: ?*anyopaque = null,
     file_read: *const fn (?*anyopaque, []const u8, u32, []u8) FileReadResult = unavailableFileRead,
@@ -1386,8 +1383,6 @@ pub const Vm = struct {
             .file_close,
             .audio_beep,
             .audio_play,
-            .deferred_statement,
-            .deferred_builtin,
             .call_builtin,
             => .host,
         };
@@ -1452,11 +1447,6 @@ pub const Vm = struct {
             .file_close => try self.closeFiles(instruction.a),
             .audio_beep => try self.audioBeep(instruction_index),
             .audio_play => try self.audioPlay(instruction_index),
-            .deferred_statement => self.host.deferred_statement(
-                self.host.context,
-                @enumFromInt(@as(u8, @intCast(instruction.a))),
-            ) catch return error.HostFailure,
-            .deferred_builtin => try self.deferredBuiltin(instruction.b),
             .convert => try self.convertTop(bytecode.decodeValueType(instruction.a)),
             .negate => try self.unaryNegate(bytecode.decodeValueType(instruction.a)),
             .logical_not => try self.unaryLogicalNot(),
@@ -2744,16 +2734,6 @@ pub const Vm = struct {
         return std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{ base, if (needs_separator) "\\" else "", raw_path });
     }
 
-    fn deferredBuiltin(self: *Vm, argument_count: u32) ExecutionError!void {
-        if (argument_count > self.stack.items.len) return error.StackUnderflow;
-        var remaining = argument_count;
-        while (remaining != 0) : (remaining -= 1) {
-            var argument = try self.popValue();
-            argument.deinit(self.allocator);
-        }
-        return error.HostFailure;
-    }
-
     fn convertTop(self: *Vm, target: bytecode.ValueType) ExecutionError!void {
         var input = try self.popValue();
         defer input.deinit(self.allocator);
@@ -3631,10 +3611,6 @@ fn defaultMath(_: ?*anyopaque, operation: MathOperation, first: f64, second: f64
 }
 
 fn acceptScreenMode(_: ?*anyopaque, _: i32) ScreenModeError!void {}
-
-fn rejectDeferredStatement(_: ?*anyopaque, _: frontend.Keyword) DeferredStatementError!void {
-    return error.Unsupported;
-}
 
 fn neverCancel(_: ?*anyopaque) bool {
     return false;

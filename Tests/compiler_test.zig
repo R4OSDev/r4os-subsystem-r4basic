@@ -107,6 +107,58 @@ test "core compiler emits a bound instruction program" {
     try std.testing.expectEqual(@as(usize, 1), program.globals.len);
 }
 
+test "R4BASIC v2 conformance catalog is complete stable and machine readable" {
+    try std.testing.expectEqual(core.conformance.part1_count, core.conformance.part1_targets.len);
+    try std.testing.expectEqual(core.conformance.part2_count, core.conformance.part2_targets.len);
+    try std.testing.expectEqual(core.conformance.metacommand_count, core.conformance.metacommand_targets.len);
+    try std.testing.expectEqual(core.conformance.runtime_error_count, core.conformance.runtime_error_targets.len);
+
+    var identifiers = std.StringHashMap(void).init(std.testing.allocator);
+    defer identifiers.deinit();
+    for (core.conformance.part1_targets) |target| try validateCatalogTarget(&identifiers, target);
+    for (core.conformance.metacommand_targets) |target| try validateCatalogTarget(&identifiers, target);
+    for (core.conformance.part2_targets, 1..) |target, number| {
+        try validateCatalogTarget(&identifiers, target);
+        var expected_storage: [16]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&expected_storage, "QB45-P2-{d:0>3}", .{number});
+        try std.testing.expectEqualStrings(expected, target.id);
+    }
+
+    var previous_error: u8 = 0;
+    for (core.conformance.runtime_error_targets) |target| {
+        try std.testing.expect(target.number > previous_error);
+        previous_error = target.number;
+        try std.testing.expect(target.name.len != 0);
+        try std.testing.expect(!identifiers.contains(target.id));
+        try identifiers.put(target.id, {});
+        var expected_storage: [16]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&expected_storage, "QB45-ERR-{d:0>3}", .{target.number});
+        try std.testing.expectEqualStrings(expected, target.id);
+    }
+
+    try std.testing.expectEqual(
+        core.conformance.part1_count + core.conformance.part2_count +
+            core.conformance.metacommand_count + core.conformance.runtime_error_count,
+        identifiers.count(),
+    );
+}
+
+test "unimplemented statements stop at catalog-addressed compile diagnostics" {
+    const cases = [_]struct { source: []const u8, id: []const u8 }{
+        .{ .source = "ERROR 5\nEND\n", .id = "QB45-P2-050" },
+        .{ .source = "SHARED Value\nEND\n", .id = "QB45-P2-153" },
+        .{ .source = "STATIC Value\nEND\n", .id = "QB45-P2-161" },
+    };
+    for (cases) |case| {
+        var program = try core.compiler.compile(std.testing.allocator, "not-yet.bas", case.source);
+        defer program.deinit();
+        try std.testing.expect(!program.ok());
+        try std.testing.expect(program.diagnostics.len != 0);
+        try std.testing.expectEqual(core.bytecode.DiagnosticCode.unsupported_core_feature, program.diagnostics[0].code);
+        try std.testing.expectEqualStrings(case.id, program.diagnostics[0].catalog_id);
+    }
+}
+
 test "compiler indices scale across symbols records procedures and label fixups" {
     const allocator = std.testing.allocator;
     var source: std.ArrayList(u8) = .empty;
@@ -1952,6 +2004,18 @@ fn runFileIoCooperatively(machine: *core.vm.Vm, maximum_cycles: usize) !u64 {
         }
     }
     return error.FileIoDidNotFinish;
+}
+
+fn validateCatalogTarget(
+    identifiers: *std.StringHashMap(void),
+    target: core.conformance.Target,
+) !void {
+    try std.testing.expect(target.id.len != 0);
+    try std.testing.expect(target.name.len != 0);
+    try std.testing.expect(target.semantics.len != 0);
+    try std.testing.expect(target.delivery.len != 0);
+    try std.testing.expect(!identifiers.contains(target.id));
+    try identifiers.put(target.id, {});
 }
 
 fn feedInput(machine: *core.vm.Vm, bytes: []const u8) !void {

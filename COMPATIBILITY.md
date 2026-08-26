@@ -1,19 +1,30 @@
-﻿# R4BASIC v1 compatibility contract
+﻿# R4BASIC v2 QuickBASIC 4.5 target contract
 
-Contract version: `1.0.0`
+Contract version: `2.0.0`
 
-This document freezes the source-language surface accepted by the first
-R4BASIC frontend. It is a deliberately bounded QuickBASIC 4.5 subset selected
-for real compatibility work, not a Tiny BASIC dialect and not a claim of full
-QuickBASIC implementation.
+R4BASIC v2 targets the complete Microsoft QuickBASIC 4.5 interpreter language
+and runtime. The target is not limited by GORILLA.BAS or by the historical v1
+subset. IDE, editor, native compiler, linker, and librarian behavior remain
+separate products; source-language and runtime compatibility do not.
 
-Parsing a construct means that its syntax, source span, nesting, and argument
-shape are recognized. It does not by itself claim executable semantics. The
-separate `VM-CONTRACT.md` freezes the scalar, aggregate, DATA, error-flow,
-control-flow, procedure, text, input, time, random, and sequential-file
-subset that is already bound and executed. Indexed graphics, Music Macro
-Language, PCM audio, and the productive window host are executable in VM
-contract 1.4.
+`src/conformance.zig` is the machine-readable contract index. It assigns
+stable IDs to seven Part-1 areas (`QB45-P1-*`), all 193 Part-2 reference
+entries (`QB45-P2-001` through `QB45-P2-193`), `$INCLUDE`, `$STATIC`, and
+`$DYNAMIC` (`QB45-META-*`), and all 43 Appendix-B runtime errors
+(`QB45-ERR-*`). Every Part-1, Part-2, and metacommand target records lexer,
+syntax, binder, VM, error, coverage, ownership, and delivery status.
+
+The remainder of this document preserves the already implemented v1 baseline
+that v2 must continue to accept while the catalog is completed. It is a
+minimum compatibility floor, not the v2 scope ceiling.
+
+The lexer performs lexical analysis only. The compiler Builder is the single
+parser, binder, and emitter; syntax can no longer pass a second non-binding
+grammar. A successful compilation therefore has no Deferred statement or
+Deferred built-in opcode. Unimplemented catalog targets fail compilation with
+`unsupported_core_feature` and, where the keyword is already uniquely known,
+their stable catalog ID. Later 0.70.X packages replace those diagnostics with
+the specified semantics.
 
 ## Authority and source identity
 
@@ -150,10 +161,12 @@ the typed-program phase.
   codes. Invalid bytes or malformed grammar never disappear as comments or
   successful empty input.
 
-## Explicit v1 non-goals
+## Historical v1 exclusions, now scheduled v2 targets
 
-- Full QuickBASIC 4.5, BASICA/GW-BASIC line-number compatibility, QBX
-  extensions, a native-code compiler, IDE, debugger, or source editor.
+- Full QuickBASIC 4.5 and BASICA/GW-BASIC line-number compatibility were not
+  v1 promises. They are v2 implementation targets where the QuickBASIC 4.5
+  references require them. QBX extensions, a native-code compiler, IDE,
+  debugger, and source editor remain separate products.
 - `COMMON`, `CHAIN`, `RUN`, `SHELL`, `SYSTEM`, printer/COM/device I/O,
   random/binary file records, directory mutation, and unrestricted hardware
   access.
@@ -162,6 +175,10 @@ the typed-program phase.
   access.
 - Runtime correctness merely from parse or bind success. Only the subset in
   `VM-CONTRACT.md` has executable semantics.
+
+These bullets describe the preserved v1 boundary only and do not exclude the
+items from v2. Their exact current state and owning 0.70.X package are recorded
+in `src/conformance.zig`.
 
 Changing a promise in this document or `VM-CONTRACT.md` requires a
 contract-version decision, an original positive fixture, an original

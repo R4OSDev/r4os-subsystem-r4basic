@@ -4,7 +4,7 @@ R4BASIC is the QBasic-compatible subsystem host for R4OS. It is a normal GUI
 R4X module with the subsystem identity `r4os.basic` and the guest format
 `basic.qbasic-source`.
 
-The installed R4X is the productive R4BASIC v1 host. Explorer passes one
+The installed R4X is the productive R4BASIC v2 foundation. Explorer passes one
 absolute `.BAS` path through `R4SUBSYS1`; R4BASIC loads it through the storage
 facade, compiles it once, and runs an isolated VM in a movable, resizable, and
 maximizable window. `SCREEN 0`, `SCREEN 1`, and `SCREEN 9` are presented as
@@ -27,7 +27,7 @@ input, or graphics.
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.15`
+- Module version: `1.2.16`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -60,7 +60,7 @@ this repository and is read directly from the ignored workspace injection
 tree. The normal test step uses the permanent general BAS fixtures under
 `Tests/Fixtures`, including the standalone audio contract.
 
-R4BASIC 1.2.15 allocates the exact source size once, fills that buffer with
+R4BASIC 1.2.16 allocates the exact source size once, fills that buffer with
 range reads up to the 256 KiB source limit, and transfers the same allocation
 to the compiler. The launch report records metadata calls, range-read calls,
 and bytes so the productive GORILLA acceptance can require one source load
@@ -77,7 +77,7 @@ bytes. Reset and teardown quiesce a non-cancellable request before releasing
 its VM-owned buffer. The `R4BASIC file-io` report makes submissions, polls,
 path work, transfer maxima, compaction, and buffer peaks measurable.
 
-R4BASIC 1.2.15 uses a shared 262,144-instruction ceiling with adaptive bounded
+R4BASIC 1.2.16 uses a shared 262,144-instruction ceiling with adaptive bounded
 clock blocks and an 8-ms production time boundary. Active work requests a
 scheduler yield at most once per 8-ms interval; input-only waits, pause and
 static status windows block on the Desktop activity sequence. The first guest
@@ -91,7 +91,7 @@ separate QEMU-readable numeric, 4-KB assignment, LEN, UCASE$, call and array
 markers plus an exact summary. The productive artifact remains the canonical
 GUI subsystem host and uses its measured module-local `OPTIMIZE=speed` profile.
 
-The 1.2.15 input profile emits each printable key exactly once as text,
+The 1.2.16 input profile emits each printable key exactly once as text,
 retains Enter and Backspace as keys, and filters pointer traffic before guest
 coordinate mapping. Stable sequence/tick metadata follows accepted bytes to
 consumption; bounded counters distinguish focus, invalid-code, unsupported,
@@ -112,12 +112,12 @@ checkout.
 
 ## Compatibility contract
 
-`COMPATIBILITY.md` is the versioned R4BASIC v1 source-language contract. It
-states exactly what the frontend accepts and what remains outside that
-surface. `VM-CONTRACT.md` separately freezes the subset that is already
-bound and executed, including value semantics, bytecode, diagnostics,
-instruction budgets, and instance isolation. A construct does not become an
-execution promise merely because its syntax parses.
+`COMPATIBILITY.md` is the versioned R4BASIC v2 target contract.
+`src/conformance.zig` assigns stable, test-validated IDs and layer status to
+Part 1, all 193 Part-2 entries, three metacommands, and 43 runtime errors.
+The compiler Builder is the sole parser and binder; unimplemented targets are
+compile diagnostics and never Deferred runtime opcodes. `VM-CONTRACT.md`
+freezes the executable foundation, budgets, isolation, and lifecycle rules.
 
 Detailed German technical documentation is in `DOCUMENTATION.de.txt`.
 Reference and implementation provenance is recorded in `PROVENANCE.txt`.

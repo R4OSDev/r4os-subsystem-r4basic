@@ -1,10 +1,11 @@
-DECLARE SUB Render (BYREF Position AS ANY, Values() AS LONG)
-DECLARE FUNCTION Score# (BYVAL Text$)
-
 TYPE XYPosition
     X AS INTEGER
     Y AS INTEGER
 END TYPE
+
+DECLARE SUB Render (BYREF Position AS XYPosition, Values() AS LONG)
+DECLARE SUB AcceptAny (Values() AS ANY)
+DECLARE FUNCTION Score# (BYVAL Text$)
 
 CONST TRUE = -1, FALSE = 0
 DIM SHARED Points(0 TO 3) AS XYPosition, Flags(1 TO 2) AS INTEGER
@@ -23,7 +24,7 @@ SUB Render (Position AS XYPosition, Values() AS LONG) STATIC
     EXIT SUB
 END SUB
 
-FUNCTION Score# (Text$)
+FUNCTION Score# (BYVAL Text$)
     Score# = VAL(Text$)
 END FUNCTION
 

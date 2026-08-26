@@ -1,6 +1,7 @@
 const std = @import("std");
 const frontend = @import("frontend.zig");
 const bytecode = @import("bytecode.zig");
+const conformance = @import("conformance.zig");
 const values = @import("value.zig");
 
 pub const maximum_instructions: usize = 262_144;
@@ -1837,8 +1838,12 @@ const Builder = struct {
     fn parseDeferredStatement(self: *Builder) !bool {
         const statement = self.advance();
         while (!self.atBoundary() and !self.atKeyword(.else_)) _ = self.advance();
-        _ = try self.emit(.deferred_statement, @intFromEnum(statement.keyword), 0, statement.span);
-        return true;
+        try self.addCatalogDiagnostic(
+            .unsupported_core_feature,
+            statement.span,
+            conformance.deferredStatementId(statement.keyword),
+        );
+        return false;
     }
 
     fn parseDeclare(self: *Builder) !bool {
@@ -3154,6 +3159,25 @@ const Builder = struct {
             .code = code,
             .span = span,
             .file_name = self.file_name,
+        });
+    }
+
+    fn addCatalogDiagnostic(
+        self: *Builder,
+        code: bytecode.DiagnosticCode,
+        span: frontend.Span,
+        catalog_id: []const u8,
+    ) !void {
+        self.diagnostics_total +|= 1;
+        if (self.diagnostics.items.len >= maximum_stored_diagnostics) {
+            self.diagnostics_truncated = true;
+            return;
+        }
+        try self.diagnostics.append(self.allocator, .{
+            .code = code,
+            .span = span,
+            .file_name = self.file_name,
+            .catalog_id = catalog_id,
         });
     }
 

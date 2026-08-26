@@ -1294,11 +1294,19 @@ fn showCompilerDiagnostics(
     views[1] = program.file_name;
     var count: usize = 2;
     for (program.diagnostics[0..@min(program.diagnostics.len, lines.len)]) |diagnostic| {
-        views[count] = std.fmt.bufPrint(lines[count - 2][0..], "{d}:{d}: {s}", .{
-            diagnostic.span.line,
-            diagnostic.span.column,
-            diagnostic.message(),
-        }) catch "Diagnose konnte nicht formatiert werden";
+        views[count] = if (diagnostic.catalog_id.len == 0)
+            std.fmt.bufPrint(lines[count - 2][0..], "{d}:{d}: {s}", .{
+                diagnostic.span.line,
+                diagnostic.span.column,
+                diagnostic.message(),
+            }) catch "Diagnose konnte nicht formatiert werden"
+        else
+            std.fmt.bufPrint(lines[count - 2][0..], "{d}:{d}: [{s}] {s}", .{
+                diagnostic.span.line,
+                diagnostic.span.column,
+                diagnostic.catalog_id,
+                diagnostic.message(),
+            }) catch "Katalogdiagnose konnte nicht formatiert werden";
         count += 1;
     }
     if (program.diagnostics_truncated) {

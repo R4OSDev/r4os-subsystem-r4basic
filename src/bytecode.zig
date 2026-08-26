@@ -1,7 +1,7 @@
 const std = @import("std");
 const frontend = @import("frontend.zig");
 
-pub const contract_version = "1.5.0";
+pub const contract_version = "2.0.0";
 pub const invalid_index: u32 = std.math.maxInt(u32);
 pub const unknown_dimensions: u8 = std.math.maxInt(u8);
 
@@ -189,8 +189,6 @@ pub const OpCode = enum(u8) {
     file_close,
     audio_beep,
     audio_play,
-    deferred_statement,
-    deferred_builtin,
     convert,
     negate,
     logical_not,
@@ -294,6 +292,7 @@ pub const Diagnostic = struct {
     span: frontend.Span,
     file_name: []const u8,
     frontend_code: ?frontend.DiagnosticCode = null,
+    catalog_id: []const u8 = "",
 
     pub fn message(self: Diagnostic) []const u8 {
         return switch (self.code) {
@@ -302,7 +301,7 @@ pub const Diagnostic = struct {
             .expected_identifier => "expected BASIC identifier",
             .expected_expression => "expected BASIC expression",
             .unexpected_token => "unexpected token in core-language compiler",
-            .unsupported_core_feature => "feature belongs to a later R4BASIC layer",
+            .unsupported_core_feature => "QuickBASIC target is not implemented yet",
             .duplicate_symbol => "symbol is already defined in this scope",
             .symbol_kind_conflict => "name conflicts with another symbol kind",
             .constant_assignment => "constant cannot be assigned",

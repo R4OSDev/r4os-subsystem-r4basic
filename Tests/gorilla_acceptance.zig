@@ -11,10 +11,7 @@ const canonical_sha256 = [_]u8{
     0xA8, 0x35, 0xA7, 0x43, 0xE2, 0x46, 0x99, 0xF7,
 };
 
-var tokens: [frontend.recommended_token_capacity]frontend.Token = undefined;
-var diagnostics: [frontend.recommended_diagnostic_capacity]frontend.Diagnostic = undefined;
-
-test "canonical local GORILLA.BAS tokenizes and parses unchanged" {
+test "canonical local GORILLA.BAS lexes parses and binds unchanged" {
     const allocator = std.testing.allocator;
     const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, canonical_path, allocator, .limited(frontend.maximum_source_bytes));
     defer allocator.free(source);
@@ -22,20 +19,6 @@ test "canonical local GORILLA.BAS tokenizes and parses unchanged" {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
     try std.testing.expectEqualSlices(u8, canonical_sha256[0..], digest[0..]);
-
-    const result = frontend.analyzeNamed(canonical_path, source, tokens[0..], diagnostics[0..]);
-    if (!result.ok()) {
-        for (diagnostics[0..result.diagnostic_count]) |diagnostic| {
-            std.debug.print("{s}:{d}:{d}: {s}: {s}\n", .{
-                diagnostic.file_name,
-                diagnostic.span.line,
-                diagnostic.span.column,
-                @tagName(diagnostic.code),
-                diagnostic.span.bytes(source),
-            });
-        }
-    }
-    try std.testing.expect(result.ok());
 
     var program = try core.compiler.compile(allocator, canonical_path, source);
     defer program.deinit();
@@ -94,12 +77,15 @@ test "canonical local GORILLA.BAS completes a deterministic round with victory" 
     var stage: Stage = .intro;
     var delay_slices: u8 = 0;
     var guest_ns: u64 = 0;
+    var audio_scratch: [core.audio.frame_bytes * 480]u8 = undefined;
+    var accepted_audio_frames: u64 = 0;
     var completed_round = false;
 
     run_loop: for (0..80_000) |_| {
         machine.setGuestTime(guest_ns);
         const slice = machine.runSlice(256);
         guest_ns +|= 10 * std.time.ns_per_ms;
+        accepted_audio_frames +|= try acceptAudioTransport(&machine, &audio_scratch);
 
         if (slice.status == .runtime_error) {
             std.debug.print("unexpected GORILLA VM error in {s}: {s}:{d}:{d} {s}\n", .{
@@ -204,6 +190,12 @@ test "canonical local GORILLA.BAS completes a deterministic round with victory" 
         }
     }
 
+    for (0..4096) |_| {
+        const frames = try acceptAudioTransport(&machine, &audio_scratch);
+        accepted_audio_frames +|= frames;
+        if (frames == 0) break;
+    }
+
     if (!completed_round) {
         std.debug.print("GORILLA guard end: status={s} instructions={d} audio_calls={d}\n", .{ @tagName(machine.status), machine.total_instructions, machine.audioStats().play_statements + machine.audioStats().beep_statements });
         var debug_row: [core.text_screen.columns]u8 = undefined;
@@ -219,7 +211,11 @@ test "canonical local GORILLA.BAS completes a deterministic round with victory" 
     const graphics = machine.graphicsView() orelse return error.MissingGorillaGraphics;
     try std.testing.expectEqual(@as(u32, 640), graphics.width);
     try std.testing.expectEqual(@as(u32, 350), graphics.height);
-    try std.testing.expectEqual(@as(u64, 0xc2b26adb181863cc), std.hash.Wyhash.hash(0, graphics.pixels));
+    // This is the first golden captured after the production audio transport
+    // fences were honored. The score, palette, command counts and named state
+    // below make the raster identity a semantic round result, not a timing
+    // snapshot from the formerly stalled test harness.
+    try std.testing.expectEqual(@as(u64, 0x2f1201c433baac00), std.hash.Wyhash.hash(0, graphics.pixels));
     try std.testing.expectEqual(@as(u32, 0x000000aa), graphics.palette[0]);
     try std.testing.expectEqual(@as(u32, 0x00ffaa55), graphics.palette[1]);
     try std.testing.expectEqual(@as(u32, 0x00ff0055), graphics.palette[2]);
@@ -228,6 +224,19 @@ test "canonical local GORILLA.BAS completes a deterministic round with victory" 
     try std.testing.expect(scoreWasUpdated(&machine));
     try std.testing.expectEqual(@as(u32, 12), machine.audioStats().play_statements);
     try std.testing.expectEqual(@as(u32, 2), machine.audioStats().beep_statements);
+    try std.testing.expect(accepted_audio_frames != 0);
+    try std.testing.expectEqual(machine.audioStats().scheduled_frames, machine.audioStats().resolved_frames);
+}
+
+fn acceptAudioTransport(machine: *core.vm.Vm, scratch: []u8) !u64 {
+    const count = machine.renderAudio(scratch);
+    try std.testing.expect(count >= 0);
+    if (count == 0) return 0;
+    const bytes: usize = @intCast(count);
+    try std.testing.expectEqual(@as(usize, 0), bytes % core.audio.frame_bytes);
+    const frames = bytes / core.audio.frame_bytes;
+    _ = machine.noteAudioProgress(frames, 0, 0, false);
+    return frames;
 }
 
 fn screenContains(machine: *const core.vm.Vm, needle: []const u8) bool {

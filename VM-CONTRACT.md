@@ -1,17 +1,18 @@
-﻿# R4BASIC v1 core VM contract
+﻿# R4BASIC v2 execution foundation
 
-Contract version: `1.12.0`
+Contract version: `2.0.0`
 
-This document freezes the executable R4BASIC language layers. The broader
-source syntax accepted by the frontend remains defined in
-`COMPATIBILITY.md`; parse success alone does not extend this VM contract.
+This document freezes the executable R4BASIC foundation and its non-regression
+invariants while the complete v2 target in `COMPATIBILITY.md` and
+`src/conformance.zig` is implemented.
 
 ## Compilation model
 
 - The caller supplies the source bytes and file name. The compiler owns
   immutable copies in the resulting program.
-- Source is tokenized once. Parsing, symbol binding, type selection, jump
-  resolution, and instruction emission then operate on that token stream.
+- Source is tokenized once. The compiler Builder is the sole parser, binder,
+  and emitter. Type selection, jump resolution, and instruction emission
+  operate on that same token stream; there is no independent frontend parser.
 - A successful program records one parse pass and one bind pass. VM
   instances reference the prepared program and never tokenize or parse it.
 - The hot instruction stream contains only an opcode and two bounded
@@ -20,6 +21,29 @@ source syntax accepted by the frontend remains defined in
   same O(1) instruction index; branch operands are resolved instruction
   indices, not source labels or text offsets.
 - A program with any compile diagnostic cannot initialize a VM.
+- Deferred statement and built-in opcodes do not exist. A catalog target that
+  lacks executable semantics is rejected during compilation and cannot enter
+  a generic runtime HostFailure path.
+
+## Cross-package invariants
+
+Every subsequent v2 package must retain the 0.69.X execution properties:
+
+- one bounded guest slice per host cycle and event-based waits rather than
+  busy polling;
+- monotonic pause-adjusted guest time and deterministic injected test time;
+- bounded asynchronous file buffers and at most one outstanding storage
+  request per VM;
+- caller-owned PCM buffers, transport-confirmed foreground audio fences, and
+  audio degradation that never accelerates or blocks guest time or video;
+- sparse raster damage, no frame for an unchanged image, and 128 by 128 pixel
+  presentation blocks;
+- complete instance isolation and the same idempotent resource release for
+  normal completion, error, reset, cancellation, and close.
+
+The existing compiler, VM, graphics-host, performance, and Gorilla runners
+are the aggregate cross-package acceptance. A new per-catalog gate is not
+created.
 
 ## Symbols and scopes
 

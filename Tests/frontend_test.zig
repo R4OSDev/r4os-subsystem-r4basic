@@ -1,10 +1,9 @@
 const std = @import("std");
-const frontend = @import("frontend");
+const core = @import("core");
+const frontend = core.frontend;
 
 var tokens: [frontend.recommended_token_capacity]frontend.Token = undefined;
 var diagnostics: [frontend.recommended_diagnostic_capacity]frontend.Diagnostic = undefined;
-var repeat_tokens: [frontend.recommended_token_capacity]frontend.Token = undefined;
-var repeat_diagnostics: [frontend.recommended_diagnostic_capacity]frontend.Diagnostic = undefined;
 
 const positive_fixtures = [_][]const u8{
     "Tests/Fixtures/positive_source_contract.bas",
@@ -13,146 +12,98 @@ const positive_fixtures = [_][]const u8{
     "Tests/Fixtures/positive_io_graphics.bas",
 };
 
-const ExpectedDiagnostic = struct {
+const negative_binding_fixtures = [_][]const u8{
+    "Tests/Fixtures/negative_structure.bas",
+    "Tests/Fixtures/negative_statements.bas",
+    "Tests/Fixtures/negative_expressions.bas",
+};
+
+const ExpectedLexicalDiagnostic = struct {
     code: frontend.DiagnosticCode,
     line: u32,
 };
 
-const NegativeFixture = struct {
-    path: []const u8,
-    expected: []const ExpectedDiagnostic,
+const negative_lexical_diagnostics = [_]ExpectedLexicalDiagnostic{
+    .{ .code = .unsupported_metacommand, .line = 1 },
+    .{ .code = .invalid_byte, .line = 2 },
+    .{ .code = .invalid_identifier, .line = 3 },
+    .{ .code = .invalid_number, .line = 4 },
+    .{ .code = .invalid_byte, .line = 5 },
+    .{ .code = .invalid_byte, .line = 6 },
+    .{ .code = .unterminated_string, .line = 7 },
 };
 
-const negative_fixtures = [_]NegativeFixture{
-    .{
-        .path = "Tests/Fixtures/negative_lexical.bas",
-        .expected = &.{
-            .{ .code = .unsupported_metacommand, .line = 1 },
-            .{ .code = .invalid_byte, .line = 2 },
-            .{ .code = .invalid_identifier, .line = 3 },
-            .{ .code = .invalid_number, .line = 4 },
-            .{ .code = .invalid_byte, .line = 5 },
-            .{ .code = .invalid_byte, .line = 6 },
-            .{ .code = .unterminated_string, .line = 7 },
-        },
-    },
-    .{
-        .path = "Tests/Fixtures/negative_structure.bas",
-        .expected = &.{
-            .{ .code = .expected_identifier, .line = 1 },
-            .{ .code = .expected_identifier, .line = 2 },
-            .{ .code = .unmatched_block, .line = 3 },
-            .{ .code = .unmatched_block, .line = 5 },
-            .{ .code = .unmatched_block, .line = 6 },
-            .{ .code = .unclosed_block, .line = 8 },
-        },
-    },
-    .{
-        .path = "Tests/Fixtures/negative_statements.bas",
-        .expected = &.{
-            .{ .code = .unsupported_statement, .line = 1 },
-            .{ .code = .unsupported_statement, .line = 2 },
-            .{ .code = .expected_expression, .line = 3 },
-            .{ .code = .expected_token, .line = 4 },
-            .{ .code = .unexpected_token, .line = 5 },
-            .{ .code = .expected_token, .line = 6 },
-            .{ .code = .expected_token, .line = 7 },
-            .{ .code = .expected_expression, .line = 8 },
-            .{ .code = .expected_expression, .line = 9 },
-            .{ .code = .unsupported_statement, .line = 10 },
-            .{ .code = .expected_expression, .line = 11 },
-        },
-    },
-    .{
-        .path = "Tests/Fixtures/negative_expressions.bas",
-        .expected = &.{
-            .{ .code = .wrong_argument_count, .line = 1 },
-            .{ .code = .wrong_argument_count, .line = 2 },
-            .{ .code = .wrong_argument_count, .line = 3 },
-            .{ .code = .wrong_argument_count, .line = 4 },
-            .{ .code = .wrong_argument_count, .line = 5 },
-            .{ .code = .wrong_argument_count, .line = 6 },
-            .{ .code = .wrong_argument_count, .line = 7 },
-            .{ .code = .wrong_argument_count, .line = 8 },
-            .{ .code = .expected_expression, .line = 9 },
-            .{ .code = .expected_separator, .line = 10 },
-            .{ .code = .invalid_byte, .line = 11 },
-            .{ .code = .expected_expression, .line = 12 },
-            .{ .code = .expected_expression, .line = 13 },
-        },
-    },
-};
-
-test "all public positive BAS fixtures satisfy the v1 source contract" {
+test "all public positive BAS fixtures use the sole compiler parser and binder" {
     const allocator = std.testing.allocator;
     for (positive_fixtures) |path| {
         const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(frontend.maximum_source_bytes));
         defer allocator.free(source);
 
-        const result = frontend.analyzeNamed(path, source, tokens[0..], diagnostics[0..]);
-        if (!result.ok()) dumpDiagnostics(source, result);
-        try std.testing.expect(!result.diagnostics_truncated);
-        try std.testing.expect(result.ok());
-        try std.testing.expect(result.summary.statements != 0);
+        var program = try core.compiler.compile(allocator, path, source);
+        defer program.deinit();
+        if (!program.ok()) dumpCompilerDiagnostics(&program);
+        try std.testing.expect(program.ok());
+        try std.testing.expectEqual(@as(u32, 1), program.parse_passes);
+        try std.testing.expectEqual(@as(u32, 1), program.bind_passes);
+        try std.testing.expect(program.instructions.len != 0);
     }
 }
 
-test "negative BAS fixtures produce their contracted diagnostics" {
+test "negative lexical fixture retains exact deterministic lexer diagnostics" {
+    const path = "Tests/Fixtures/negative_lexical.bas";
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(frontend.maximum_source_bytes));
+    defer std.testing.allocator.free(source);
+
+    const result = frontend.tokenizeNamed(path, source, tokens[0..], diagnostics[0..]);
+    try std.testing.expect(!result.ok());
+    try std.testing.expect(!result.diagnostics_truncated);
+    for (negative_lexical_diagnostics) |expected| {
+        try std.testing.expect(containsLexicalDiagnostic(result, expected));
+    }
+}
+
+test "negative grammar fixtures are rejected deterministically by the sole compiler parser" {
     const allocator = std.testing.allocator;
-    for (negative_fixtures) |fixture| {
-        const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, fixture.path, allocator, .limited(frontend.maximum_source_bytes));
+    for (negative_binding_fixtures) |path| {
+        const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(frontend.maximum_source_bytes));
         defer allocator.free(source);
 
-        const result = frontend.analyzeNamed(fixture.path, source, tokens[0..], diagnostics[0..]);
-        if (result.ok()) std.debug.print("negative fixture unexpectedly passed: {s}\n", .{fixture.path});
-        try std.testing.expect(!result.ok());
-        try std.testing.expect(!result.diagnostics_truncated);
-
-        const repeated = frontend.analyzeNamed(fixture.path, source, repeat_tokens[0..], repeat_diagnostics[0..]);
-        try std.testing.expectEqual(result.token_count, repeated.token_count);
-        try std.testing.expectEqual(result.diagnostic_count, repeated.diagnostic_count);
-        try std.testing.expectEqual(result.diagnostics_truncated, repeated.diagnostics_truncated);
-        for (diagnostics[0..result.diagnostic_count], repeat_diagnostics[0..repeated.diagnostic_count]) |first, second| {
-            try std.testing.expectEqual(first.code, second.code);
-            try std.testing.expectEqual(first.span, second.span);
-            try std.testing.expectEqualStrings(first.file_name, second.file_name);
-        }
-
-        for (diagnostics[0..result.diagnostic_count]) |diagnostic| {
-            try std.testing.expectEqualStrings(fixture.path, diagnostic.file_name);
-        }
-        for (fixture.expected) |expected| {
-            if (!containsDiagnostic(result, expected)) {
-                dumpDiagnostics(source, result);
-                std.debug.print("missing diagnostic {s} on line {d} in {s}\n", .{
-                    @tagName(expected.code),
-                    expected.line,
-                    fixture.path,
-                });
-            }
-            try std.testing.expect(containsDiagnostic(result, expected));
+        var first = try core.compiler.compile(allocator, path, source);
+        defer first.deinit();
+        var second = try core.compiler.compile(allocator, path, source);
+        defer second.deinit();
+        if (first.ok()) std.debug.print("negative fixture unexpectedly passed: {s}\n", .{path});
+        try std.testing.expect(!first.ok());
+        try std.testing.expect(!first.diagnostics_truncated);
+        try std.testing.expectEqual(first.diagnostics_total, second.diagnostics_total);
+        try std.testing.expectEqual(first.diagnostics.len, second.diagnostics.len);
+        for (first.diagnostics, second.diagnostics) |left, right| {
+            try std.testing.expectEqual(left.code, right.code);
+            try std.testing.expectEqual(left.span, right.span);
+            try std.testing.expectEqualStrings(left.file_name, right.file_name);
+            try std.testing.expectEqualStrings(left.catalog_id, right.catalog_id);
         }
     }
 }
 
-test "line endings and extended string bytes are source-stable" {
+test "line endings and extended string bytes remain valid through binding" {
     const sources = [_][]const u8{
         "PRINT \"one\"\nPRINT \"two\"\n",
         "PRINT \"one\"\rPRINT \"two\"\r",
         "PRINT \"one\"\r\nPRINT \"two\"\r\n",
         "Text$ = \"\x80\xFF\"\nEND\n",
     };
-    for (sources, 0..) |source, index| {
-        const result = frontend.analyzeNamed("line-endings.bas", source, tokens[0..], diagnostics[0..]);
-        if (!result.ok()) dumpDiagnostics(source, result);
-        try std.testing.expect(result.ok());
-        if (index < 3) try std.testing.expectEqual(@as(u32, 2), result.summary.statements);
+    for (sources) |source| {
+        var program = try core.compiler.compile(std.testing.allocator, "line-endings.bas", source);
+        defer program.deinit();
+        if (!program.ok()) dumpCompilerDiagnostics(&program);
+        try std.testing.expect(program.ok());
     }
 }
 
-test "keyword matching preserves the original source spelling" {
+test "keyword matching preserves original spelling" {
     const source = "DeFiNt A-Z\n";
-    const result = frontend.analyzeNamed("case.bas", source, tokens[0..], diagnostics[0..]);
+    const result = frontend.tokenizeNamed("case.bas", source, tokens[0..], diagnostics[0..]);
     try std.testing.expect(result.ok());
     try std.testing.expectEqual(frontend.TokenKind.keyword, tokens[0].kind);
     try std.testing.expectEqual(frontend.Keyword.defint, tokens[0].keyword);
@@ -173,7 +124,7 @@ test "token census follows lexical demand instead of source bytes" {
     try std.testing.expectEqual(frontend.maximum_source_bytes + 1, frontend.countTokens(dense));
 }
 
-test "expression depth accepts its boundary and rejects the next recursive level" {
+test "compiler expression depth accepts its boundary and rejects the next level" {
     const allocator = std.testing.allocator;
     const Shape = enum { parentheses, unary, power };
     for ([_]Shape{ .parentheses, .unary, .power }) |shape| {
@@ -198,23 +149,25 @@ test "expression depth accepts its boundary and rejects the next recursive level
                 },
             }
             try source.append(allocator, '\n');
-            const result = frontend.analyzeNamed("depth.bas", source.items, tokens[0..], diagnostics[0..]);
+
+            var program = try core.compiler.compile(allocator, "depth.bas", source.items);
+            defer program.deinit();
             if (accepted) {
-                if (!result.ok()) dumpDiagnostics(source.items, result);
-                try std.testing.expect(result.ok());
+                if (!program.ok()) dumpCompilerDiagnostics(&program);
+                try std.testing.expect(program.ok());
                 try std.testing.expectEqual(
                     @as(u16, @intCast(frontend.maximum_expression_depth)),
-                    result.summary.maximum_expression_depth,
+                    program.compile_stats.maximum_expression_depth,
                 );
             } else {
-                try std.testing.expect(!result.ok());
-                try std.testing.expect(containsCode(result, .expression_too_deep));
+                try std.testing.expect(!program.ok());
+                try std.testing.expect(containsCompilerCode(&program, .expression_too_deep));
             }
         }
     }
 }
 
-test "all supported and unsupported keywords use bounded case-insensitive lookup" {
+test "all known keywords use bounded case-insensitive lexical lookup" {
     const allocator = std.testing.allocator;
     var source: std.ArrayList(u8) = .empty;
     defer source.deinit(allocator);
@@ -258,9 +211,9 @@ test "all supported and unsupported keywords use bounded case-insensitive lookup
     try std.testing.expectEqual(frontend.TokenKind.identifier, tokens[token_index].kind);
 }
 
-test "diagnostics retain exact file line column and byte span" {
+test "lexical diagnostics retain exact file line column and byte span" {
     const source = "PRINT @\r\nPRINT 1\r\n";
-    const result = frontend.analyzeNamed("position.bas", source, tokens[0..], diagnostics[0..]);
+    const result = frontend.tokenizeNamed("position.bas", source, tokens[0..], diagnostics[0..]);
     try std.testing.expect(!result.ok());
     try std.testing.expect(result.diagnostic_count >= 1);
     const diagnostic = diagnostics[0];
@@ -271,63 +224,78 @@ test "diagnostics retain exact file line column and byte span" {
     try std.testing.expectEqualStrings("@", diagnostic.span.bytes(source));
 }
 
-test "identifiers honor the 40-byte source-contract boundary" {
+test "identifiers honor the 40-byte lexical boundary" {
     var accepted_source: [45]u8 = undefined;
     @memset(accepted_source[0..40], 'A');
     @memcpy(accepted_source[40..], " = 1\n");
-    const accepted = frontend.analyzeNamed("identifier-40.bas", accepted_source[0..], tokens[0..], diagnostics[0..]);
+    const accepted = frontend.tokenizeNamed("identifier-40.bas", accepted_source[0..], tokens[0..], diagnostics[0..]);
     try std.testing.expect(accepted.ok());
 
     var rejected_source: [46]u8 = undefined;
     @memset(rejected_source[0..41], 'A');
     @memcpy(rejected_source[41..], " = 1\n");
-    const rejected = frontend.analyzeNamed("identifier-41.bas", rejected_source[0..], tokens[0..], diagnostics[0..]);
+    const rejected = frontend.tokenizeNamed("identifier-41.bas", rejected_source[0..], tokens[0..], diagnostics[0..]);
     try std.testing.expect(!rejected.ok());
-    try std.testing.expect(containsCode(rejected, .invalid_identifier));
+    try std.testing.expect(containsLexicalCode(rejected, .invalid_identifier));
 }
 
-test "bounded caller storage fails visibly" {
+test "bounded caller storage fails visibly in the lexer" {
     var tiny_tokens: [2]frontend.Token = undefined;
-    const token_result = frontend.analyzeNamed("tokens.bas", "PRINT 1\n", tiny_tokens[0..], diagnostics[0..]);
+    const token_result = frontend.tokenizeNamed("tokens.bas", "PRINT 1\n", tiny_tokens[0..], diagnostics[0..]);
     try std.testing.expect(!token_result.ok());
-    try std.testing.expect(containsCode(token_result, .token_capacity_exceeded));
+    try std.testing.expect(containsLexicalCode(token_result, .token_capacity_exceeded));
 
     var no_diagnostics: [0]frontend.Diagnostic = .{};
-    const diagnostic_result = frontend.analyzeNamed("diagnostics.bas", "@", tokens[0..], no_diagnostics[0..]);
+    const diagnostic_result = frontend.tokenizeNamed("diagnostics.bas", "@", tokens[0..], no_diagnostics[0..]);
     try std.testing.expect(!diagnostic_result.ok());
     try std.testing.expect(diagnostic_result.diagnostics_truncated);
 
-    const allocator = std.testing.allocator;
-    const oversized = try allocator.alloc(u8, frontend.maximum_source_bytes + 1);
-    defer allocator.free(oversized);
+    const oversized = try std.testing.allocator.alloc(u8, frontend.maximum_source_bytes + 1);
+    defer std.testing.allocator.free(oversized);
     @memset(oversized, ' ');
-    const source_result = frontend.analyzeNamed("large.bas", oversized, tokens[0..], diagnostics[0..]);
+    const source_result = frontend.tokenizeNamed("large.bas", oversized, tokens[0..], diagnostics[0..]);
     try std.testing.expect(!source_result.ok());
-    try std.testing.expect(containsCode(source_result, .source_too_large));
+    try std.testing.expect(containsLexicalCode(source_result, .source_too_large));
 }
 
-fn containsDiagnostic(result: frontend.Result, expected: ExpectedDiagnostic) bool {
+test "lexical success cannot bypass catalog-addressed compiler rejection" {
+    const source = "ERROR 5\nEND\n";
+    const lexed = frontend.tokenizeNamed("deferred.bas", source, tokens[0..], diagnostics[0..]);
+    try std.testing.expect(lexed.ok());
+
+    var program = try core.compiler.compile(std.testing.allocator, "deferred.bas", source);
+    defer program.deinit();
+    try std.testing.expect(!program.ok());
+    try std.testing.expectEqual(core.bytecode.DiagnosticCode.unsupported_core_feature, program.diagnostics[0].code);
+    try std.testing.expectEqualStrings("QB45-P2-050", program.diagnostics[0].catalog_id);
+}
+
+fn containsLexicalDiagnostic(result: frontend.LexResult, expected: ExpectedLexicalDiagnostic) bool {
     for (diagnostics[0..result.diagnostic_count]) |diagnostic| {
         if (diagnostic.code == expected.code and diagnostic.span.line == expected.line) return true;
     }
     return false;
 }
 
-fn containsCode(result: frontend.Result, code: frontend.DiagnosticCode) bool {
-    for (diagnostics[0..result.diagnostic_count]) |diagnostic| {
-        if (diagnostic.code == code) return true;
-    }
+fn containsLexicalCode(result: frontend.LexResult, code: frontend.DiagnosticCode) bool {
+    for (diagnostics[0..result.diagnostic_count]) |diagnostic| if (diagnostic.code == code) return true;
     return false;
 }
 
-fn dumpDiagnostics(source: []const u8, result: frontend.Result) void {
-    for (diagnostics[0..result.diagnostic_count]) |diagnostic| {
-        std.debug.print("{s}:{d}:{d}: {s}: {s}\n", .{
+fn containsCompilerCode(program: *const core.bytecode.Program, code: core.bytecode.DiagnosticCode) bool {
+    for (program.diagnostics) |diagnostic| if (diagnostic.code == code) return true;
+    return false;
+}
+
+fn dumpCompilerDiagnostics(program: *const core.bytecode.Program) void {
+    for (program.diagnostics) |diagnostic| {
+        std.debug.print("{s}:{d}:{d}: {s} {s}: {s}\n", .{
             diagnostic.file_name,
             diagnostic.span.line,
             diagnostic.span.column,
             @tagName(diagnostic.code),
-            diagnostic.span.bytes(source),
+            diagnostic.catalog_id,
+            diagnostic.span.bytes(program.source),
         });
     }
 }

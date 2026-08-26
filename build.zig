@@ -6,20 +6,6 @@ pub fn build(b: *std.Build) void {
     const sdk = sdk_build.sdk(b, sdk_dep, .{});
     _ = sdk.addR4MF(b.path("module.R4MF"));
 
-    const frontend_module = b.createModule(.{
-        .root_source_file = b.path("src/frontend.zig"),
-        .target = b.graph.host,
-        .optimize = .Debug,
-    });
-    const frontend_tests_module = b.createModule(.{
-        .root_source_file = b.path("Tests/frontend_test.zig"),
-        .target = b.graph.host,
-        .optimize = .Debug,
-    });
-    frontend_tests_module.addImport("frontend", frontend_module);
-    const frontend_tests = b.addTest(.{ .root_module = frontend_tests_module });
-    const run_frontend_tests = b.addRunArtifact(frontend_tests);
-
     const core_module = b.createModule(.{
         .root_source_file = b.path("src/core.zig"),
         .target = b.graph.host,
@@ -27,6 +13,16 @@ pub fn build(b: *std.Build) void {
     });
     const host_r4os = sdk.createR4osModule(b.graph.host, .Debug);
     core_module.addImport("r4os", host_r4os);
+
+    const frontend_tests_module = b.createModule(.{
+        .root_source_file = b.path("Tests/frontend_test.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    frontend_tests_module.addImport("core", core_module);
+    const frontend_tests = b.addTest(.{ .root_module = frontend_tests_module });
+    const run_frontend_tests = b.addRunArtifact(frontend_tests);
+
     const compiler_tests_module = b.createModule(.{
         .root_source_file = b.path("Tests/compiler_test.zig"),
         .target = b.graph.host,
