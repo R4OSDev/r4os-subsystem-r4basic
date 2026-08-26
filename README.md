@@ -27,7 +27,7 @@ input, or graphics.
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.21`
+- Module version: `1.2.22`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -60,7 +60,7 @@ this repository and is read directly from the ignored workspace injection
 tree. The normal test step uses the permanent general BAS fixtures under
 `Tests/Fixtures`, including the standalone audio contract.
 
-R4BASIC 1.2.21 allocates the exact source size once, fills that buffer with
+R4BASIC 1.2.22 allocates the exact source size once, fills that buffer with
 range reads up to the 256 KiB source limit, and transfers the same allocation
 to the compiler. The launch report records metadata calls, range-read calls,
 and bytes so the productive GORILLA acceptance can require one source load
@@ -69,7 +69,9 @@ after a metadata-only Explorer/Desktop resolution.
 Sequential BASIC files use the asynchronous R4SYS resource facade with one
 outstanding request and 64-KiB transfers. INPUT keeps a rolling buffer and
 normalizes each repeated path through a four-entry typed cache; OUTPUT and
-APPEND publish confirmed prefixes incrementally, including partial writes.
+APPEND publish confirmed prefixes incrementally, including partial and
+positioned writes. `SEEK` drains earlier output before changing the 1-based
+position, while APPEND initializes that position from the real EOF.
 The VM yields at a one-millisecond guest deadline while a request is pending,
 so input, presentation, audio, and lifecycle work continue between polls.
 `CLOSE` and normal `END` drain the same bounded output state without duplicate
@@ -77,7 +79,17 @@ bytes. Reset and teardown quiesce a non-cancellable request before releasing
 its VM-owned buffer. The `R4BASIC file-io` report makes submissions, polls,
 path work, transfer maxima, compaction, and buffer peaks measurable.
 
-R4BASIC 1.2.21 uses a shared 262,144-instruction ceiling with adaptive bounded
+RANDOM and BINARY files use the same single-request rule and bounded 64-KiB
+chunks. Modern and legacy OPEN syntax support ACCESS, SHARED/LOCK and LEN;
+GET/PUT serialize numeric scalars, strings, whole arrays and UDTs in canonical
+little-endian guest layout. RANDOM enforces exact record lengths and FIELD
+overlays a fixed record buffer whose bindings are invalidated by CLOSE/RESET.
+BINARY supports sparse offset writes and `INPUT$`. `LOC`, `LOF`, `EOF`,
+`SEEK`, `FILEATTR`, `FREEFILE`, exact range LOCK/UNLOCK and all classified
+file errors operate on confirmed state. R4SYS supplies asynchronous write-at,
+size-query and instance-owned range-lock operations; no DOS handle escapes.
+
+R4BASIC 1.2.22 uses a shared 262,144-instruction ceiling with adaptive bounded
 clock blocks and an 8-ms production time boundary. Active work requests a
 scheduler yield at most once per 8-ms interval; input-only waits, pause and
 static status windows block on the Desktop activity sequence. The first guest
@@ -91,7 +103,7 @@ separate QEMU-readable numeric, 4-KB assignment, LEN, UCASE$, call and array
 markers plus an exact summary. The productive artifact remains the canonical
 GUI subsystem host and uses its measured module-local `OPTIMIZE=speed` profile.
 
-The 1.2.21 input profile emits each printable key exactly once as text,
+The 1.2.22 input profile emits each printable key exactly once as text,
 retains Enter and Backspace as keys, maps supported extended keys atomically
 to QuickBASIC null/scancode pairs, and filters pointer traffic before guest
 coordinate mapping. Stable sequence/tick metadata follows every accepted byte
@@ -108,7 +120,7 @@ output share one QuickBASIC formatter for ordinary `PRINT`, `PRINT USING`,
 `PRINT # USING`, `WRITE`, and `WRITE #`; WRITE output round-trips through the
 same `INPUT #` field decoder.
 
-R4BASIC 1.2.21 completes the declaration and storage foundation. All five
+R4BASIC 1.2.22 completes the declaration and storage foundation. All five
 `DEFtype` statements, suffix/`AS` precedence, `OPTION BASE`, implicit arrays,
 `$STATIC`/`$DYNAMIC`, `ERASE`, bounds queries, and atomic `REDIM PRESERVE`
 now follow source order and the 60-dimension limit. Automatic, procedure-
@@ -117,7 +129,7 @@ VM and reset deterministically. Nested records use canonical guest byte
 offsets rather than host layouts; record assignment, `LEN`, `LSET`/`RSET`,
 `SWAP`, and `CLEAR` operate on the same owned representation.
 
-R4BASIC 1.2.21 also completes BASIC procedure and central error flow.
+R4BASIC 1.2.22 also completes BASIC procedure and central error flow.
 Declarations validate ByRef/ByVal scalars, dimensioned arrays, records,
 fixed-string temporaries and AS ANY; SUB/FUNCTION recursion and STATIC remain
 VM-local. One-line and multiline DEF FN support module scope, STATIC,

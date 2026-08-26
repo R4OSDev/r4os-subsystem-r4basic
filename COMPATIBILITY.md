@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 QuickBASIC 4.5 target contract
 
-Contract version: `2.3.0`
+Contract version: `2.4.0`
 
 R4BASIC v2 targets the complete Microsoft QuickBASIC 4.5 interpreter language
 and runtime. The target is not limited by GORILLA.BAS or by the historical v1
@@ -128,7 +128,7 @@ the same grammar family. All fixture paths are below `Tests/Fixtures/`.
 | GFX-01 | `SCREEN 1`/`9`, `PALETTE`, `PSET`, coordinate `POINT`, `LINE` including `B`/`BF`, `CIRCLE`, and `PAINT` | yes | `positive_io_graphics.bas` | `negative_statements.bas`, `negative_expressions.bas` |
 | GFX-02 | Graphics `GET` and `PUT` with `PSET` and `XOR` actions | yes | `positive_io_graphics.bas` | `negative_statements.bas` |
 | AUDIO-01 | `BEEP` and `PLAY` expression syntax | yes | `positive_io_graphics.bas`, `vm_audio.bas` | `negative_statements.bas` |
-| FILE-01 | Sequential `OPEN` for `INPUT`, `OUTPUT`, or `APPEND`; `CLOSE`, `PRINT #`, `PRINT # USING`, `WRITE #`, `INPUT$`, `INPUT #`, `LINE INPUT #`, and `EOF` | no, but v1 platform scope | `positive_io_graphics.bas` plus inline round-trip vectors | `negative_statements.bas`, `negative_expressions.bas` |
+| FILE-01 | Old/new `OPEN` for `INPUT`, `OUTPUT`, `APPEND`, `RANDOM`, or `BINARY`; access/lock/LEN, `CLOSE`/`RESET`, sequential formatting/input, FIELD/LSET/RSET, typed GET/PUT, BINARY `INPUT$`, SEEK/LOC/LOF/EOF/FILEATTR/FREEFILE, and exact LOCK/UNLOCK | yes | `vm_sequential_files.bas` plus inline one-byte, sparse, record/UDT, exact-64-KiB, positioned-output, metadata, lock and catchable-error vectors | inline bad-mode, bad-record, FIELD, path/storage and device-name vectors |
 | HW-01 | Selected `DEF SEG`, `PEEK`, and `POKE` syntax for a later private compatibility device | yes | `positive_io_graphics.bas` | `negative_expressions.bas` |
 
 The optional `Tests/gorilla_acceptance.zig` step additionally verifies the
@@ -146,16 +146,17 @@ source does not select a separate production path.
 
 - One argument: `ABS`, `ASC`, `ATN`, `CDBL`, `CHR$`, `CINT`, `CLNG`, `COS`, `CSNG`,
   `CVD`, `CVDMBF`, `CVI`, `CVL`, `CVS`, `CVSMBF`, `EOF`, `EXP`, `FIX`,
-  `HEX$`, `INT`, `LCASE$`, `LEN`, `LOG`, `LTRIM$`, `MKD$`, `MKDMBF$`,
+  `HEX$`, `INT`, `LCASE$`, `LEN`, `LOC`, `LOF`, `LOG`, `LTRIM$`, `MKD$`, `MKDMBF$`,
   `MKI$`, `MKL$`, `MKS$`, `MKSMBF$`, `OCT$`, `PEEK`, `POS`, `RTRIM$`,
-  `SGN`, `SIN`, `SPACE$`, `SQR`, `STR$`, `TAN`, `UCASE$`, `VAL`.
+  `SEEK`, `SGN`, `SIN`, `SPACE$`, `SQR`, `STR$`, `TAN`, `UCASE$`, `VAL`.
 - One or two arguments: `LBOUND` and `UBOUND` accept an array and an optional
   one-based dimension number.
-- Two arguments: `LEFT$`, `RIGHT$`, `STRING$`, coordinate `POINT`.
+- Two arguments: `FILEATTR`, `LEFT$`, `RIGHT$`, `STRING$`, coordinate `POINT`.
 - Two or three arguments: `INSTR`, `MID$`.
 - Two or three arguments: text `SCREEN`.
-- One or two arguments: `INPUT$` accepts a count and an optional sequential
+- One or two arguments: `INPUT$` accepts a count and an optional INPUT/BINARY
   file number.
+- Bare and without parentheses: `FREEFILE` also accepts empty parentheses.
 - Zero or one argument: `RND`; the bare form is accepted.
 - Bare and without parentheses: `CSRLIN`, `INKEY$`, `TIMER`.
 

@@ -3134,6 +3134,389 @@ const MemoryFiles = struct {
     }
 };
 
+const RandomFiles = struct {
+    const count = 4;
+    paths: [count][]const u8 = .{
+        "C:\\GAMES\\random.dat",
+        "C:\\GAMES\\binary.dat",
+        "C:\\GAMES\\record.dat",
+        "C:\\GAMES\\output.txt",
+    },
+    data: [count]std.ArrayList(u8) = .{ .empty, .empty, .empty, .empty },
+    exists: [count]bool = .{false} ** count,
+    async_like: bool = true,
+    ready: bool = false,
+    maximum_transfer: usize = 1,
+    lock_calls: u32 = 0,
+
+    fn deinit(self: *@This()) void {
+        for (&self.data) |*bytes| bytes.deinit(std.testing.allocator);
+    }
+
+    fn index(self: *const @This(), path: []const u8) ?usize {
+        for (self.paths, 0..) |candidate, i| if (std.ascii.eqlIgnoreCase(candidate, path)) return i;
+        return null;
+    }
+
+    fn waitOnce(self: *@This()) bool {
+        if (!self.async_like) return false;
+        if (!self.ready) {
+            self.ready = true;
+            return true;
+        }
+        self.ready = false;
+        return false;
+    }
+
+    fn info(context: ?*anyopaque, path: []const u8) core.vm.FileInfoResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        const i = self.index(path) orelse return .{ .failure = .path_not_found };
+        if (!self.exists[i]) return .missing;
+        return .{ .info = .{ .size = @intCast(self.data[i].items.len) } };
+    }
+
+    fn read(context: ?*anyopaque, path: []const u8, offset: u32, out: []u8) core.vm.FileReadResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        const i = self.index(path) orelse return .{ .failure = .path_not_found };
+        if (!self.exists[i]) return .{ .failure = .not_found };
+        if (self.waitOnce()) return .pending;
+        if (offset >= self.data[i].items.len) return .end;
+        const amount = @min(out.len, self.maximum_transfer, self.data[i].items.len - offset);
+        @memcpy(out[0..amount], self.data[i].items[offset..][0..amount]);
+        return .{ .bytes = @intCast(amount) };
+    }
+
+    fn writeAt(context: ?*anyopaque, path: []const u8, offset: u32, bytes: []const u8, create: bool) core.vm.FileWriteResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        const i = self.index(path) orelse return .{ .failure = .path_not_found };
+        if (self.waitOnce()) return .pending;
+        if (!self.exists[i]) {
+            if (!create) return .{ .failure = .not_found };
+            self.exists[i] = true;
+        }
+        if (bytes.len == 0) return .{ .bytes = 0 };
+        const amount = @min(bytes.len, self.maximum_transfer);
+        const end = @as(usize, offset) + amount;
+        if (self.data[i].items.len < end) {
+            self.data[i].appendNTimes(std.testing.allocator, 0, end - self.data[i].items.len) catch
+                return .{ .failure = .disk_full };
+        }
+        @memcpy(self.data[i].items[offset..end], bytes[0..amount]);
+        return .{ .bytes = @intCast(amount) };
+    }
+
+    fn write(context: ?*anyopaque, path: []const u8, bytes: []const u8, append: bool) core.vm.FileWriteResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        const i = self.index(path) orelse return .{ .failure = .path_not_found };
+        if (self.waitOnce()) return .pending;
+        if (!append) self.data[i].clearRetainingCapacity();
+        self.exists[i] = true;
+        const amount = @min(bytes.len, self.maximum_transfer);
+        self.data[i].appendSlice(std.testing.allocator, bytes[0..amount]) catch return .{ .failure = .disk_full };
+        return .{ .bytes = @intCast(amount) };
+    }
+
+    fn lock(context: ?*anyopaque, path: []const u8, _: u32, _: u32, _: bool) core.vm.FileLockResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        _ = self.index(path) orelse return .{ .failure = .path_not_found };
+        if (self.waitOnce()) return .pending;
+        self.lock_calls += 1;
+        return .success;
+    }
+};
+
+test "RANDOM BINARY FIELD GET PUT SEEK metadata and locks preserve partial transfers" {
+    const source =
+        \\TYPE RowType
+        \\  Code AS LONG
+        \\  Label AS STRING * 4
+        \\END TYPE
+        \\DEFINT A-Z
+        \\F = FREEFILE
+        \\OPEN "random.dat" FOR RANDOM ACCESS READ WRITE AS #F LEN = 8
+        \\FIELD #F, 2 AS FL$, 6 AS FR$
+        \\LSET FL$ = "AB"
+        \\RSET FR$ = "Z"
+        \\PUT #F, 1
+        \\LSET FL$ = "XX"
+        \\LSET FR$ = "YYYYYY"
+        \\GET #F, 1
+        \\SavedLeft$ = FL$
+        \\SavedRight$ = FR$
+        \\RandomLoc& = LOC(F)
+        \\RandomSeek& = SEEK(F)
+        \\RandomLen& = LOF(F)
+        \\RandomMode = FILEATTR(F, 1)
+        \\RandomSlot = FILEATTR(F, 2)
+        \\LOCK #F, 1 TO 1
+        \\UNLOCK #F, 1 TO 1
+        \\CLOSE #F
+        \\Released = LEN(FL$)
+        \\B = FREEFILE
+        \\OPEN "binary.dat" FOR BINARY ACCESS READ WRITE AS #B
+        \\Number& = 305419896&
+        \\PUT #B, 1, Number&
+        \\SEEK #B, 9
+        \\Text$ = "ABCD"
+        \\PUT #B, , Text$
+        \\BinaryLen& = LOF(B)
+        \\SEEK #B, 1
+        \\Number& = 0
+        \\GET #B, , Number&
+        \\SEEK #B, 9
+        \\Text$ = SPACE$(4)
+        \\GET #B, , Text$
+        \\SEEK #B, 9
+        \\BinaryInput$ = INPUT$(4, #B)
+        \\BinaryAfter& = SEEK(B)
+        \\BinaryLoc& = LOC(B)
+        \\CLOSE #B
+        \\OPEN "B", #4, "binary.dat"
+        \\SEEK #4, 9
+        \\LegacyInput$ = INPUT$(4, #4)
+        \\CLOSE #4
+        \\DIM Row AS RowType
+        \\OPEN "record.dat" FOR RANDOM AS #3 LEN = 8
+        \\Row.Code = 42
+        \\Row.Label = "OK"
+        \\PUT #3, 2, Row
+        \\Row.Code = 0
+        \\Row.Label = ""
+        \\GET #3, 2, Row
+        \\LoadedCode& = Row.Code
+        \\LoadedName$ = Row.Label
+        \\CLOSE #3
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\RANDOMIO.BAS", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var files = RandomFiles{};
+    defer files.deinit();
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{
+        .file_context = &files,
+        .file_read = RandomFiles.read,
+        .file_write_at = RandomFiles.writeAt,
+        .file_info = RandomFiles.info,
+        .file_lock = RandomFiles.lock,
+    });
+    defer machine.deinit();
+    try std.testing.expect((try runFileIoCooperatively(&machine, 2048)) != 0);
+    try expectString(&machine, "SavedLeft$", "AB");
+    try expectString(&machine, "SavedRight$", "     Z");
+    try expectLong(&machine, "RandomLoc&", 1);
+    try expectLong(&machine, "RandomSeek&", 2);
+    try expectLong(&machine, "RandomLen&", 8);
+    try expectInteger(&machine, "RandomMode", 4);
+    try expectInteger(&machine, "RandomSlot", 1);
+    try expectInteger(&machine, "Released", 0);
+    try expectLong(&machine, "Number&", 0x12345678);
+    try expectString(&machine, "Text$", "ABCD");
+    try expectString(&machine, "BinaryInput$", "ABCD");
+    try expectLong(&machine, "BinaryAfter&", 13);
+    try expectLong(&machine, "BinaryLen&", 12);
+    try expectLong(&machine, "BinaryLoc&", 12);
+    try expectString(&machine, "LegacyInput$", "ABCD");
+    try expectLong(&machine, "LoadedCode&", 42);
+    try expectString(&machine, "LoadedName$", "OK  ");
+    try std.testing.expect(files.lock_calls >= 2);
+    try std.testing.expectEqual(@as(usize, 0), machine.openFileCount());
+}
+
+test "BINARY whole-array transfers cross the exact 64 KiB boundary resumably" {
+    const source =
+        \\DIM Blob&(16383)
+        \\Blob&(0) = 123456&
+        \\Blob&(16383) = 654321&
+        \\OPEN "binary.dat" FOR BINARY ACCESS READ WRITE AS #1
+        \\PUT #1, 1, Blob&()
+        \\BoundaryLen& = LOF(1)
+        \\Blob&(0) = 0
+        \\Blob&(16383) = 0
+        \\GET #1, 1, Blob&()
+        \\First& = Blob&(0)
+        \\Last& = Blob&(16383)
+        \\CLOSE #1
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\BOUNDARY.BAS", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var files = RandomFiles{ .maximum_transfer = 257 };
+    defer files.deinit();
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{
+        .file_context = &files,
+        .file_read = RandomFiles.read,
+        .file_write_at = RandomFiles.writeAt,
+        .file_info = RandomFiles.info,
+        .file_lock = RandomFiles.lock,
+    });
+    defer machine.deinit();
+    const waiting = try runFileIoCooperatively(&machine, 4096);
+    try std.testing.expect(waiting != 0);
+    try expectLong(&machine, "BoundaryLen&", 64 * 1024);
+    try expectLong(&machine, "First&", 123456);
+    try expectLong(&machine, "Last&", 654321);
+    try std.testing.expectEqual(@as(usize, 64 * 1024), files.data[1].items.len);
+}
+
+test "sequential SEEK overwrites exact offsets and APPEND begins after EOF" {
+    const source =
+        \\OPEN "output.txt" FOR OUTPUT AS #1
+        \\PRINT #1, "ABCDE";
+        \\SEEK #1, 3
+        \\PRINT #1, "xy";
+        \\Position& = SEEK(1)
+        \\Length& = LOF(1)
+        \\CLOSE #1
+        \\OPEN "output.txt" FOR APPEND AS #1
+        \\AppendStart& = SEEK(1)
+        \\PRINT #1, "Z";
+        \\FinalLength& = LOF(1)
+        \\CLOSE #1
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\POSITION.BAS", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var files = RandomFiles{ .maximum_transfer = 2 };
+    defer files.deinit();
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{
+        .file_context = &files,
+        .file_read = RandomFiles.read,
+        .file_write = RandomFiles.write,
+        .file_write_at = RandomFiles.writeAt,
+        .file_info = RandomFiles.info,
+        .file_lock = RandomFiles.lock,
+    });
+    defer machine.deinit();
+    _ = try runFileIoCooperatively(&machine, 1024);
+    try expectLong(&machine, "Position&", 5);
+    try expectLong(&machine, "Length&", 5);
+    try expectLong(&machine, "AppendStart&", 6);
+    try expectLong(&machine, "FinalLength&", 6);
+    try std.testing.expectEqualStrings("ABxyEZ", files.data[3].items);
+}
+
+test "RANDOM record diagnostics remain catchable across RESUME labels" {
+    const source =
+        \\DEFINT A-Z
+        \\ON ERROR GOTO Handler
+        \\OPEN "random.dat" FOR RANDOM AS #1 LEN = 8
+        \\Stage = 1
+        \\FIELD #1, 9 AS F$
+        \\AfterOverflow:
+        \\FIELD #1, 8 AS F$
+        \\Value& = 1
+        \\Stage = 2
+        \\GET #1, 1, Value&
+        \\AfterActive:
+        \\RESET
+        \\OPEN "random.dat" FOR RANDOM AS #1 LEN = 8
+        \\Stage = 3
+        \\PUT #1, 1, Value&
+        \\AfterLength:
+        \\Stage = 4
+        \\SEEK #1, 0
+        \\AfterRecord:
+        \\CLOSE #1
+        \\END
+        \\Handler:
+        \\IF Stage = 1 THEN OverflowError = ERR: RESUME AfterOverflow
+        \\IF Stage = 2 THEN ActiveError = ERR: RESUME AfterActive
+        \\IF Stage = 3 THEN LengthError = ERR: RESUME AfterLength
+        \\IF Stage = 4 THEN RecordError = ERR: RESUME AfterRecord
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\RECORDERR.BAS", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var files = RandomFiles{};
+    defer files.deinit();
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{
+        .file_context = &files,
+        .file_read = RandomFiles.read,
+        .file_write_at = RandomFiles.writeAt,
+        .file_info = RandomFiles.info,
+        .file_lock = RandomFiles.lock,
+    });
+    defer machine.deinit();
+    _ = try runFileIoCooperatively(&machine, 2048);
+    try expectInteger(&machine, "OverflowError", 50);
+    try expectInteger(&machine, "ActiveError", 56);
+    try expectInteger(&machine, "LengthError", 59);
+    try expectInteger(&machine, "RecordError", 63);
+}
+
+test "storage facade faults retain catchable QuickBASIC file numbers" {
+    const FaultFiles = struct {
+        failure: core.vm.FileHostError,
+        exists: bool,
+
+        fn info(context: ?*anyopaque, _: []const u8) core.vm.FileInfoResult {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return if (self.exists) .{ .info = .{ .size = 0 } } else .missing;
+        }
+
+        fn writeAt(context: ?*anyopaque, _: []const u8, _: u32, _: []const u8, _: bool) core.vm.FileWriteResult {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return .{ .failure = self.failure };
+        }
+
+        fn lock(context: ?*anyopaque, _: []const u8, _: u32, _: u32, _: bool) core.vm.FileLockResult {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return .{ .failure = self.failure };
+        }
+    };
+    const create_source =
+        \\DEFINT A-Z
+        \\ON ERROR GOTO Handler
+        \\OPEN "fault.dat" FOR BINARY AS #1
+        \\Missed = 1
+        \\END
+        \\Handler:
+        \\Caught = ERR
+        \\RESUME Done
+        \\Done:
+        \\END
+    ;
+    const lock_source =
+        \\DEFINT A-Z
+        \\ON ERROR GOTO Handler
+        \\OPEN "fault.dat" FOR RANDOM LOCK WRITE AS #1 LEN = 8
+        \\Missed = 1
+        \\END
+        \\Handler:
+        \\Caught = ERR
+        \\RESUME Done
+        \\Done:
+        \\END
+    ;
+    const cases = [_]struct { failure: core.vm.FileHostError, exists: bool, expected: i16, source: []const u8 }{
+        .{ .failure = .file_exists, .exists = false, .expected = 58, .source = create_source },
+        .{ .failure = .disk_full, .exists = false, .expected = 61, .source = create_source },
+        .{ .failure = .too_many_files, .exists = false, .expected = 67, .source = create_source },
+        .{ .failure = .path_not_found, .exists = false, .expected = 76, .source = create_source },
+        .{ .failure = .lock_violation, .exists = true, .expected = 70, .source = lock_source },
+    };
+    for (cases) |case| {
+        var program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\HOSTERR.BAS", case.source);
+        defer program.deinit();
+        try expectProgramOk(&program);
+        var files = FaultFiles{ .failure = case.failure, .exists = case.exists };
+        var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{
+            .file_context = &files,
+            .file_write_at = FaultFiles.writeAt,
+            .file_info = FaultFiles.info,
+            .file_lock = FaultFiles.lock,
+        });
+        defer machine.deinit();
+        try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(512, 32));
+        try expectInteger(&machine, "Caught", case.expected);
+        try expectInteger(&machine, "Missed", 0);
+    }
+}
+
 test "VM reset and teardown quiesce file bindings before releasing state" {
     const Probe = struct {
         calls: u32 = 0,

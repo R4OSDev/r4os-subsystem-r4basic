@@ -406,12 +406,17 @@ Argument und die DOUBLE-Wortmischung von RANDOMIZE sind mit festen
 Referenzvektoren belegt. RANDOMIZE TIMER verwendet pausenbereinigte Gastzeit;
 RANDOMIZE ohne Ausdruck bleibt im editierbaren Eingabe- und Wiederholungspfad.
 
-Sequentielle Dateien
---------------------
+Dateien und Records
+-------------------
 
-OPEN unterstuetzt INPUT, OUTPUT und APPEND an den Dateinummern 1 bis 255.
-CLOSE, PRINT #, PRINT # USING, WRITE #, INPUT$, INPUT #, LINE INPUT # und EOF
-pruefen Nummer und Modus.
+OPEN unterstuetzt die neue und die historische Syntax fuer INPUT, OUTPUT,
+APPEND, RANDOM und BINARY an den Dateinummern 1 bis 255. ACCESS READ, WRITE
+oder READ WRITE, SHARED beziehungsweise LOCK READ/WRITE sowie LEN werden
+vor dem Oeffnen geprueft. CLOSE kann einzelne Nummern oder alle Dateien
+schliessen; RESET schliesst und leert den gesamten Dateizustand. PRINT #,
+PRINT # USING, WRITE #, INPUT$, INPUT #, LINE INPUT #, GET, PUT, FIELD,
+LSET, RSET, SEEK, LOC, LOF, EOF, FILEATTR, FREEFILE, LOCK und UNLOCK pruefen
+Nummer, Modus und Zugriff.
 Relative Pfade werden gegen ein angegebenes Gastverzeichnis oder das
 Verzeichnis der absolut gestarteten BAS-Datei aufgeloest; absolute
 Laufwerkspfade bleiben unveraendert. Leere oder ungueltige Pfade,
@@ -424,22 +429,43 @@ meldet ein zu fruehes Dateiende ohne Teilzuweisung.
 
 Die VM erreicht keine R4SYS-Dateifunktion direkt. `src/storage_adapter.zig`
 uebersetzt ausschliesslich ueber die asynchrone `r4os.Resources`-Fassade und
-vier zwischengespeicherte `AbsoluteFilePath`-Werte. Pro VM ist hoechstens eine
-Anfrage aktiv; ihr VM-eigener Puffer bleibt bis zum terminalen Status und zum
-Schliessen der Anfrage unveraendert. INPUT liest bedarfsgesteuert in
-hoechstens 64-KiB-Stuecken und verdichtet verbrauchte Praefixe. Ein noch nicht
-abgeschlossenes LINE-INPUT- oder INPUT-Statement kann den rollierenden Puffer
-bis zur Vier-MiB-Dateigrenze wachsen lassen. OUTPUT und APPEND veroeffentlichen
-bestaetigte Praefixe ebenfalls in hoechstens 64-KiB-Stuecken; Teilwrites,
-CLOSE, normales END sowie Fehler und RESUME setzen ohne doppelte Bytes fort.
+vier zwischengespeicherte `AbsoluteFilePath`-Werte. Neben positionsgenauem
+Lesen und Schreiben liefert die Fassade Dateigroesse und instanzgebundene
+Bereichssperren. Pro VM ist hoechstens eine Anfrage aktiv; ihr VM-eigener
+Puffer bleibt bis zum terminalen Status und zum Schliessen der Anfrage
+unveraendert. INPUT liest bedarfsgesteuert in hoechstens 64-KiB-Stuecken und
+verdichtet verbrauchte Praefixe. Ein noch nicht abgeschlossenes LINE-INPUT-
+oder INPUT-Statement kann den rollierenden Puffer bis zur Vier-MiB-Dateigrenze
+wachsen lassen. OUTPUT und APPEND veroeffentlichen bestaetigte Praefixe
+positionsgenau in hoechstens 64-KiB-Stuecken; APPEND beginnt hinter dem
+tatsaechlichen Dateiende. Teilwrites, CLOSE, normales END sowie Fehler und
+RESUME setzen ohne doppelte Bytes fort.
+
+RANDOM besitzt einen festen Recordpuffer von 1 bis 32767 Bytes. FIELD bindet
+Stringzellen an nicht ueberlappende Ausschnitte dieses Puffers; eine normale
+Zuweisung loest die Bindung, LSET und RSET erhalten sie. GET und PUT ohne
+Variable uebertragen den ganzen Puffer, mit Variable exakt einen passend
+grossen Record. BINARY adressiert 1-basierte Bytepositionen und unterstuetzt
+sparse Writes. Numerische Skalare, Strings, ganze Arrays und UDTs werden in
+kanonischer Little-Endian-Gastdarstellung uebertragen. INPUT$ teilt sich den
+Lesezustand mit BINARY-GET; SEEK und PUT halten ihn kohaerent. Auch ein exakt
+64 KiB grosser Wert wird ueber beliebig kleine bestaetigte Teiltransfers ohne
+Duplikate oder Luecken fortgesetzt.
+
+LOC, LOF, EOF und SEEK leiten ihre Werte modegerecht aus bestaetigtem
+VM-Zustand und asynchronen Metadaten ab. LOCK und UNLOCK bilden sequentielle
+Gesamtdateien, RANDOM-Records und BINARY-Bytebereiche auf exakte R4SYS-Sperren
+ab; Close, RESET und Programmabbau geben verbleibende Sperren frei.
 Eine offene Anfrage gibt die aktuelle Instruktion bis zur naechsten
 Gastmillisekunde kooperativ ab, sodass Eingabe, Bild, Audio und Lebenszyklus
 zwischen den Polls weiterlaufen. Reset und Abbau warten eine nicht abbrechbare
 Anfrage ab und schliessen ihre Bindung, bevor der VM-Puffer freigegeben wird.
-Fehlende Dateien, falsche Modi, EOF-Ueberlauf und Pfadfehler behalten getrennte
-QBasic-Fehlernummern. RANDOM/BINARY,
-Drucker, COM-Ports, Loeschen und Verzeichnisveraenderungen sind nicht
-Bestandteil dieses Stands.
+Fehlende oder bereits vorhandene Dateien, falsche Modi, doppelte Slots,
+FIELD-Zustand und -Ueberlauf, ungueltige Recordlaenge oder -nummer, Disk Full,
+zu viele Dateien, Sperrkonflikte, EOF-Ueberlauf sowie Namens-, Pfad- und
+Zugriffsfehler behalten getrennte, fangbare QBasic-Fehlernummern. Drucker,
+COM-Ports, Loeschen und Verzeichnisveraenderungen sind nicht Bestandteil
+dieses Stands.
 Die Dateinummern 0 bis 255 werden ueber einen festen 256-Byte-Index in O(1)
 aufgeloest; nur wirklich offene Dateien besitzen einen dynamischen Slot samt
 Puffer. Dadurch entfallen 256 eingebettete optionale Dateizustaende pro VM.
@@ -648,8 +674,8 @@ Noch offene v2-Bereiche
 -----------------------
 
 Der Interpretervertrag zielt auf die vollstaendige QuickBASIC-4.5-Sprache
-und -Laufzeit. Nach 0.70.7 folgen insbesondere Random-/Binary-Dateien,
-Plattformoperationen, weitere Grafikmodi und -primitive, Audio/Ereignisse
+und -Laufzeit. Nach 0.70.8 folgen insbesondere Plattform- und
+Dateisystemoperationen, weitere Grafikmodi und -primitive, Audio/Ereignisse
 sowie die private sichere Abbildung historischer Geraete- und
 Fremdcodeoberflaechen. IDE, Debugger, nativer Compiler, Linker und Editor sind
 getrennte Produkte; Notepad bleibt fuer BAS-Dateien ueber `Open With` als

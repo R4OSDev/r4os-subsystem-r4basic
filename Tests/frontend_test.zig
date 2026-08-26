@@ -213,10 +213,10 @@ test "all known keywords use bounded case-insensitive lexical lookup" {
 
 test "remaining QuickBASIC appendix-E words are reserved" {
     const reference_words = [_][]const u8{
-        "SEEK",   "ACCESS",   "ALIAS",   "ENDIF",  "SETMEM",   "SIGNAL",
-        "ERDEV",  "ERDEV$",   "BINARY",  "CALLS",  "FILEATTR", "OFF",
-        "CDECL",  "FREEFILE", "PEN",     "COM",    "PMAP",
-        "UEVENT", "VARPTR$",  "RESET",   "LIST",   "LOCAL",
+        "ALIAS",   "ENDIF",  "SETMEM",   "SIGNAL",
+        "ERDEV",   "ERDEV$", "CALLS",    "OFF",
+        "CDECL",   "PEN",    "COM",      "PMAP",
+        "UEVENT",  "VARPTR$", "LIST",     "LOCAL",
         "WINDOW",
     };
     for (reference_words) |word| {

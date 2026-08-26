@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 execution foundation
 
-Contract version: `2.3.0`
+Contract version: `2.4.0`
 
 This document freezes the executable R4BASIC foundation and its non-regression
 invariants while the complete v2 target in `COMPATIBILITY.md` and
@@ -464,12 +464,12 @@ guest address can become an R4OS or host pointer.
   Bare `RANDOMIZE` requests a seed in the range -32768 through 32767 through
   the same editable, retrying console-input path.
 
-## Sequential files
+## Files and records
 
-- File numbers 1 through 255 address VM-owned slots. `OPEN` supports only
-  `INPUT`, `OUTPUT`, and `APPEND`; `CLOSE` accepts selected numbers or all
-  slots. `PRINT #`, `PRINT # USING`, `WRITE #`, `INPUT$`, `INPUT #`,
-  `LINE INPUT #`, and `EOF` require a compatible open mode.
+- File numbers 1 through 255 address VM-owned slots. Modern `OPEN` supports
+  `INPUT`, `OUTPUT`, `APPEND`, `RANDOM`, and `BINARY` plus `ACCESS`,
+  `SHARED`/`LOCK`, and `LEN`; the original mode-string form is equivalent.
+  `CLOSE` accepts selected numbers or all slots, and `RESET` closes all.
 - A relative path is resolved against the explicit guest directory or,
   when absent, the directory of the absolute BAS file name. An absolute
   drive path remains absolute. Empty paths, invalid path bytes, drive-relative
@@ -488,20 +488,36 @@ guest address can become an R4OS or host pointer.
   deterministic. Geometric capacity growth is
   clamped to the input limit; the reported peak is allocated capacity rather
   than only the logical byte count.
-- `OUTPUT` and `APPEND` publish at most 64 KiB at a time. A partial host result
+- `OUTPUT` and `APPEND` publish at most 64 KiB at a time. Writes use the
+  current 1-based `SEEK` position; APPEND starts after the actual EOF. A
+  partial host result
   advances only the confirmed prefix, while `CLOSE`, normal `END`, and a
   resumed error continue with the remaining bytes without duplication.
   Submission and polling return `waiting` to the subsystem runtime at a
   one-millisecond guest deadline; input polling, presentation, audio service,
   and lifecycle work therefore continue between file-I/O progress steps. The
   output allocation itself is clamped to the 64-KiB transfer limit.
+- `RANDOM` owns a fixed 1..32767-byte record buffer. `FIELD` binds string
+  cells to non-overlapping slices of that buffer; ordinary assignment breaks
+  one binding, while `LSET`/`RSET` preserve it. `GET`/`PUT` without a variable
+  transfer the buffer. Variable transfers require the exact record length.
+- `BINARY` addresses 1-based byte positions and permits sparse writes.
+  `GET`/`PUT` serialize numeric scalars, strings, whole arrays and UDTs in
+  canonical little-endian guest layout. Both modes use the same resumable
+  64-KiB chunks and commit position/size only after confirmed progress.
+  BINARY `INPUT$` shares the read-ahead buffer and remains coherent across
+  `SEEK`, `GET`, and `PUT`.
+- `LOC`, `LOF`, `EOF`, `SEEK`, `FILEATTR`, and `FREEFILE` derive only from
+  the VM slot plus asynchronous metadata. `LOCK`/`UNLOCK` map sequential
+  whole files, RANDOM records, and BINARY byte ranges to exact R4SYS locks
+  owned by the current program generation; teardown releases all survivors.
 - Reset and teardown wait for a non-cancellable outstanding request and close
   its binding before any VM-owned path or transfer buffer is released.
-- Bad numbers, missing files, wrong modes, duplicate slots, input past end,
-  bad names, permission failures, and path/I/O failures remain distinct VM
-  codes with the BASIC numbers listed below. Random-access and binary records,
-  devices, printer and COM I/O, file deletion, and directory mutation are
-  outside v1.
+- Bad numbers, missing/existing files, wrong modes, duplicate slots, FIELD
+  overflow/active state, bad record length/number, disk full, too many files,
+  lock denial, input past end, bad names, path-not-found, and path/I/O failure
+  remain catchable distinct VM codes. Devices, printer and COM I/O, file
+  deletion, and directory mutation remain later platform work.
 
 ## Error flow
 
@@ -605,14 +621,22 @@ line, and column span. The stable v1 mappings are:
 | subscript out of range | 9 |
 | array already dimensioned | 10 |
 | RESUME without error | 20 |
+| FIELD overflow | 50 |
 | bad file number | 52 |
 | file not found | 53 |
 | bad file mode | 54 |
 | file already open | 55 |
+| FIELD statement active | 56 |
+| file already exists | 58 |
+| bad record length | 59 |
+| disk full | 61 |
 | input past end of file | 62 |
+| bad record number | 63 |
 | bad file name | 64 |
+| too many files | 67 |
 | permission denied | 70 |
 | path/file access failure | 75 |
+| path not found | 76 |
 | VM stack, frame, instruction, GOSUB, or host failure | 70 |
 
 Normal completion exits with `0`; cooperative cancellation exits with `130`.
@@ -651,6 +675,10 @@ The permanent general fixtures below are part of this contract:
   TIMER-poll pacing.
 - `vm_sequential_files.bas`: relative and absolute sequential input, output,
   append, quoted fields, whole lines, and EOF.
+- Inline file vectors cover old/new OPEN syntax, RANDOM/FIELD records,
+  BINARY sparse scalar/string/UDT/whole-array transfer, one-byte progress,
+  the exact 64-KiB boundary, positional sequential overwrite, metadata,
+  locking, catchable errors, CLOSE/RESET, and BINARY `INPUT$`.
 - `vm_graphics.bas`: modes, palette, text-compatible drawing, clipping,
   circle, flood fill, GET/PUT, POINT, STEP, XOR reversibility, and
   two-instance pixel/palette isolation.

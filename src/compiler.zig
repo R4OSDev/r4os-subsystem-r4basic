@@ -863,12 +863,17 @@ const Builder = struct {
             .pset => self.parseGraphicsPset(),
             .circle => self.parseGraphicsCircle(),
             .paint => self.parseGraphicsPaint(),
-            .get => self.parseGraphicsGet(),
-            .put => self.parseGraphicsPut(),
+            .get => if (self.peek(1).kind == .hash) self.parseFileGetPut(false) else self.parseGraphicsGet(),
+            .put => if (self.peek(1).kind == .hash) self.parseFileGetPut(true) else self.parseGraphicsPut(),
             .randomize => self.parseRandomize(),
             .sleep => self.parseSleep(),
             .open => self.parseOpen(),
             .close => self.parseClose(),
+            .field => self.parseField(),
+            .seek => self.parseFileSeek(),
+            .lock => self.parseFileLock(false),
+            .unlock => self.parseFileLock(true),
+            .reset => self.parseSimpleOp(.file_reset),
             .beep => self.parseAudioBeep(),
             .play => self.parseAudioPlay(),
             .return_ => self.parseReturn(),
@@ -2721,8 +2726,27 @@ const Builder = struct {
 
     fn parseOpen(self: *Builder) !bool {
         const statement = self.advance();
-        const path_type = (try self.parseExpression()) orelse return false;
-        if (path_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+        const first_type = (try self.parseExpression()) orelse return false;
+        if (first_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+
+        // QuickBASIC's original form is OPEN mode$, #number, path$ [, length].
+        if (self.consume(.comma)) {
+            _ = self.consume(.hash);
+            const file_type = (try self.parseExpression()) orelse return false;
+            if (!file_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            if (!try self.expect(.comma)) return false;
+            const path_type = (try self.parseExpression()) orelse return false;
+            if (path_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+            var flags = bytecode.file_open_legacy;
+            if (self.consume(.comma)) {
+                const length_type = (try self.parseExpression()) orelse return false;
+                if (!length_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+                flags |= bytecode.file_open_has_length;
+            }
+            _ = try self.emit(.file_open, @intFromEnum(bytecode.FileMode.random), flags, statement.span);
+            return true;
+        }
+
         if (!try self.expectKeyword(.for_)) return false;
         const mode: bytecode.FileMode = if (self.consumeKeyword(.input))
             .input
@@ -2730,13 +2754,45 @@ const Builder = struct {
             .output
         else if (self.consumeKeyword(.append))
             .append
+        else if (self.consumeKeyword(.random))
+            .random
+        else if (self.consumeKeyword(.binary))
+            .binary
         else
-            return self.fail(.unsupported_core_feature);
+            return self.fail(.expected_token);
+
+        var access: bytecode.FileAccess = .default;
+        if (self.consumeKeyword(.access)) {
+            if (self.consumeKeyword(.read)) {
+                access = if (self.consumeKeyword(.write)) .read_write else .read;
+            } else if (self.consumeKeyword(.write)) {
+                access = .write;
+            } else return self.fail(.expected_token);
+        }
+
+        var lock: bytecode.FileLock = .default;
+        if (self.consumeKeyword(.shared)) {
+            lock = .shared;
+        } else if (self.consumeKeyword(.lock)) {
+            if (self.consumeKeyword(.read)) {
+                lock = if (self.consumeKeyword(.write)) .read_write else .read;
+            } else if (self.consumeKeyword(.write)) {
+                lock = .write;
+            } else return self.fail(.expected_token);
+        }
         if (!try self.expectKeyword(.as)) return false;
         if (!try self.expect(.hash)) return false;
         const file_type = (try self.parseExpression()) orelse return false;
         if (!file_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
-        _ = try self.emit(.file_open, @intFromEnum(mode), 0, statement.span);
+        var flags = (@as(u32, @intFromEnum(access)) << bytecode.file_open_access_shift) |
+            (@as(u32, @intFromEnum(lock)) << bytecode.file_open_lock_shift);
+        if (self.consumeKeyword(.len)) {
+            if (!try self.expect(.equal)) return false;
+            const length_type = (try self.parseExpression()) orelse return false;
+            if (!length_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            flags |= bytecode.file_open_has_length;
+        }
+        _ = try self.emit(.file_open, @intFromEnum(mode), flags, statement.span);
         return true;
     }
 
@@ -2753,6 +2809,85 @@ const Builder = struct {
             }
         }
         _ = try self.emit(.file_close, count, 0, statement.span);
+        return true;
+    }
+
+    fn parseFileGetPut(self: *Builder, write: bool) !bool {
+        const statement = self.advance();
+        if (!try self.expect(.hash)) return false;
+        const file_type = (try self.parseExpression()) orelse return false;
+        if (!file_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        var flags: u32 = 0;
+        if (self.consume(.comma)) {
+            if (!self.at(.comma) and !self.atBoundary() and !self.atKeyword(.else_)) {
+                const position_type = (try self.parseExpression()) orelse return false;
+                if (!position_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+                flags |= bytecode.file_argument_position;
+            }
+            if (self.consume(.comma) and !self.atBoundary() and !self.atKeyword(.else_)) {
+                const name = (try self.expectIdentifier()) orelse return false;
+                _ = (try self.parseLvalueReference(name, true)) orelse return false;
+                flags |= bytecode.file_argument_variable;
+            }
+        }
+        _ = try self.emit(if (write) .file_put else .file_get, flags, 0, statement.span);
+        return true;
+    }
+
+    fn parseField(self: *Builder) !bool {
+        const statement = self.advance();
+        if (!try self.expect(.hash)) return false;
+        const file_type = (try self.parseExpression()) orelse return false;
+        if (!file_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        if (!try self.expect(.comma)) return false;
+        var count: u32 = 0;
+        while (true) {
+            const width_type = (try self.parseExpression()) orelse return false;
+            if (!width_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            if (!try self.expectKeyword(.as)) return false;
+            const name = (try self.expectIdentifier()) orelse return false;
+            const target = (try self.parseLvalueReference(name, true)) orelse return false;
+            if (target.value_type != .string or target.is_whole_array or target.record_type != bytecode.invalid_index) {
+                try self.addDiagnostic(.type_mismatch, name.span);
+            }
+            count += 1;
+            if (!self.consume(.comma)) break;
+        }
+        _ = try self.emit(.file_field, count, 0, statement.span);
+        return true;
+    }
+
+    fn parseFileSeek(self: *Builder) !bool {
+        const statement = self.advance();
+        _ = self.consume(.hash);
+        const file_type = (try self.parseExpression()) orelse return false;
+        if (!file_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        if (!try self.expect(.comma)) return false;
+        const position_type = (try self.parseExpression()) orelse return false;
+        if (!position_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        _ = try self.emit(.file_seek, 0, 0, statement.span);
+        return true;
+    }
+
+    fn parseFileLock(self: *Builder, unlock: bool) !bool {
+        const statement = self.advance();
+        _ = self.consume(.hash);
+        const file_type = (try self.parseExpression()) orelse return false;
+        if (!file_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        var flags: u32 = 0;
+        if (self.consume(.comma)) {
+            if (!self.atKeyword(.to) and !self.atBoundary() and !self.atKeyword(.else_)) {
+                const first_type = (try self.parseExpression()) orelse return false;
+                if (!first_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+                flags |= bytecode.file_range_first;
+            }
+            if (self.consumeKeyword(.to)) {
+                const last_type = (try self.parseExpression()) orelse return false;
+                if (!last_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+                flags |= bytecode.file_range_last;
+            }
+        }
+        _ = try self.emit(if (unlock) .file_unlock else .file_lock, flags, 0, statement.span);
         return true;
     }
 
@@ -3674,7 +3809,7 @@ const Builder = struct {
         const function_token = self.advance();
         var argument_types: [3]bytecode.ValueType = undefined;
         var argument_count: usize = 0;
-        const allows_bare = builtin == .inkey_string or builtin == .timer or builtin == .rnd or builtin == .err or builtin == .erl or builtin == .csrlin;
+        const allows_bare = builtin == .inkey_string or builtin == .timer or builtin == .rnd or builtin == .err or builtin == .erl or builtin == .csrlin or builtin == .freefile;
         if (self.consume(.left_paren)) {
             if (!self.consume(.right_paren)) {
                 while (true) {
@@ -3709,8 +3844,8 @@ const Builder = struct {
         const expected_min: usize = switch (builtin) {
             .instr, .mid_string => 2,
             .left_string, .right_string, .string_string, .screen => 2,
-            .point => 2,
-            .rnd, .inkey_string, .timer, .err, .erl, .csrlin => 0,
+            .point, .fileattr => 2,
+            .rnd, .inkey_string, .timer, .err, .erl, .csrlin, .freefile => 0,
             else => 1,
         };
         const expected_max: usize = switch (builtin) {
@@ -3753,8 +3888,8 @@ const Builder = struct {
             .ucase_string,
             => .string,
             .inkey_string => .string,
-            .asc, .cint, .cvi, .csrlin, .err, .instr, .len, .eof, .peek, .point, .pos, .screen, .sgn => .integer,
-            .erl => .long,
+            .asc, .cint, .cvi, .csrlin, .err, .instr, .len, .eof, .fileattr, .freefile, .peek, .point, .pos, .screen, .sgn => .integer,
+            .erl, .loc, .lof, .seek => .long,
             .fix, .int => arguments[0],
             .val => .double,
             .rnd, .timer => .single,
@@ -3771,6 +3906,9 @@ const Builder = struct {
             .oct_string,
             .peek,
             .eof,
+            .loc,
+            .lof,
+            .seek,
             .atn,
             .cos,
             .exp,
@@ -3803,6 +3941,7 @@ const Builder = struct {
                 }
             },
             .point => if (!arguments[0].isNumeric() or !arguments[1].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
+            .fileattr => if (!arguments[0].isNumeric() or !arguments[1].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
             .pos => if (!arguments[0].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
             .screen => {
                 if (!arguments[0].isNumeric() or !arguments[1].isNumeric() or
@@ -3814,7 +3953,7 @@ const Builder = struct {
                 }
             },
             .rnd => if (arguments.len == 1 and !arguments[0].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
-            .inkey_string, .timer, .err, .erl, .csrlin => {},
+            .inkey_string, .timer, .err, .erl, .csrlin, .freefile => {},
         }
         return result;
     }
@@ -4895,6 +5034,11 @@ fn builtinForKeyword(keyword: frontend.Keyword) ?bytecode.Builtin {
         .ucase_string => .ucase_string,
         .val => .val,
         .eof => .eof,
+        .fileattr => .fileattr,
+        .freefile => .freefile,
+        .loc => .loc,
+        .lof => .lof,
+        .seek => .seek,
         .err => .err,
         .erl => .erl,
         .inkey_string => .inkey_string,

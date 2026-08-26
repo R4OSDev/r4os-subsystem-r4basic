@@ -6,7 +6,7 @@ const graphics_screen = @import("graphics_screen.zig");
 const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "2.2.0";
+pub const contract_version = "2.4.0";
 pub const default_instruction_budget: u32 = 262_144;
 pub const timer_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
@@ -42,6 +42,11 @@ pub const ScreenModeError = error{ModeUnavailable};
 pub const FileHostError = enum(u8) {
     unavailable,
     not_found,
+    path_not_found,
+    file_exists,
+    disk_full,
+    too_many_files,
+    lock_violation,
     permission_denied,
     path_error,
     io_error,
@@ -61,6 +66,23 @@ pub const FileWriteResult = union(enum) {
     failure: FileHostError,
 };
 
+pub const FileInfo = struct {
+    size: u32,
+};
+
+pub const FileInfoResult = union(enum) {
+    info: FileInfo,
+    missing,
+    pending,
+    failure: FileHostError,
+};
+
+pub const FileLockResult = union(enum) {
+    success,
+    pending,
+    failure: FileHostError,
+};
+
 pub const HostServices = struct {
     context: ?*anyopaque = null,
     math: *const fn (?*anyopaque, MathOperation, f64, f64) HostMathError!f64 = defaultMath,
@@ -69,6 +91,9 @@ pub const HostServices = struct {
     file_context: ?*anyopaque = null,
     file_read: *const fn (?*anyopaque, []const u8, u32, []u8) FileReadResult = unavailableFileRead,
     file_write: *const fn (?*anyopaque, []const u8, []const u8, bool) FileWriteResult = unavailableFileWrite,
+    file_write_at: *const fn (?*anyopaque, []const u8, u32, []const u8, bool) FileWriteResult = unavailableFileWriteAt,
+    file_info: *const fn (?*anyopaque, []const u8) FileInfoResult = unavailableFileInfo,
+    file_lock: *const fn (?*anyopaque, []const u8, u32, u32, bool) FileLockResult = unavailableFileLock,
     file_quiesce: *const fn (?*anyopaque) void = ignoreFileQuiesce,
     guest_directory: []const u8 = "",
     initial_random_seed: u32 = default_random_seed,
@@ -99,7 +124,15 @@ pub const RuntimeCode = enum(u8) {
     file_already_open,
     input_past_end,
     bad_file_name,
+    field_overflow,
+    field_active,
+    file_exists,
+    bad_record_length,
+    disk_full,
+    bad_record_number,
+    too_many_files,
     permission_denied,
+    path_not_found,
     path_file_access,
 };
 
@@ -130,7 +163,15 @@ pub const RuntimeDiagnostic = struct {
             .file_already_open => 55,
             .input_past_end => 62,
             .bad_file_name => 64,
+            .field_overflow => 50,
+            .field_active => 56,
+            .file_exists => 58,
+            .bad_record_length => 59,
+            .disk_full => 61,
+            .bad_record_number => 63,
+            .too_many_files => 67,
             .permission_denied => 70,
+            .path_not_found => 76,
             .path_file_access => 75,
             .raised_error => 5,
             .stack_overflow, .stack_underflow, .call_depth_exceeded, .invalid_instruction, .host_failure => 70,
@@ -307,7 +348,15 @@ const ExecutionError = values.Fault || error{
     FileAlreadyOpen,
     InputPastEnd,
     BadFileName,
+    FieldOverflow,
+    FieldActive,
+    FileExists,
+    BadRecordLength,
+    DiskFull,
+    BadRecordNumber,
+    TooManyFiles,
     PermissionDenied,
+    PathNotFound,
     PathFileAccess,
 };
 
@@ -392,9 +441,15 @@ const FixedString = struct {
     }
 };
 
+const FieldString = struct {
+    value: values.Value,
+    file_generation: u64,
+};
+
 const OwnedValue = union(enum) {
     scalar: values.Value,
     fixed_string: FixedString,
+    field_string: FieldString,
     array: ArrayValue,
     record: RecordValue,
 
@@ -402,6 +457,7 @@ const OwnedValue = union(enum) {
         switch (self.*) {
             .scalar => |*scalar| scalar.deinit(allocator),
             .fixed_string => |*string| string.deinit(allocator),
+            .field_string => {},
             .array => |*array| array.deinit(allocator),
             .record => |*record| record.deinit(allocator),
         }
@@ -435,6 +491,7 @@ const Reference = union(enum) {
                 .owned => |*owned| switch (owned.*) {
                     .scalar => |scalar_value| scalar_value,
                     .fixed_string => |string| string.value,
+                    .field_string => |string| string.value,
                     else => error.TypeMismatch,
                 },
                 .alias => error.InvalidInstruction,
@@ -455,6 +512,10 @@ const Reference = union(enum) {
             .cell => |cell| switch (cell.*) {
                 .owned => |*owned| switch (owned.*) {
                     .fixed_string => |string| string.length,
+                    .field_string => |string| switch (string.value) {
+                        .string => |bytes| @intCast(bytes.len),
+                        else => error.InvalidInstruction,
+                    },
                     .scalar => null,
                     else => error.TypeMismatch,
                 },
@@ -499,6 +560,16 @@ const Reference = union(enum) {
                         destination.value = .{ .string = replacement };
                         var consumed = incoming;
                         consumed.deinit(allocator);
+                    },
+                    .field_string => {
+                        const source = switch (incoming) {
+                            .string => |bytes| bytes,
+                            else => return error.TypeMismatch,
+                        };
+                        const replacement = try allocator.dupe(u8, source);
+                        var consumed = incoming;
+                        consumed.deinit(allocator);
+                        owned.* = .{ .scalar = .{ .string = replacement } };
                     },
                     else => return error.TypeMismatch,
                 },
@@ -616,9 +687,25 @@ const ResumeMode = enum {
     label,
 };
 
+const FileRange = struct {
+    first: u32,
+    last: u32,
+};
+
 const SequentialFile = struct {
     mode: bytecode.FileMode,
+    access: bytecode.FileAccess = .default,
+    open_lock: bytecode.FileLock = .default,
     path: []u8,
+    record_length: u16 = 128,
+    size: u32 = 0,
+    next_position: u32 = 1,
+    generation: u64 = 0,
+    storage_ready: bool = false,
+    create_pending: bool = false,
+    open_lock_ready: bool = false,
+    record_buffer: []u8 = &.{},
+    locks: std.ArrayList(FileRange) = .empty,
     input: std.ArrayList(u8) = .empty,
     input_head: usize = 0,
     input_offset: usize = 0,
@@ -632,6 +719,8 @@ const SequentialFile = struct {
         allocator.free(self.path);
         self.input.deinit(allocator);
         self.output.deinit(allocator);
+        if (self.record_buffer.len != 0) allocator.free(self.record_buffer);
+        self.locks.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -639,6 +728,23 @@ const SequentialFile = struct {
 const FileSlot = struct {
     number: u8,
     file: SequentialFile,
+};
+
+const PendingFileTransfer = struct {
+    instruction: u32,
+    file_number: u8,
+    write: bool,
+    offset: u32,
+    buffer: []u8,
+    transferred: usize = 0,
+    stack_base: usize,
+    flags: u32,
+    position: u32,
+
+    fn deinit(self: *PendingFileTransfer, allocator: std.mem.Allocator) void {
+        allocator.free(self.buffer);
+        self.* = undefined;
+    }
 };
 
 const module_frame = bytecode.invalid_index;
@@ -743,6 +849,8 @@ pub const Vm = struct {
     file_slot_indices: [maximum_file_number + 1]u8 = .{0} ** (maximum_file_number + 1),
     pending_open_file: ?SequentialFile = null,
     pending_open_number: u8 = 0,
+    next_file_generation: u64 = 1,
+    pending_file_transfer: ?PendingFileTransfer = null,
     active_print_file: ?u8 = null,
     print_using_cursor: usize = 0,
     write_item_count: usize = 0,
@@ -780,6 +888,7 @@ pub const Vm = struct {
 
     pub fn deinit(self: *Vm) void {
         self.host.file_quiesce(self.fileHostContext());
+        self.discardPendingFileTransfer();
         self.discardStackFrom(0);
         self.stack.deinit(self.allocator);
         while (self.frames.pop()) |frame_value| {
@@ -1142,6 +1251,7 @@ pub const Vm = struct {
         self.audio_fence_frames = 0;
         self.random_state = normalizeRandomSeed(self.host.initial_random_seed);
         self.random_last = randomValue(self.random_state);
+        self.discardPendingFileTransfer();
         self.discardFiles();
         self.active_print_file = null;
         self.print_using_cursor = 0;
@@ -1322,6 +1432,7 @@ pub const Vm = struct {
                 return switch (cell.owned) {
                     .scalar => |*scalar| scalar,
                     .fixed_string => |*string| &string.value,
+                    .field_string => |*string| &string.value,
                     else => null,
                 };
             }
@@ -1393,6 +1504,7 @@ pub const Vm = struct {
                 return switch (field_cell.owned) {
                     .scalar => |*scalar| scalar,
                     .fixed_string => |*string| &string.value,
+                    .field_string => |*string| &string.value,
                     else => null,
                 };
             }
@@ -1597,6 +1709,13 @@ pub const Vm = struct {
             .sleep,
             .file_open,
             .file_close,
+            .file_get,
+            .file_put,
+            .file_field,
+            .file_seek,
+            .file_lock,
+            .file_unlock,
+            .file_reset,
             .audio_beep,
             .audio_play,
             .call_builtin,
@@ -1675,8 +1794,15 @@ pub const Vm = struct {
             .input_string => try self.inputString(instruction_index, instruction.a, instruction.b != 0),
             .randomize => try self.randomize(instruction_index, instruction.a),
             .sleep => try self.sleep(instruction_index, instruction.a),
-            .file_open => try self.openFile(@enumFromInt(@as(u8, @intCast(instruction.a)))),
+            .file_open => try self.openFile(instruction_index, @enumFromInt(@as(u8, @intCast(instruction.a))), instruction.b),
             .file_close => try self.closeFiles(instruction.a),
+            .file_get => try self.fileTransfer(instruction_index, false, instruction.a),
+            .file_put => try self.fileTransfer(instruction_index, true, instruction.a),
+            .file_field => try self.bindFileFields(instruction.a),
+            .file_seek => try self.seekFile(),
+            .file_lock => try self.lockFile(false, instruction.a),
+            .file_unlock => try self.lockFile(true, instruction.a),
+            .file_reset => try self.resetFiles(),
             .audio_beep => try self.audioBeep(instruction_index),
             .audio_play => try self.audioPlay(instruction_index),
             .convert => try self.convertTop(bytecode.decodeValueType(instruction.a)),
@@ -2135,6 +2261,10 @@ pub const Vm = struct {
                 };
                 @memset(bytes, ' ');
             },
+            .field_string => |*string| switch (string.value) {
+                .string => |bytes| @memset(bytes, ' '),
+                else => return error.InvalidInstruction,
+            },
             .record => |*record| for (record.fields) |*field| try self.clearCell(field),
             .array => |*array| try self.eraseArrayValue(array),
         }
@@ -2180,13 +2310,26 @@ pub const Vm = struct {
             .string => |bytes| bytes,
             else => return error.TypeMismatch,
         };
-        const replacement = try self.allocator.alloc(u8, field.len);
-        errdefer self.allocator.free(replacement);
+        const direct = switch (destination) {
+            .cell => |cell| blk: {
+                const resolved = resolveCell(cell) orelse return error.InvalidInstruction;
+                break :blk switch (resolved.owned) {
+                    .field_string => |value| switch (value.value) {
+                        .string => |bytes| bytes,
+                        else => return error.InvalidInstruction,
+                    },
+                    else => null,
+                };
+            },
+            else => null,
+        };
+        const replacement = if (direct) |bytes| bytes else try self.allocator.alloc(u8, field.len);
+        errdefer if (direct == null) self.allocator.free(replacement);
         @memset(replacement, ' ');
         const amount = @min(replacement.len, source.len);
         const first = if (right and source.len < replacement.len) replacement.len - amount else 0;
         @memcpy(replacement[first .. first + amount], source[0..amount]);
-        try destination.replace(self.allocator, .{ .string = replacement });
+        if (direct == null) try destination.replace(self.allocator, .{ .string = replacement });
     }
 
     fn copyRecord(self: *Vm) ExecutionError!void {
@@ -2250,6 +2393,7 @@ pub const Vm = struct {
                     .fixed_string => |second_string| first_string.length == second_string.length,
                     else => false,
                 },
+                .field_string => false,
                 .record => |first_record| switch (second_cell.owned) {
                     .record => |second_record| first_record.record_type == second_record.record_type,
                     else => false,
@@ -2261,7 +2405,8 @@ pub const Vm = struct {
                 return;
             }
             if (first_cell.owned == .record or second_cell.owned == .record or
-                first_cell.owned == .fixed_string or second_cell.owned == .fixed_string)
+                first_cell.owned == .fixed_string or second_cell.owned == .fixed_string or
+                first_cell.owned == .field_string or second_cell.owned == .field_string)
             {
                 return error.TypeMismatch;
             }
@@ -2313,6 +2458,7 @@ pub const Vm = struct {
 
     fn resumeError(self: *Vm, mode: ResumeMode, label: u32) ExecutionError!void {
         const active = self.active_error orelse return error.ResumeWithoutError;
+        if (mode != .retry) self.discardPendingFileTransfer();
         if (active.handler_frame == module_frame) {
             self.module_error_handler_active = false;
         } else {
@@ -2624,7 +2770,7 @@ pub const Vm = struct {
     fn printBeginFile(self: *Vm) ExecutionError!void {
         const file_number = try self.popFileNumber();
         const file = try self.fileAt(file_number);
-        if (file.mode == .input) return error.BadFileMode;
+        if (file.mode != .output and file.mode != .append) return error.BadFileMode;
         self.active_print_file = @intCast(file_number);
     }
 
@@ -2843,7 +2989,7 @@ pub const Vm = struct {
     fn printBytes(self: *Vm, bytes: []const u8) ExecutionError!void {
         if (self.active_print_file) |raw_number| {
             const file = try self.fileAt(raw_number);
-            if (file.mode == .input) return error.BadFileMode;
+            if (file.mode != .output and file.mode != .append) return error.BadFileMode;
             try self.appendFileBytes(file, bytes);
             return;
         }
@@ -2864,6 +3010,8 @@ pub const Vm = struct {
             if (newline) try file.output.appendSlice(self.allocator, "\r\n");
             try file.output.appendNTimes(self.allocator, ' ', spaces);
             file.output_total_bytes += additional;
+            file.next_position +|= @intCast(additional);
+            file.size = @max(file.size, file.next_position - 1);
             file.print_column = target;
             self.noteFileOutputBuffer(file);
             self.discardStackFrom(self.stack.items.len - 1);
@@ -2889,6 +3037,8 @@ pub const Vm = struct {
             try self.ensureFileOutputSpace(file, count);
             try file.output.appendNTimes(self.allocator, ' ', count);
             file.output_total_bytes += count;
+            file.next_position +|= @intCast(count);
+            file.size = @max(file.size, file.next_position - 1);
             file.print_column +|= count;
             self.noteFileOutputBuffer(file);
             return;
@@ -2914,6 +3064,8 @@ pub const Vm = struct {
         try self.ensureFileOutputSpace(file, bytes.len);
         try file.output.appendSlice(self.allocator, bytes);
         file.output_total_bytes += bytes.len;
+        file.next_position +|= @intCast(bytes.len);
+        file.size = @max(file.size, file.next_position - 1);
         for (bytes) |byte| switch (byte) {
             '\r', '\n' => file.print_column = 0,
             else => file.print_column +|= 1,
@@ -2992,7 +3144,8 @@ pub const Vm = struct {
             const raw_file = try values.asLong(try self.stackValueAt(base + 1));
             if (raw_file < 1 or raw_file > maximum_file_number) return error.BadFileNumber;
             const file = try self.fileAt(@intCast(raw_file));
-            if (file.mode != .input) return error.BadFileMode;
+            if (file.mode != .input and file.mode != .binary) return error.BadFileMode;
+            if (!fileCanRead(file)) return error.BadFileMode;
             const available = file.input.items.len - file.input_head;
             if (available < count) {
                 if (file.input_eof) return error.InputPastEnd;
@@ -3002,6 +3155,7 @@ pub const Vm = struct {
             }
             const result = try self.allocator.dupe(u8, file.input.items[file.input_head .. file.input_head + count]);
             file.input_head += count;
+            file.next_position +|= @intCast(count);
             if (file.input_head == file.input.items.len) {
                 file.input.clearRetainingCapacity();
                 file.input_head = 0;
@@ -3192,7 +3346,8 @@ pub const Vm = struct {
             for (parsed[0..initialized]) |*value| value.deinit(self.allocator);
             self.allocator.free(parsed);
         }
-        var cursor = file.input_head;
+        const original_cursor = file.input_head;
+        var cursor = original_cursor;
         if (line_input) {
             if (target_count != 1 or try self.inputTargetType(statement_base + 1) != .string) return error.TypeMismatch;
             if (cursor >= file.input.items.len) {
@@ -3232,6 +3387,7 @@ pub const Vm = struct {
         }
         try self.assignInputValues(statement_base + 1, parsed);
         self.allocator.free(parsed);
+        file.next_position +|= @intCast(cursor - original_cursor);
         file.input_head = cursor;
         if (file.input_head == file.input.items.len) {
             file.input.clearRetainingCapacity();
@@ -3362,47 +3518,92 @@ pub const Vm = struct {
         return error.WouldBlock;
     }
 
-    fn openFile(self: *Vm, mode: bytecode.FileMode) ExecutionError!void {
-        self.openFileStep(mode) catch |fault| {
+    fn openFile(self: *Vm, instruction_index: u32, mode: bytecode.FileMode, flags: u32) ExecutionError!void {
+        self.openFileStep(instruction_index, mode, flags) catch |fault| {
             if (fault != error.WouldBlock) self.discardPendingOpen();
             return fault;
         };
     }
 
-    fn openFileStep(self: *Vm, mode: bytecode.FileMode) ExecutionError!void {
-        if (self.stack.items.len < 2) return error.StackUnderflow;
-        const statement_base = self.stack.items.len - 2;
-        const file_number = try self.fileNumberAt(statement_base + 1);
-        const path_value = try self.stackValueAt(statement_base);
+    fn openFileStep(self: *Vm, _: u32, encoded_mode: bytecode.FileMode, flags: u32) ExecutionError!void {
+        const legacy = (flags & bytecode.file_open_legacy) != 0;
+        const has_length = (flags & bytecode.file_open_has_length) != 0;
+        const argument_count: usize = (if (legacy) @as(usize, 3) else 2) + @intFromBool(has_length);
+        if (self.stack.items.len < argument_count) return error.StackUnderflow;
+        const statement_base = self.stack.items.len - argument_count;
+        const mode = if (legacy) try legacyFileMode(try self.stackValueAt(statement_base)) else encoded_mode;
+        const file_index = statement_base + if (legacy) @as(usize, 1) else 1;
+        const path_index = statement_base + if (legacy) @as(usize, 2) else 0;
+        const length_index = statement_base + if (legacy) @as(usize, 3) else 2;
+        const file_number = try self.fileNumberAt(file_index);
+        const path_value = try self.stackValueAt(path_index);
         const raw_path = switch (path_value) {
             .string => |value| value,
             else => return error.TypeMismatch,
         };
+        const record_length: u16 = if (has_length) blk: {
+            const requested = try values.asLong(try self.stackValueAt(length_index));
+            if (requested < 1 or requested > 32_767) return error.BadRecordLength;
+            break :blk @intCast(requested);
+        } else if (mode == .binary) 1 else 128;
+        const access: bytecode.FileAccess = if (legacy)
+            .default
+        else blk: {
+            const raw = (flags >> bytecode.file_open_access_shift) & 0x0F;
+            if (raw > @intFromEnum(bytecode.FileAccess.read_write)) return error.InvalidInstruction;
+            break :blk @enumFromInt(@as(u8, @intCast(raw)));
+        };
+        const open_lock: bytecode.FileLock = if (legacy)
+            .default
+        else blk: {
+            const raw = (flags >> bytecode.file_open_lock_shift) & 0x0F;
+            if (raw > @intFromEnum(bytecode.FileLock.read_write)) return error.InvalidInstruction;
+            break :blk @enumFromInt(@as(u8, @intCast(raw)));
+        };
+        try validateFileAccess(mode, access);
 
         if (self.pending_open_file == null) {
             if (self.fileSlotIndex(file_number) != null) return error.FileAlreadyOpen;
-            const resolved_path = try self.resolveGuestPath(raw_path);
-            self.pending_open_file = .{
-                .mode = mode,
-                .path = resolved_path,
+            self.pending_open_file = blk: {
+                const resolved_path = try self.resolveGuestPath(raw_path);
+                errdefer self.allocator.free(resolved_path);
+                const record_buffer: []u8 = if (mode == .random or mode == .binary)
+                    try self.allocator.alloc(u8, record_length)
+                else
+                    &.{};
+                errdefer if (record_buffer.len != 0) self.allocator.free(record_buffer);
+                if (record_buffer.len != 0) @memset(record_buffer, 0);
+                break :blk .{
+                    .mode = mode,
+                    .access = access,
+                    .open_lock = open_lock,
+                    .path = resolved_path,
+                    .record_length = record_length,
+                    .generation = self.next_file_generation,
+                    .record_buffer = record_buffer,
+                };
             };
+            self.next_file_generation +%= 1;
+            if (self.next_file_generation == 0) self.next_file_generation = 1;
             self.pending_open_number = @intCast(file_number);
-        } else if (self.pending_open_number != file_number or self.pending_open_file.?.mode != mode) {
+        } else if (self.pending_open_number != file_number or self.pending_open_file.?.mode != mode or
+            self.pending_open_file.?.access != access or self.pending_open_file.?.record_length != record_length)
+        {
             return error.InvalidInstruction;
         }
 
         const pending = &self.pending_open_file.?;
-        switch (mode) {
-            .input => if (pending.input_offset == 0 and pending.input.items.len == 0 and !pending.input_eof) {
-                try self.refillFileInput(pending);
+        if (!pending.storage_ready) switch (mode) {
+            .input => {
+                if (pending.input_offset == 0 and pending.input.items.len == 0 and !pending.input_eof) try self.refillFileInput(pending);
+                pending.storage_ready = true;
             },
-            .output, .append => switch (self.host.file_write(
-                self.fileHostContext(),
-                pending.path,
-                "",
-                mode == .append,
-            )) {
-                .bytes => |count| if (count != 0) return error.PathFileAccess,
+            .output => switch (self.host.file_write(self.fileHostContext(), pending.path, "", false)) {
+                .bytes => |count| {
+                    if (count != 0) return error.PathFileAccess;
+                    pending.storage_ready = true;
+                    pending.size = 0;
+                },
                 .pending => {
                     self.file_io_waits +%= 1;
                     self.scheduleFilePoll();
@@ -3410,6 +3611,101 @@ pub const Vm = struct {
                 },
                 .failure => |failure| return fileHostFault(failure),
             },
+            .append => {
+                if (!pending.create_pending) switch (self.host.file_write(self.fileHostContext(), pending.path, "", true)) {
+                    .bytes => |count| {
+                        if (count != 0) return error.PathFileAccess;
+                        pending.create_pending = true;
+                    },
+                    .pending => {
+                        self.file_io_waits +%= 1;
+                        self.scheduleFilePoll();
+                        return error.WouldBlock;
+                    },
+                    .failure => |failure| return fileHostFault(failure),
+                };
+                switch (self.host.file_info(self.fileHostContext(), pending.path)) {
+                    .info => |info| {
+                        pending.size = info.size;
+                        pending.next_position = info.size +| 1;
+                        pending.input_offset = info.size;
+                        pending.storage_ready = true;
+                        pending.create_pending = false;
+                    },
+                    .missing => return error.FileNotFound,
+                    .pending => {
+                        self.file_io_waits +%= 1;
+                        self.scheduleFilePoll();
+                        return error.WouldBlock;
+                    },
+                    .failure => |failure| if (failure == .unavailable) {
+                        // Legacy embedders only supplied the original read/
+                        // write callbacks. Their append behavior remains
+                        // usable, while the R4OS adapter reports the exact EOF.
+                        pending.size = 0;
+                        pending.next_position = 1;
+                        pending.storage_ready = true;
+                        pending.create_pending = false;
+                    } else return fileHostFault(failure),
+                }
+            },
+            .random, .binary => if (pending.create_pending) switch (self.host.file_write_at(self.fileHostContext(), pending.path, 0, "", true)) {
+                .bytes => |count| {
+                    if (count != 0) return error.PathFileAccess;
+                    pending.size = 0;
+                    pending.storage_ready = true;
+                    pending.create_pending = false;
+                },
+                .pending => {
+                    self.file_io_waits +%= 1;
+                    self.scheduleFilePoll();
+                    return error.WouldBlock;
+                },
+                .failure => |failure| return fileHostFault(failure),
+            } else switch (self.host.file_info(self.fileHostContext(), pending.path)) {
+                .info => |info| {
+                    pending.size = info.size;
+                    pending.storage_ready = true;
+                },
+                .missing => {
+                    if (!fileCanWrite(pending)) return error.FileNotFound;
+                    pending.create_pending = true;
+                    switch (self.host.file_write_at(self.fileHostContext(), pending.path, 0, "", true)) {
+                        .bytes => |count| {
+                            if (count != 0) return error.PathFileAccess;
+                            pending.size = 0;
+                            pending.storage_ready = true;
+                            pending.create_pending = false;
+                        },
+                        .pending => {
+                            self.file_io_waits +%= 1;
+                            self.scheduleFilePoll();
+                            return error.WouldBlock;
+                        },
+                        .failure => |failure| return fileHostFault(failure),
+                    }
+                },
+                .pending => {
+                    self.file_io_waits +%= 1;
+                    self.scheduleFilePoll();
+                    return error.WouldBlock;
+                },
+                .failure => |failure| return fileHostFault(failure),
+            },
+        };
+        if (!pending.open_lock_ready) {
+            if (pending.open_lock != .default and pending.open_lock != .shared) {
+                switch (self.host.file_lock(self.fileHostContext(), pending.path, 0, std.math.maxInt(u32), false)) {
+                    .success => {},
+                    .pending => {
+                        self.file_io_waits +%= 1;
+                        self.scheduleFilePoll();
+                        return error.WouldBlock;
+                    },
+                    .failure => |failure| return fileHostFault(failure),
+                }
+            }
+            pending.open_lock_ready = true;
         }
 
         const previous_capacity = self.open_files.capacity;
@@ -3427,6 +3723,343 @@ pub const Vm = struct {
         self.discardStackFrom(statement_base);
     }
 
+    fn fileTransfer(self: *Vm, instruction_index: u32, write: bool, flags: u32) ExecutionError!void {
+        if ((flags & ~(bytecode.file_argument_position | bytecode.file_argument_variable)) != 0) return error.InvalidInstruction;
+        const argument_count: usize = 1 + @as(usize, @intFromBool((flags & bytecode.file_argument_position) != 0)) +
+            @as(usize, @intFromBool((flags & bytecode.file_argument_variable) != 0));
+        if (self.stack.items.len < argument_count) return error.StackUnderflow;
+        const stack_base = self.stack.items.len - argument_count;
+        const file_number = try self.fileNumberAt(stack_base);
+        const file = try self.fileAt(file_number);
+        if (file.mode != .random and file.mode != .binary) return error.BadFileMode;
+        if (write) {
+            if (!fileCanWrite(file)) return error.BadFileMode;
+        } else if (!fileCanRead(file)) return error.BadFileMode;
+
+        var stack_index = stack_base + 1;
+        const position: u32 = if ((flags & bytecode.file_argument_position) != 0) blk: {
+            const raw = try values.asLong(try self.stackValueAt(stack_index));
+            stack_index += 1;
+            if (raw < 1) return error.BadRecordNumber;
+            break :blk @intCast(raw);
+        } else file.next_position;
+        const has_variable = (flags & bytecode.file_argument_variable) != 0;
+        const variable = if (has_variable) try self.stackReferenceAt(stack_index) else null;
+        if (has_variable and file.mode == .random and self.hasFieldBindings(file.generation)) return error.FieldActive;
+        if (!has_variable and file.mode == .binary) return error.BadRecordLength;
+
+        const byte_length = if (variable) |reference|
+            try referenceByteLength(self.program, reference)
+        else
+            file.record_buffer.len;
+        if (byte_length == 0 or byte_length > std.math.maxInt(u32)) return error.BadRecordLength;
+        if (file.mode == .random and byte_length != file.record_length) return error.BadRecordLength;
+        const offset64: u64 = if (file.mode == .random)
+            @as(u64, position - 1) * file.record_length
+        else
+            position - 1;
+        if (offset64 > std.math.maxInt(u32) or offset64 + byte_length > @as(u64, std.math.maxInt(u32)) + 1) {
+            return error.BadRecordNumber;
+        }
+
+        if (self.pending_file_transfer == null) {
+            const buffer = try self.allocator.alloc(u8, byte_length);
+            errdefer self.allocator.free(buffer);
+            if (write) {
+                if (variable) |reference| {
+                    try encodeReference(self.program, reference, buffer);
+                } else {
+                    @memcpy(buffer, file.record_buffer);
+                }
+            }
+            self.pending_file_transfer = .{
+                .instruction = instruction_index,
+                .file_number = @intCast(file_number),
+                .write = write,
+                .offset = @intCast(offset64),
+                .buffer = buffer,
+                .stack_base = stack_base,
+                .flags = flags,
+                .position = position,
+            };
+        } else {
+            const pending = self.pending_file_transfer.?;
+            if (pending.instruction != instruction_index or pending.file_number != file_number or pending.write != write or
+                pending.offset != offset64 or pending.flags != flags or pending.position != position or pending.buffer.len != byte_length)
+            {
+                return error.InvalidInstruction;
+            }
+            self.pending_file_transfer.?.stack_base = stack_base;
+        }
+
+        const pending = &self.pending_file_transfer.?;
+        if (pending.transferred < pending.buffer.len) {
+            const request = @min(sequential_file_transfer_bytes, pending.buffer.len - pending.transferred);
+            const first = pending.transferred;
+            const transfer_offset: u32 = @intCast(@as(u64, pending.offset) + first);
+            if (write) {
+                switch (self.host.file_write_at(
+                    self.fileHostContext(),
+                    file.path,
+                    transfer_offset,
+                    pending.buffer[first .. first + request],
+                    true,
+                )) {
+                    .bytes => |raw_count| {
+                        const count: usize = @intCast(raw_count);
+                        if (count == 0 or count > request) return error.PathFileAccess;
+                        pending.transferred += count;
+                    },
+                    .pending => {
+                        self.file_io_waits +%= 1;
+                        self.scheduleFilePoll();
+                        return error.WouldBlock;
+                    },
+                    .failure => |failure| return fileHostFault(failure),
+                }
+            } else switch (self.host.file_read(
+                self.fileHostContext(),
+                file.path,
+                transfer_offset,
+                pending.buffer[first .. first + request],
+            )) {
+                .bytes => |raw_count| {
+                    const count: usize = @intCast(raw_count);
+                    if (count == 0 or count > request) return error.PathFileAccess;
+                    pending.transferred += count;
+                },
+                .end => return error.InputPastEnd,
+                .pending => {
+                    self.file_io_waits +%= 1;
+                    self.scheduleFilePoll();
+                    return error.WouldBlock;
+                },
+                .failure => |failure| return fileHostFault(failure),
+            }
+            if (pending.transferred != pending.buffer.len) {
+                self.scheduleFilePoll();
+                return error.WouldBlock;
+            }
+        }
+
+        if (!write) {
+            if (variable) |reference| {
+                try decodeReference(self.program, reference, pending.buffer);
+            } else {
+                @memcpy(file.record_buffer, pending.buffer);
+            }
+        }
+        if (write) file.size = @max(file.size, @as(u32, @intCast(@as(u64, pending.offset) + pending.buffer.len)));
+        file.next_position = if (file.mode == .random)
+            pending.position +| 1
+        else
+            @intCast(@as(u64, pending.position) + pending.buffer.len);
+        if (file.mode == .binary) {
+            file.input.clearRetainingCapacity();
+            file.input_head = 0;
+            file.input_offset = file.next_position - 1;
+            file.input_eof = false;
+        }
+        const completed_base = pending.stack_base;
+        self.discardPendingFileTransfer();
+        self.discardStackFrom(completed_base);
+    }
+
+    fn bindFileFields(self: *Vm, count: u32) ExecutionError!void {
+        if (count == 0) return error.InvalidInstruction;
+        const argument_count = 1 + @as(usize, count) * 2;
+        if (self.stack.items.len < argument_count) return error.StackUnderflow;
+        const base = self.stack.items.len - argument_count;
+        const file = try self.fileAt(try self.fileNumberAt(base));
+        if (file.mode != .random) return error.BadFileMode;
+
+        var total: usize = 0;
+        for (0..count) |index| {
+            const width_value = try self.stackValueAt(base + 1 + index * 2);
+            const raw_width = try values.asLong(width_value);
+            if (raw_width < 1 or raw_width > 32_767) return error.IllegalFunctionCall;
+            total = std.math.add(usize, total, @intCast(raw_width)) catch return error.FieldOverflow;
+            if (total > file.record_length) return error.FieldOverflow;
+            const reference = try self.stackReferenceAt(base + 2 + index * 2);
+            const cell = switch (reference) {
+                .cell => |value| resolveCell(value) orelse return error.InvalidInstruction,
+                else => return error.TypeMismatch,
+            };
+            switch (cell.owned) {
+                .scalar => |value| if (value != .string) return error.TypeMismatch,
+                .field_string => {},
+                else => return error.TypeMismatch,
+            }
+        }
+
+        var first: usize = 0;
+        for (0..count) |index| {
+            const width: usize = @intCast(try values.asLong(try self.stackValueAt(base + 1 + index * 2)));
+            const reference = try self.stackReferenceAt(base + 2 + index * 2);
+            const cell = resolveCell(reference.cell) orelse return error.InvalidInstruction;
+            cell.owned.deinit(self.allocator);
+            cell.owned = .{ .field_string = .{
+                .value = .{ .string = file.record_buffer[first .. first + width] },
+                .file_generation = file.generation,
+            } };
+            first += width;
+        }
+        self.discardStackFrom(base);
+    }
+
+    fn seekFile(self: *Vm) ExecutionError!void {
+        if (self.stack.items.len < 2) return error.StackUnderflow;
+        const base = self.stack.items.len - 2;
+        const file = try self.fileAt(try self.fileNumberAt(base));
+        const raw_position = try values.asLong(try self.stackValueAt(base + 1));
+        if (raw_position < 1) return error.BadRecordNumber;
+        if (file.output_head != file.output.items.len) try self.flushFileOutput(file);
+        if (file.mode == .input or file.mode == .binary) {
+            file.input.clearRetainingCapacity();
+            file.input_head = 0;
+            file.input_offset = @intCast(raw_position - 1);
+            file.input_eof = false;
+        }
+        file.next_position = @intCast(raw_position);
+        self.discardStackFrom(base);
+    }
+
+    fn lockFile(self: *Vm, unlock: bool, flags: u32) ExecutionError!void {
+        if ((flags & ~(bytecode.file_range_first | bytecode.file_range_last)) != 0) return error.InvalidInstruction;
+        const argument_count: usize = 1 + @as(usize, @intFromBool((flags & bytecode.file_range_first) != 0)) +
+            @as(usize, @intFromBool((flags & bytecode.file_range_last) != 0));
+        if (self.stack.items.len < argument_count) return error.StackUnderflow;
+        const base = self.stack.items.len - argument_count;
+        const file = try self.fileAt(try self.fileNumberAt(base));
+        var stack_index = base + 1;
+        const first_unit: u32 = if ((flags & bytecode.file_range_first) != 0) blk: {
+            const raw = try values.asLong(try self.stackValueAt(stack_index));
+            stack_index += 1;
+            if (raw < 1) return error.BadRecordNumber;
+            break :blk @intCast(raw);
+        } else 1;
+        const last_unit: u32 = if ((flags & bytecode.file_range_last) != 0) blk: {
+            const raw = try values.asLong(try self.stackValueAt(stack_index));
+            if (raw < 1) return error.BadRecordNumber;
+            break :blk @intCast(raw);
+        } else if ((flags & bytecode.file_range_first) != 0) first_unit else std.math.maxInt(u32);
+        if (last_unit < first_unit) return error.BadRecordNumber;
+
+        const range = try fileByteRange(file, first_unit, last_unit);
+        var existing: ?usize = null;
+        for (file.locks.items, 0..) |held, index| {
+            if (held.first == range.first and held.last == range.last) {
+                existing = index;
+                break;
+            }
+        }
+        if (unlock and existing == null) return error.PermissionDenied;
+        if (!unlock) try file.locks.ensureUnusedCapacity(self.allocator, 1);
+        const length = range.last - range.first +| 1;
+        switch (self.host.file_lock(self.fileHostContext(), file.path, range.first, length, unlock)) {
+            .success => {},
+            .pending => {
+                self.file_io_waits +%= 1;
+                self.scheduleFilePoll();
+                return error.WouldBlock;
+            },
+            .failure => |failure| return fileHostFault(failure),
+        }
+        if (unlock) {
+            _ = file.locks.swapRemove(existing.?);
+        } else {
+            file.locks.appendAssumeCapacity(range);
+        }
+        self.discardStackFrom(base);
+    }
+
+    fn resetFiles(self: *Vm) ExecutionError!void {
+        try self.closeAllFiles();
+    }
+
+    fn releaseFileLocks(self: *Vm, file: *SequentialFile) ExecutionError!void {
+        while (file.locks.items.len != 0) {
+            const range = file.locks.items[file.locks.items.len - 1];
+            switch (self.host.file_lock(self.fileHostContext(), file.path, range.first, range.last - range.first +| 1, true)) {
+                .success => _ = file.locks.pop(),
+                .pending => {
+                    self.file_io_waits +%= 1;
+                    self.scheduleFilePoll();
+                    return error.WouldBlock;
+                },
+                .failure => |failure| return fileHostFault(failure),
+            }
+        }
+        if (file.open_lock_ready and file.open_lock != .default and file.open_lock != .shared) {
+            switch (self.host.file_lock(self.fileHostContext(), file.path, 0, std.math.maxInt(u32), true)) {
+                .success => file.open_lock_ready = false,
+                .pending => {
+                    self.file_io_waits +%= 1;
+                    self.scheduleFilePoll();
+                    return error.WouldBlock;
+                },
+                .failure => |failure| return fileHostFault(failure),
+            }
+        }
+    }
+
+    fn stackReferenceAt(self: *Vm, index: usize) ExecutionError!Reference {
+        if (index >= self.stack.items.len) return error.StackUnderflow;
+        return switch (self.stack.items[index]) {
+            .reference => |reference| reference,
+            .value => error.InvalidInstruction,
+        };
+    }
+
+    fn discardPendingFileTransfer(self: *Vm) void {
+        if (self.pending_file_transfer) |*pending| pending.deinit(self.allocator);
+        self.pending_file_transfer = null;
+    }
+
+    fn hasFieldBindings(self: *const Vm, generation: u64) bool {
+        for (self.globals) |*cell| if (cellHasFieldBinding(cell, generation)) return true;
+        for (self.frames.items) |frame| {
+            const storage = &self.frame_local_storage.items[frame.local_pool_index];
+            var current = frame.initialized_local_head;
+            while (current != bytecode.invalid_index) {
+                const slot = &storage.slots.items[current];
+                if (slot.generation == frame.local_generation and cellHasFieldBinding(&slot.cell, generation)) return true;
+                current = slot.next_initialized;
+            }
+        }
+        return false;
+    }
+
+    fn invalidateFieldBindings(self: *Vm, generation: u64) ExecutionError!void {
+        for (self.globals) |*cell| try self.invalidateFieldCell(cell, generation);
+        for (self.frames.items) |frame| {
+            var storage = &self.frame_local_storage.items[frame.local_pool_index];
+            var current = frame.initialized_local_head;
+            while (current != bytecode.invalid_index) {
+                var slot = &storage.slots.items[current];
+                if (slot.generation == frame.local_generation) try self.invalidateFieldCell(&slot.cell, generation);
+                current = slot.next_initialized;
+            }
+        }
+    }
+
+    fn invalidateFieldCell(self: *Vm, cell: *Cell, generation: u64) ExecutionError!void {
+        switch (cell.*) {
+            .alias => {},
+            .owned => |*owned| switch (owned.*) {
+                .field_string => |field| if (field.file_generation == generation) {
+                    owned.* = .{ .scalar = .{ .string = try self.allocator.alloc(u8, 0) } };
+                },
+                .record => |*record| for (record.fields) |*field| try self.invalidateFieldCell(field, generation),
+                .array => |*array| switch (array.storage) {
+                    .cells => |cells| for (cells) |*item| try self.invalidateFieldCell(item, generation),
+                    else => {},
+                },
+                else => {},
+            },
+        }
+    }
+
     fn closeFiles(self: *Vm, argument_count: u32) ExecutionError!void {
         if (argument_count == 0) return self.closeAllFiles();
         if (argument_count > self.stack.items.len) return error.StackUnderflow;
@@ -3437,7 +4070,9 @@ pub const Vm = struct {
         while (current != 0) {
             current -= 1;
             const file_number = try self.fileNumberAt(first + current);
-            try self.flushFileOutput(try self.fileAt(file_number));
+            const file = try self.fileAt(file_number);
+            try self.flushFileOutput(file);
+            try self.releaseFileLocks(file);
         }
         current = count;
         while (current != 0) {
@@ -3451,7 +4086,9 @@ pub const Vm = struct {
         var current = self.open_files.items.len;
         while (current != 0) {
             current -= 1;
-            try self.flushFileOutput(&self.open_files.items[current].file);
+            const file = &self.open_files.items[current].file;
+            try self.flushFileOutput(file);
+            try self.releaseFileLocks(file);
         }
         while (self.open_files.items.len != 0) try self.removeFile(self.open_files.items[self.open_files.items.len - 1].number);
     }
@@ -3465,7 +4102,17 @@ pub const Vm = struct {
             return;
         }
         const remaining = file.output.items[file.output_head..];
-        switch (self.host.file_write(self.fileHostContext(), file.path, remaining, true)) {
+        const buffer_start = @as(u64, file.next_position - 1) - file.output.items.len;
+        const write_offset: u32 = @intCast(buffer_start + file.output_head);
+        const positional = self.host.file_write_at(self.fileHostContext(), file.path, write_offset, remaining, true);
+        const result: FileWriteResult = switch (positional) {
+            .failure => |failure| if (failure == .unavailable)
+                self.host.file_write(self.fileHostContext(), file.path, remaining, true)
+            else
+                .{ .failure = failure },
+            else => positional,
+        };
+        switch (result) {
             .bytes => |raw_count| {
                 const count: usize = @intCast(raw_count);
                 if (count == 0 or count > remaining.len) return error.PathFileAccess;
@@ -3490,6 +4137,7 @@ pub const Vm = struct {
     fn removeFile(self: *Vm, file_number: usize) ExecutionError!void {
         const slot_index = self.fileSlotIndex(file_number) orelse return error.BadFileNumber;
         var removed = self.open_files.swapRemove(slot_index);
+        try self.invalidateFieldBindings(removed.file.generation);
         removed.file.deinit(self.allocator);
         self.file_slot_indices[file_number] = 0;
         if (slot_index < self.open_files.items.len) {
@@ -3500,6 +4148,7 @@ pub const Vm = struct {
     }
 
     fn discardFiles(self: *Vm) void {
+        self.discardPendingFileTransfer();
         self.discardPendingOpen();
         for (self.open_files.items) |*slot| slot.file.deinit(self.allocator);
         self.open_files.clearRetainingCapacity();
@@ -3515,13 +4164,19 @@ pub const Vm = struct {
     fn refillFileInput(self: *Vm, file: *SequentialFile) ExecutionError!void {
         if (file.input_eof) return;
         self.compactFileInput(file);
-        if (file.input_offset > maximum_sequential_file_bytes) return error.OutOfMemory;
-        const remaining_limit = maximum_sequential_file_bytes + 1 - file.input_offset;
+        const is_binary = file.mode == .binary;
+        if (!is_binary and file.input_offset > maximum_sequential_file_bytes) return error.OutOfMemory;
+        const buffer_limit = if (is_binary) sequential_file_transfer_bytes else maximum_sequential_file_bytes + 1;
+        const remaining_limit = if (is_binary)
+            buffer_limit - file.input.items.len
+        else
+            maximum_sequential_file_bytes + 1 - file.input_offset;
         const requested = @min(sequential_file_transfer_bytes, remaining_limit);
+        if (requested == 0) return error.OutOfMemory;
         try self.ensureFileBufferCapacity(
             &file.input,
             file.input.items.len + requested,
-            maximum_sequential_file_bytes + 1,
+            buffer_limit,
         );
         self.maximum_file_input_buffer_bytes = @max(
             self.maximum_file_input_buffer_bytes,
@@ -3541,7 +4196,7 @@ pub const Vm = struct {
                 file.input.items.len += count;
                 file.input_offset += count;
                 self.file_input_refills +%= 1;
-                if (file.input_offset > maximum_sequential_file_bytes) return error.OutOfMemory;
+                if (!is_binary and file.input_offset > maximum_sequential_file_bytes) return error.OutOfMemory;
             },
             .end => file.input_eof = true,
             .pending => {
@@ -3986,6 +4641,11 @@ pub const Vm = struct {
             .ucase_string => self.upperString(arguments[0]),
             .val => self.val(arguments[0]),
             .eof => self.endOfFile(arguments[0]),
+            .fileattr => self.fileAttribute(arguments[0], arguments[1]),
+            .freefile => self.freeFileNumber(),
+            .loc => self.fileLocation(arguments[0]),
+            .lof => self.fileLength(arguments[0]),
+            .seek => self.fileSeekPosition(arguments[0]),
             .err => self.errorNumber(),
             .erl => self.errorLine(),
             .inkey_string => self.inkeyString(),
@@ -4004,10 +4664,78 @@ pub const Vm = struct {
         const raw_number = try values.asLong(file_number_value);
         if (raw_number < 1 or raw_number > maximum_file_number) return error.BadFileNumber;
         const file = try self.fileAt(@intCast(raw_number));
+        if (!fileCanRead(file)) return error.BadFileMode;
+        if (file.mode == .random) {
+            const offset = @as(u64, file.next_position - 1) * file.record_length;
+            return .{ .integer = if (offset >= file.size) -1 else 0 };
+        }
+        if (file.mode == .binary) return .{ .integer = if (file.next_position - 1 >= file.size) -1 else 0 };
         if (file.mode != .input) return error.BadFileMode;
         if (file.input_head < file.input.items.len) return .{ .integer = 0 };
         if (!file.input_eof) try self.refillFileInput(file);
         return .{ .integer = if (file.input_eof and file.input_head >= file.input.items.len) -1 else 0 };
+    }
+
+    fn freeFileNumber(self: *const Vm) values.Value {
+        var number: usize = 1;
+        while (number <= maximum_file_number) : (number += 1) {
+            if (self.fileSlotIndex(number) == null) return .{ .integer = @intCast(number) };
+        }
+        return .{ .integer = 0 };
+    }
+
+    fn fileAttribute(self: *Vm, file_value: values.Value, attribute_value: values.Value) ExecutionError!values.Value {
+        const raw_number = try values.asLong(file_value);
+        if (raw_number < 1 or raw_number > maximum_file_number) return error.BadFileNumber;
+        const file = try self.fileAt(@intCast(raw_number));
+        const attribute = try values.asLong(attribute_value);
+        if (attribute == 1) return .{ .integer = switch (file.mode) {
+            .input => 1,
+            .output => 2,
+            .random => 4,
+            .append => 8,
+            .binary => 32,
+        } };
+        // R4OS intentionally exposes no DOS handle. Attribute 2 is a stable,
+        // instance-local virtual slot and therefore remains typed and bounded.
+        if (attribute == 2) return .{ .integer = @intCast(raw_number) };
+        return error.IllegalFunctionCall;
+    }
+
+    fn fileLocation(self: *Vm, file_value: values.Value) ExecutionError!values.Value {
+        const raw_number = try values.asLong(file_value);
+        if (raw_number < 1 or raw_number > maximum_file_number) return error.BadFileNumber;
+        const file = try self.fileAt(@intCast(raw_number));
+        const result: u32 = switch (file.mode) {
+            .random, .binary => file.next_position - 1,
+            .input, .output, .append => (file.next_position - 1) / 128,
+        };
+        return .{ .long = @intCast(@min(result, @as(u32, std.math.maxInt(i32)))) };
+    }
+
+    fn fileLength(self: *Vm, file_value: values.Value) ExecutionError!values.Value {
+        const raw_number = try values.asLong(file_value);
+        if (raw_number < 1 or raw_number > maximum_file_number) return error.BadFileNumber;
+        const file = try self.fileAt(@intCast(raw_number));
+        if (file.mode == .random or file.mode == .binary) return .{ .long = @intCast(@min(file.size, @as(u32, std.math.maxInt(i32)))) };
+        switch (self.host.file_info(self.fileHostContext(), file.path)) {
+            .info => |info| file.size = @max(info.size, file.size),
+            .missing => return error.FileNotFound,
+            .pending => {
+                self.file_io_waits +%= 1;
+                self.scheduleFilePoll();
+                return error.WouldBlock;
+            },
+            .failure => |failure| return fileHostFault(failure),
+        }
+        return .{ .long = @intCast(@min(file.size, @as(u32, std.math.maxInt(i32)))) };
+    }
+
+    fn fileSeekPosition(self: *Vm, file_value: values.Value) ExecutionError!values.Value {
+        const raw_number = try values.asLong(file_value);
+        if (raw_number < 1 or raw_number > maximum_file_number) return error.BadFileNumber;
+        const file = try self.fileAt(@intCast(raw_number));
+        return .{ .long = @intCast(@min(file.next_position, @as(u32, std.math.maxInt(i32)))) };
     }
 
     fn errorLine(self: *const Vm) values.Value {
@@ -4841,10 +5569,221 @@ fn randomValue(state: u32) f32 {
     return @as(f32, @floatFromInt(state & random_mask)) / 16_777_216.0;
 }
 
+fn legacyFileMode(value: values.Value) ExecutionError!bytecode.FileMode {
+    const text = switch (value) {
+        .string => |bytes| std.mem.trim(u8, bytes, " \t"),
+        else => return error.TypeMismatch,
+    };
+    if (text.len != 1) return error.BadFileMode;
+    return switch (std.ascii.toUpper(text[0])) {
+        'I' => .input,
+        'O' => .output,
+        'A' => .append,
+        'R' => .random,
+        'B' => .binary,
+        else => error.BadFileMode,
+    };
+}
+
+fn validateFileAccess(mode: bytecode.FileMode, access: bytecode.FileAccess) ExecutionError!void {
+    const valid = switch (mode) {
+        .input => access == .default or access == .read,
+        .output, .append => access == .default or access == .write,
+        .random, .binary => true,
+    };
+    if (!valid) return error.BadFileMode;
+}
+
+fn fileCanRead(file: *const SequentialFile) bool {
+    return switch (file.mode) {
+        .input => true,
+        .output, .append => false,
+        .random, .binary => file.access == .default or file.access == .read or file.access == .read_write,
+    };
+}
+
+fn fileCanWrite(file: *const SequentialFile) bool {
+    return switch (file.mode) {
+        .input => false,
+        .output, .append => true,
+        .random, .binary => file.access == .default or file.access == .write or file.access == .read_write,
+    };
+}
+
+fn fileByteRange(file: *const SequentialFile, first_unit: u32, last_unit: u32) ExecutionError!FileRange {
+    if (file.mode == .input or file.mode == .output or file.mode == .append or last_unit == std.math.maxInt(u32)) {
+        return .{ .first = 0, .last = std.math.maxInt(u32) };
+    }
+    const scale: u64 = if (file.mode == .random) file.record_length else 1;
+    const first = @as(u64, first_unit - 1) * scale;
+    const exclusive_last = @as(u64, last_unit) * scale;
+    if (first > std.math.maxInt(u32) or exclusive_last == 0 or exclusive_last - 1 > std.math.maxInt(u32)) {
+        return error.BadRecordNumber;
+    }
+    return .{ .first = @intCast(first), .last = @intCast(exclusive_last - 1) };
+}
+
+fn referenceByteLength(program: *const bytecode.Program, reference: Reference) ExecutionError!usize {
+    return switch (reference) {
+        .integer => 2,
+        .long, .single => 4,
+        .double => 8,
+        .cell => |cell| ownedByteLength(program, &(resolveCellConst(cell) orelse return error.InvalidInstruction).owned),
+    };
+}
+
+fn ownedByteLength(program: *const bytecode.Program, owned: *const OwnedValue) ExecutionError!usize {
+    return switch (owned.*) {
+        .scalar => |value| switch (value) {
+            .integer => 2,
+            .long, .single => 4,
+            .double => 8,
+            .string => |bytes| bytes.len,
+        },
+        .fixed_string => |string| string.length,
+        .field_string => |string| switch (string.value) {
+            .string => |bytes| bytes.len,
+            else => error.InvalidInstruction,
+        },
+        .record => |record| if (record.record_type < program.record_types.len)
+            program.record_types[record.record_type].byte_size
+        else
+            error.InvalidInstruction,
+        .array => |array| switch (array.storage) {
+            .integer => |items| items.len * 2,
+            .long => |items| items.len * 4,
+            .single => |items| items.len * 4,
+            .double => |items| items.len * 8,
+            .cells => |items| blk: {
+                var total: usize = 0;
+                for (items) |*item| {
+                    const resolved = resolveCellConst(item) orelse return error.InvalidInstruction;
+                    total = std.math.add(usize, total, try ownedByteLength(program, &resolved.owned)) catch return error.OutOfMemory;
+                }
+                break :blk total;
+            },
+        },
+    };
+}
+
+fn encodeReference(program: *const bytecode.Program, reference: Reference, out: []u8) ExecutionError!void {
+    if (out.len != try referenceByteLength(program, reference)) return error.InvalidInstruction;
+    switch (reference) {
+        .integer => |number| std.mem.writeInt(u16, out[0..2], @bitCast(number.*), .little),
+        .long => |number| std.mem.writeInt(u32, out[0..4], @bitCast(number.*), .little),
+        .single => |number| std.mem.writeInt(u32, out[0..4], @bitCast(number.*), .little),
+        .double => |number| std.mem.writeInt(u64, out[0..8], @bitCast(number.*), .little),
+        .cell => |cell| try encodeOwned(program, &(resolveCellConst(cell) orelse return error.InvalidInstruction).owned, out),
+    }
+}
+
+fn encodeOwned(program: *const bytecode.Program, owned: *const OwnedValue, out: []u8) ExecutionError!void {
+    switch (owned.*) {
+        .scalar => |value| switch (value) {
+            .integer => |number| std.mem.writeInt(u16, out[0..2], @bitCast(number), .little),
+            .long => |number| std.mem.writeInt(u32, out[0..4], @bitCast(number), .little),
+            .single => |number| std.mem.writeInt(u32, out[0..4], @bitCast(number), .little),
+            .double => |number| std.mem.writeInt(u64, out[0..8], @bitCast(number), .little),
+            .string => |bytes| @memcpy(out, bytes),
+        },
+        .fixed_string => |string| @memcpy(out, string.value.string),
+        .field_string => |string| @memcpy(out, string.value.string),
+        .record => |record| {
+            var temporary: Cell = .{ .owned = .{ .record = record } };
+            try encodeRecord(program, &temporary, out);
+        },
+        .array => |array| switch (array.storage) {
+            .integer => |items| @memcpy(out, std.mem.sliceAsBytes(items)),
+            .long => |items| @memcpy(out, std.mem.sliceAsBytes(items)),
+            .single => |items| @memcpy(out, std.mem.sliceAsBytes(items)),
+            .double => |items| @memcpy(out, std.mem.sliceAsBytes(items)),
+            .cells => |items| {
+                var cursor: usize = 0;
+                for (items) |*item| {
+                    const resolved = resolveCellConst(item) orelse return error.InvalidInstruction;
+                    const length = try ownedByteLength(program, &resolved.owned);
+                    try encodeOwned(program, &resolved.owned, out[cursor .. cursor + length]);
+                    cursor += length;
+                }
+            },
+        },
+    }
+}
+
+fn decodeReference(program: *const bytecode.Program, reference: Reference, bytes: []const u8) ExecutionError!void {
+    if (bytes.len != try referenceByteLength(program, reference)) return error.InvalidInstruction;
+    switch (reference) {
+        .integer => |number| number.* = @bitCast(std.mem.readInt(u16, bytes[0..2], .little)),
+        .long => |number| number.* = @bitCast(std.mem.readInt(u32, bytes[0..4], .little)),
+        .single => |number| number.* = @bitCast(std.mem.readInt(u32, bytes[0..4], .little)),
+        .double => |number| number.* = @bitCast(std.mem.readInt(u64, bytes[0..8], .little)),
+        .cell => |cell| try decodeOwned(program, &(resolveCell(cell) orelse return error.InvalidInstruction).owned, bytes),
+    }
+}
+
+fn decodeOwned(program: *const bytecode.Program, owned: *OwnedValue, bytes: []const u8) ExecutionError!void {
+    switch (owned.*) {
+        .scalar => |*value| switch (value.*) {
+            .integer => value.* = .{ .integer = @bitCast(std.mem.readInt(u16, bytes[0..2], .little)) },
+            .long => value.* = .{ .long = @bitCast(std.mem.readInt(u32, bytes[0..4], .little)) },
+            .single => value.* = .{ .single = @bitCast(std.mem.readInt(u32, bytes[0..4], .little)) },
+            .double => value.* = .{ .double = @bitCast(std.mem.readInt(u64, bytes[0..8], .little)) },
+            .string => |out| @memcpy(out, bytes),
+        },
+        .fixed_string => |*string| @memcpy(string.value.string, bytes),
+        .field_string => |*string| @memcpy(string.value.string, bytes),
+        .record => |record| {
+            var temporary: Cell = .{ .owned = .{ .record = record } };
+            try decodeRecord(program, &temporary, bytes);
+        },
+        .array => |*array| switch (array.storage) {
+            .integer => |items| @memcpy(std.mem.sliceAsBytes(items), bytes),
+            .long => |items| @memcpy(std.mem.sliceAsBytes(items), bytes),
+            .single => |items| @memcpy(std.mem.sliceAsBytes(items), bytes),
+            .double => |items| @memcpy(std.mem.sliceAsBytes(items), bytes),
+            .cells => |items| {
+                var cursor: usize = 0;
+                for (items) |*item| {
+                    const resolved = resolveCell(item) orelse return error.InvalidInstruction;
+                    const length = try ownedByteLength(program, &resolved.owned);
+                    try decodeOwned(program, &resolved.owned, bytes[cursor .. cursor + length]);
+                    cursor += length;
+                }
+            },
+        },
+    }
+}
+
+fn cellHasFieldBinding(cell: *const Cell, generation: u64) bool {
+    return switch (cell.*) {
+        .alias => false,
+        .owned => |owned| switch (owned) {
+            .field_string => |field| field.file_generation == generation,
+            .record => |record| blk: {
+                for (record.fields) |*field| if (cellHasFieldBinding(field, generation)) break :blk true;
+                break :blk false;
+            },
+            .array => |array| switch (array.storage) {
+                .cells => |items| blk: {
+                    for (items) |*item| if (cellHasFieldBinding(item, generation)) break :blk true;
+                    break :blk false;
+                },
+                else => false,
+            },
+            else => false,
+        },
+    };
+}
+
 fn fileHostFault(failure: FileHostError) ExecutionError {
     return switch (failure) {
         .unavailable => error.HostFailure,
         .not_found => error.FileNotFound,
+        .path_not_found => error.PathNotFound,
+        .file_exists => error.FileExists,
+        .disk_full => error.DiskFull,
+        .too_many_files => error.TooManyFiles,
+        .lock_violation => error.PermissionDenied,
         .permission_denied => error.PermissionDenied,
         .path_error => error.PathFileAccess,
         .io_error => error.PathFileAccess,
@@ -5143,7 +6082,15 @@ fn runtimeCode(fault: ExecutionError) RuntimeCode {
         error.FileAlreadyOpen => .file_already_open,
         error.InputPastEnd => .input_past_end,
         error.BadFileName => .bad_file_name,
+        error.FieldOverflow => .field_overflow,
+        error.FieldActive => .field_active,
+        error.FileExists => .file_exists,
+        error.BadRecordLength => .bad_record_length,
+        error.DiskFull => .disk_full,
+        error.BadRecordNumber => .bad_record_number,
+        error.TooManyFiles => .too_many_files,
         error.PermissionDenied => .permission_denied,
+        error.PathNotFound => .path_not_found,
         error.PathFileAccess => .path_file_access,
         error.Rethrow => .invalid_instruction,
         error.WouldBlock => .invalid_instruction,
@@ -5152,7 +6099,7 @@ fn runtimeCode(fault: ExecutionError) RuntimeCode {
 
 fn isCatchable(code: RuntimeCode) bool {
     return switch (code) {
-        .overflow, .division_by_zero, .type_mismatch, .illegal_function_call, .out_of_memory, .gosub_without_return, .raised_error, .subscript_out_of_range, .array_already_dimensioned, .out_of_data, .restricted_memory, .bad_file_number, .file_not_found, .bad_file_mode, .file_already_open, .input_past_end, .bad_file_name, .permission_denied, .path_file_access => true,
+        .overflow, .division_by_zero, .type_mismatch, .illegal_function_call, .out_of_memory, .gosub_without_return, .raised_error, .subscript_out_of_range, .array_already_dimensioned, .out_of_data, .restricted_memory, .bad_file_number, .file_not_found, .bad_file_mode, .file_already_open, .input_past_end, .bad_file_name, .field_overflow, .field_active, .file_exists, .bad_record_length, .disk_full, .bad_record_number, .too_many_files, .permission_denied, .path_not_found, .path_file_access => true,
         .stack_overflow, .stack_underflow, .call_depth_exceeded, .invalid_instruction, .host_failure, .no_resume, .resume_without_error => false,
     };
 }
@@ -5183,6 +6130,18 @@ fn unavailableFileRead(_: ?*anyopaque, _: []const u8, _: u32, _: []u8) FileReadR
 }
 
 fn unavailableFileWrite(_: ?*anyopaque, _: []const u8, _: []const u8, _: bool) FileWriteResult {
+    return .{ .failure = .unavailable };
+}
+
+fn unavailableFileWriteAt(_: ?*anyopaque, _: []const u8, _: u32, _: []const u8, _: bool) FileWriteResult {
+    return .{ .failure = .unavailable };
+}
+
+fn unavailableFileInfo(_: ?*anyopaque, _: []const u8) FileInfoResult {
+    return .{ .failure = .unavailable };
+}
+
+fn unavailableFileLock(_: ?*anyopaque, _: []const u8, _: u32, _: u32, _: bool) FileLockResult {
     return .{ .failure = .unavailable };
 }
 
@@ -5371,6 +6330,7 @@ fn cloneCell(allocator: std.mem.Allocator, program: *const bytecode.Program, sou
                 .value = try string.value.clone(allocator),
                 .length = string.length,
             } } },
+            .field_string => |string| .{ .owned = .{ .scalar = try string.value.clone(allocator) } },
             .record => |record| blk: {
                 if (record.record_type >= program.record_types.len) return error.InvalidInstruction;
                 const fields = try allocator.alloc(Cell, record.fields.len);
@@ -5527,6 +6487,7 @@ fn scalarAt(cell: *const Cell) ExecutionError!*const values.Value {
     return switch (resolved.owned) {
         .scalar => |*scalar| scalar,
         .fixed_string => |*string| &string.value,
+        .field_string => |*string| &string.value,
         else => error.TypeMismatch,
     };
 }
@@ -5536,6 +6497,7 @@ fn scalarAtMutable(cell: *Cell) ExecutionError!*values.Value {
     return switch (resolved.owned) {
         .scalar => |*scalar| scalar,
         .fixed_string => |*string| &string.value,
+        .field_string => |*string| &string.value,
         else => error.TypeMismatch,
     };
 }

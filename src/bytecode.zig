@@ -1,7 +1,7 @@
 const std = @import("std");
 const frontend = @import("frontend.zig");
 
-pub const contract_version = "2.2.0";
+pub const contract_version = "2.4.0";
 pub const invalid_index: u32 = std.math.maxInt(u32);
 pub const unknown_dimensions: u8 = std.math.maxInt(u8);
 
@@ -126,7 +126,33 @@ pub const FileMode = enum(u8) {
     input,
     output,
     append,
+    random,
+    binary,
 };
+
+pub const FileAccess = enum(u8) {
+    default,
+    read,
+    write,
+    read_write,
+};
+
+pub const FileLock = enum(u8) {
+    default,
+    shared,
+    read,
+    write,
+    read_write,
+};
+
+pub const file_open_has_length: u32 = 1 << 0;
+pub const file_open_legacy: u32 = 1 << 1;
+pub const file_open_access_shift: u5 = 4;
+pub const file_open_lock_shift: u5 = 8;
+pub const file_argument_position: u32 = 1 << 0;
+pub const file_argument_variable: u32 = 1 << 1;
+pub const file_range_first: u32 = 1 << 0;
+pub const file_range_last: u32 = 1 << 1;
 
 pub const GraphicsBoxMode = enum(u8) {
     line,
@@ -231,6 +257,13 @@ pub const OpCode = enum(u8) {
     sleep,
     file_open,
     file_close,
+    file_get,
+    file_put,
+    file_field,
+    file_seek,
+    file_lock,
+    file_unlock,
+    file_reset,
     audio_beep,
     audio_play,
     convert,
@@ -318,6 +351,11 @@ pub const Builtin = enum(u8) {
     ucase_string,
     val,
     eof,
+    fileattr,
+    freefile,
+    loc,
+    lof,
+    seek,
     err,
     erl,
     inkey_string,

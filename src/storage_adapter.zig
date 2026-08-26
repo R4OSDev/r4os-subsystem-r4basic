@@ -8,6 +8,11 @@ const Operation = enum(u8) {
     read,
     write,
     append,
+    write_at,
+    create,
+    info,
+    lock,
+    unlock,
 };
 
 const ActiveRequest = struct {
@@ -52,6 +57,9 @@ pub const Adapter = struct {
         services.file_context = self;
         services.file_read = read;
         services.file_write = write;
+        services.file_write_at = writeAt;
+        services.file_info = fileInfo;
+        services.file_lock = fileLock;
         services.file_quiesce = quiesce;
     }
 
@@ -84,13 +92,15 @@ pub const Adapter = struct {
                 continue;
             }
             const count: usize = @intCast(terminal);
-            if (count > requested_bytes) {
+            const transfer = operation == .read or operation == .write or operation == .append or operation == .write_at or operation == .create;
+            if (transfer and count > requested_bytes) {
                 self.stats.failures +%= 1;
                 continue;
             }
             switch (operation) {
                 .read => self.stats.read_bytes +|= @intCast(count),
-                .write, .append => self.stats.write_bytes +|= @intCast(count),
+                .write, .append, .write_at, .create => self.stats.write_bytes +|= @intCast(count),
+                .info, .lock, .unlock => {},
             }
         }
     }
@@ -99,7 +109,7 @@ pub const Adapter = struct {
         const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
         const path_slot = self.cachedPath(raw_path) orelse return .{ .failure = .path_error };
         if (self.active) |*active| {
-            if (!matches(active, .read, path_slot, offset, out.ptr, out.len)) return self.readFailure(.io_error);
+            if (!matches(active, .read, path_slot, offset, if (out.len == 0) 0 else @intFromPtr(out.ptr), out.len)) return self.readFailure(.io_error);
             return self.pollRead(active);
         }
 
@@ -112,7 +122,7 @@ pub const Adapter = struct {
             .request => |value| value,
             .failure => |raw| if (isSubmissionBackpressure(raw)) return .pending else return self.readFailure(mapSubmissionFailure(raw)),
         };
-        self.active = activeRequest(request, .read, path_slot, offset, out.ptr, out.len);
+        self.active = activeRequest(request, .read, path_slot, offset, if (out.len == 0) 0 else @intFromPtr(out.ptr), out.len);
         self.stats.read_calls +%= 1;
         self.noteSubmission(out.len);
         return .pending;
@@ -123,7 +133,7 @@ pub const Adapter = struct {
         const operation: Operation = if (append) .append else .write;
         const path_slot = self.cachedPath(raw_path) orelse return .{ .failure = .path_error };
         if (self.active) |*active| {
-            if (!matches(active, operation, path_slot, 0, bytes.ptr, bytes.len)) return self.writeFailure(.io_error);
+            if (!matches(active, operation, path_slot, 0, if (bytes.len == 0) 0 else @intFromPtr(bytes.ptr), bytes.len)) return self.writeFailure(.io_error);
             return self.pollWrite(active);
         }
 
@@ -135,9 +145,76 @@ pub const Adapter = struct {
             .request => |value| value,
             .failure => |raw| if (isSubmissionBackpressure(raw)) return .pending else return self.writeFailure(mapSubmissionFailure(raw)),
         };
-        self.active = activeRequest(request, operation, path_slot, 0, bytes.ptr, bytes.len);
+        self.active = activeRequest(request, operation, path_slot, 0, if (bytes.len == 0) 0 else @intFromPtr(bytes.ptr), bytes.len);
         self.stats.write_calls +%= 1;
         self.noteSubmission(bytes.len);
+        return .pending;
+    }
+
+    fn writeAt(context: ?*anyopaque, raw_path: []const u8, offset: u32, bytes: []const u8, create: bool) vm.FileWriteResult {
+        const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
+        const operation: Operation = if (create) .create else .write_at;
+        const path_slot = self.cachedPath(raw_path) orelse return .{ .failure = .path_error };
+        const address = if (bytes.len == 0) 0 else @intFromPtr(bytes.ptr);
+        if (self.active) |*active| {
+            if (!matches(active, operation, path_slot, offset, address, bytes.len)) return self.writeFailure(.io_error);
+            return self.pollWrite(active);
+        }
+
+        const opened = if (create and offset == 0 and bytes.len == 0)
+            self.resources.asyncWrite(self.cache_path[path_slot].asZ(), bytes, 0)
+        else
+            self.resources.asyncWriteAt(self.cache_path[path_slot].asZ(), offset, bytes, 0);
+        const request = switch (opened) {
+            .request => |value| value,
+            .failure => |raw| if (isSubmissionBackpressure(raw)) return .pending else return self.writeFailure(mapSubmissionFailure(raw)),
+        };
+        self.active = activeRequest(request, operation, path_slot, offset, address, bytes.len);
+        self.stats.write_calls +%= 1;
+        self.noteSubmission(bytes.len);
+        return .pending;
+    }
+
+    fn fileInfo(context: ?*anyopaque, raw_path: []const u8) vm.FileInfoResult {
+        const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
+        const path_slot = self.cachedPath(raw_path) orelse return .{ .failure = .path_error };
+        if (self.active) |*active| {
+            if (!matches(active, .info, path_slot, 0, 0, 0)) return .{ .failure = .io_error };
+            const terminal = self.pollTerminal(active) orelse return .pending;
+            if (terminal == r4os.abi.io_error_not_found) return .missing;
+            if (terminal < 0) return .{ .failure = mapInfoFailure(terminal) };
+            return .{ .info = .{ .size = @intCast(terminal) } };
+        }
+
+        const request = switch (self.resources.asyncFileInfo(self.cache_path[path_slot].asZ(), 0)) {
+            .request => |value| value,
+            .failure => |raw| if (isSubmissionBackpressure(raw)) return .pending else return .{ .failure = mapSubmissionFailure(raw) },
+        };
+        self.active = activeRequest(request, .info, path_slot, 0, 0, 0);
+        self.noteSubmission(0);
+        return .pending;
+    }
+
+    fn fileLock(context: ?*anyopaque, raw_path: []const u8, offset: u32, length: u32, unlock: bool) vm.FileLockResult {
+        const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
+        if (length == 0) return .{ .failure = .path_error };
+        const operation: Operation = if (unlock) .unlock else .lock;
+        const path_slot = self.cachedPath(raw_path) orelse return .{ .failure = .path_error };
+        if (self.active) |*active| {
+            if (!matches(active, operation, path_slot, offset, 0, length)) return .{ .failure = .io_error };
+            const terminal = self.pollTerminal(active) orelse return .pending;
+            if (terminal < 0) return .{ .failure = mapLockFailure(terminal) };
+            if (terminal != r4os.abi.io_ok) return .{ .failure = .io_error };
+            return .success;
+        }
+
+        const flags: u32 = if (unlock) r4os.abi.io_file_lock_flag_unlock else 0;
+        const request = switch (self.resources.asyncFileLock(self.cache_path[path_slot].asZ(), offset, length, flags)) {
+            .request => |value| value,
+            .failure => |raw| if (isSubmissionBackpressure(raw)) return .pending else return .{ .failure = mapSubmissionFailure(raw) },
+        };
+        self.active = activeRequest(request, operation, path_slot, offset, 0, length);
+        self.noteSubmission(length);
         return .pending;
     }
 
@@ -257,7 +334,7 @@ fn activeRequest(
     operation: Operation,
     path_slot: u8,
     offset: u64,
-    pointer: anytype,
+    buffer_address: usize,
     requested_bytes: usize,
 ) ActiveRequest {
     return .{
@@ -265,7 +342,7 @@ fn activeRequest(
         .operation = operation,
         .path_slot = path_slot,
         .offset = offset,
-        .buffer_address = if (requested_bytes == 0) 0 else @intFromPtr(pointer),
+        .buffer_address = buffer_address,
         .requested_bytes = requested_bytes,
     };
 }
@@ -275,14 +352,14 @@ fn matches(
     operation: Operation,
     path_slot: u8,
     offset: u64,
-    pointer: anytype,
+    buffer_address: usize,
     requested_bytes: usize,
 ) bool {
     return active.operation == operation and
         active.path_slot == path_slot and
         active.offset == offset and
         active.requested_bytes == requested_bytes and
-        (requested_bytes == 0 or active.buffer_address == @intFromPtr(pointer));
+        active.buffer_address == buffer_address;
 }
 
 fn mapReadFailure(raw: i32) vm.FileHostError {
@@ -297,8 +374,26 @@ fn mapReadFailure(raw: i32) vm.FileHostError {
 fn mapWriteFailure(raw: i32) vm.FileHostError {
     return switch (raw) {
         -1, -2 => .path_error,
-        -3 => .not_found,
+        -3, r4os.abi.io_error_not_found => .not_found,
         -10 => .too_large,
+        else => .io_error,
+    };
+}
+
+fn mapInfoFailure(raw: i32) vm.FileHostError {
+    return switch (raw) {
+        r4os.abi.io_error_not_found => .not_found,
+        r4os.abi.io_error_invalid => .path_error,
+        r4os.abi.io_error_too_large => .too_large,
+        else => .io_error,
+    };
+}
+
+fn mapLockFailure(raw: i32) vm.FileHostError {
+    return switch (raw) {
+        r4os.abi.io_error_lock_violation => .lock_violation,
+        r4os.abi.io_error_not_found => .not_found,
+        r4os.abi.io_error_invalid => .path_error,
         else => .io_error,
     };
 }
@@ -310,6 +405,8 @@ fn isSubmissionBackpressure(raw: i32) bool {
 fn mapSubmissionFailure(raw: i32) vm.FileHostError {
     return switch (raw) {
         r4os.abi.io_error_invalid => .path_error,
+        r4os.abi.io_error_not_found => .not_found,
+        r4os.abi.io_error_lock_violation => .lock_violation,
         r4os.abi.io_error_too_large => .too_large,
         r4os.abi.io_error_no_instance, r4os.abi.io_error_unsupported => .unavailable,
         else => .io_error,
@@ -322,6 +419,8 @@ test "R4SYS storage failures keep BASIC file categories visible" {
     try std.testing.expectEqual(vm.FileHostError.too_large, mapReadFailure(-8));
     try std.testing.expectEqual(vm.FileHostError.io_error, mapReadFailure(-6));
     try std.testing.expectEqual(vm.FileHostError.not_found, mapWriteFailure(-3));
+    try std.testing.expectEqual(vm.FileHostError.not_found, mapInfoFailure(r4os.abi.io_error_not_found));
+    try std.testing.expectEqual(vm.FileHostError.lock_violation, mapLockFailure(r4os.abi.io_error_lock_violation));
     try std.testing.expect(isSubmissionBackpressure(r4os.abi.io_error_busy));
     try std.testing.expect(isSubmissionBackpressure(r4os.abi.io_error_no_slots));
     try std.testing.expectEqual(vm.FileHostError.path_error, mapSubmissionFailure(r4os.abi.io_error_invalid));
