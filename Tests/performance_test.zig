@@ -377,14 +377,14 @@ test "procedure frames reuse their pool and initialize only reached locals" {
     const source =
         \\DEFINT A-Z
         \\DECLARE SUB Touch ()
-        \\DIM SHARED Calls AS INTEGER
+        \\DIM SHARED CallCount AS INTEGER
         \\CALL Touch()
         \\CALL Touch()
         \\END
         \\SUB Touch ()
         \\    IF 0 THEN NeverTouched& = 1
-        \\    Used& = Calls
-        \\    Calls = Calls + 1
+        \\    Used& = CallCount
+        \\    CallCount = CallCount + 1
         \\END SUB
     ;
     var program = try core.compiler.compile(std.testing.allocator, "frame-pool.bas", source);
@@ -398,7 +398,7 @@ test "procedure frames reuse their pool and initialize only reached locals" {
     try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 8));
     const counters = machine.performanceStats();
 
-    try std.testing.expectEqual(@as(i16, 2), machine.global("Calls").?.integer);
+    try std.testing.expectEqual(@as(i16, 2), machine.global("CallCount").?.integer);
     try std.testing.expectEqual(@as(u64, 2), counters.procedure_calls);
     try std.testing.expectEqual(@as(u64, 1), counters.local_pool_grows);
     try std.testing.expectEqual(@as(u64, 1), counters.local_pool_reuses);

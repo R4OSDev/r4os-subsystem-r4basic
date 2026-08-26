@@ -24,8 +24,8 @@ const ExpectedLexicalDiagnostic = struct {
 };
 
 const negative_lexical_diagnostics = [_]ExpectedLexicalDiagnostic{
-    .{ .code = .unsupported_metacommand, .line = 1 },
-    .{ .code = .invalid_byte, .line = 2 },
+    .{ .code = .invalid_include, .line = 1 },
+    .{ .code = .invalid_line_continuation, .line = 2 },
     .{ .code = .invalid_identifier, .line = 3 },
     .{ .code = .invalid_number, .line = 4 },
     .{ .code = .invalid_byte, .line = 5 },
@@ -209,6 +209,54 @@ test "all known keywords use bounded case-insensitive lexical lookup" {
         token_index += 1;
     }
     try std.testing.expectEqual(frontend.TokenKind.identifier, tokens[token_index].kind);
+}
+
+test "QuickBASIC appendix-E reserved words missing from v1 are all reserved" {
+    const reference_words = [_][]const u8{
+        "SEEK",  "ACCESS",   "ALIAS",   "ENDIF",   "LSET",   "SETMEM",   "SIGNAL", "MKDMBF$",
+        "ERDEV", "ERDEV$",   "BINARY",  "MKSMBF$", "CALLS",  "FILEATTR", "OFF",    "STOP",
+        "CDECL", "FREEFILE", "STRING$", "CLEAR",   "PEN",    "COM",      "PMAP",   "TROFF",
+        "TRON",  "CSRLIN",   "UEVENT",  "CVDMBF",  "CVSMBF", "VARPTR$",  "RESET",  "DEFDBL",
+        "LIST",  "DEFLNG",   "DEFSNG",  "LOCAL",   "WINDOW", "DEFSTR",   "RSET",   "RTRIM$",
+    };
+    for (reference_words) |word| {
+        const result = frontend.tokenizeNamed("appendix-e.bas", word, tokens[0..], diagnostics[0..]);
+        try std.testing.expect(result.ok());
+        try std.testing.expectEqual(frontend.TokenKind.keyword, tokens[0].kind);
+        try std.testing.expectEqual(frontend.Keyword.unsupported, tokens[0].keyword);
+        try std.testing.expectEqualStrings(word, tokens[0].text(word));
+    }
+}
+
+test "continuation question-mark and multiple comment metacommands keep exact spans" {
+    const source = "? 1 + _\r\n 2\n'$DYNAMIC $INCLUDE: 'INC.BI' $STATIC\n";
+    const result = frontend.tokenizeNamed("source-model.bas", source, tokens[0..], diagnostics[0..]);
+    try std.testing.expect(result.ok());
+    try std.testing.expectEqual(frontend.TokenKind.question, tokens[0].kind);
+    var number_two: ?frontend.Token = null;
+    var metacommands: [3]frontend.Keyword = undefined;
+    var metacommand_count: usize = 0;
+    for (tokens[0..result.token_count]) |token| {
+        if (token.kind == .number and std.mem.eql(u8, token.text(source), "2")) number_two = token;
+        if (token.kind == .metacommand) {
+            metacommands[metacommand_count] = token.keyword;
+            metacommand_count += 1;
+        }
+    }
+    try std.testing.expect(number_two != null);
+    try std.testing.expectEqual(@as(u32, 2), number_two.?.span.line);
+    try std.testing.expectEqual(@as(u32, 2), number_two.?.span.column);
+    try std.testing.expectEqual(@as(usize, 3), metacommand_count);
+    try std.testing.expectEqualSlices(frontend.Keyword, &.{ .dynamic, .include, .static }, &metacommands);
+
+    const ignored = "'text $STATIC $DYNAMIC\nREM text $STATIC\n";
+    const ignored_result = frontend.tokenizeNamed("ignored-meta.bas", ignored, tokens[0..], diagnostics[0..]);
+    try std.testing.expect(ignored_result.ok());
+    for (tokens[0..ignored_result.token_count]) |token| try std.testing.expect(token.kind != .metacommand);
+
+    const data_result = frontend.tokenizeNamed("data-continuation.bas", "10 DATA 1, _\n2\n", tokens[0..], diagnostics[0..]);
+    try std.testing.expect(!data_result.ok());
+    try std.testing.expect(containsLexicalDiagnostic(data_result, .{ .code = .invalid_line_continuation, .line = 1 }));
 }
 
 test "lexical diagnostics retain exact file line column and byte span" {

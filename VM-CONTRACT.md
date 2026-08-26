@@ -8,8 +8,9 @@ invariants while the complete v2 target in `COMPATIBILITY.md` and
 
 ## Compilation model
 
-- The caller supplies the source bytes and file name. The compiler owns
-  immutable copies in the resulting program.
+- The caller supplies either one source/file-name pair or a bounded source
+  graph loaded through the existing Storage facade. The compiler owns the
+  composite bytes and every source-file name in the resulting program.
 - Source is tokenized once. The compiler Builder is the sole parser, binder,
   and emitter. Type selection, jump resolution, and instruction emission
   operate on that same token stream; there is no independent frontend parser.
@@ -17,9 +18,10 @@ invariants while the complete v2 target in `COMPATIBILITY.md` and
   instances reference the prepared program and never tokenize or parse it.
 - The hot instruction stream contains only an opcode and two bounded
   operands (12 bytes). A parallel, equally long metadata stream contains the
-  exact source span and statement bounds (24 bytes). Both streams use the
-  same O(1) instruction index; branch operands are resolved instruction
-  indices, not source labels or text offsets.
+  exact source span, source-file identity, latest numbered BASIC line, and
+  statement bounds (32 bytes). Both streams use the same O(1) instruction
+  index; branch operands are resolved instruction indices, not source labels
+  or text offsets.
 - A program with any compile diagnostic cannot initialize a VM.
 - Deferred statement and built-in opcodes do not exist. A catalog target that
   lacks executable semantics is rejected during compilation and cannot enter
@@ -59,8 +61,10 @@ created.
   and String respectively. Without either rule the default is SINGLE.
 - Names and labels compare case-insensitively in ASCII while their original
   source spans remain unchanged.
-- Labels are local to module code or the containing procedure. Missing and
-  duplicate labels are compile diagnostics.
+- Numbered lines range from 0 through 65,529 and execute in source order; they
+  are never sorted. Numeric and named labels share the scoped O(1) lookup,
+  while direct `IF ... THEN`/`ELSE` targets are numeric as in QuickBASIC.
+  Missing and duplicate labels are compile diagnostics.
 
 Arrays and records are normal scoped variables. Array bounds and record
 layouts are immutable program metadata; elements, bounds, data cursors,
@@ -88,7 +92,8 @@ aliases, and error-handler state belong to each VM instance.
   frame, array, or record cells.
 - All `DATA` items form one immutable source-ordered program table. Each VM
   owns its own cursor. `READ` converts into the bound scalar target and
-  `RESTORE` selects item zero or a compile-resolved module data label.
+  `RESTORE` selects item zero or a compile-resolved numeric or named module
+  label.
 - Signed LONG items retain their exact 32-bit value. `REDIM` and `READ` do
   not reinterpret numeric image data through floating point.
 - Sequential file numbers retain O(1) lookup through a 256-byte direct index.
@@ -135,12 +140,14 @@ The VM executes:
 - `WHILE`/`WEND`;
 - unconditional, leading-`WHILE`, leading-`UNTIL`, trailing-`WHILE`, and
   trailing-`UNTIL` `DO`/`LOOP`, including `EXIT DO`;
-- named `GOTO`, `GOSUB`, plain `RETURN`, and `RETURN` to a named label;
-- `ON ERROR GOTO`, `ON ERROR GOTO 0`, `RESUME`, and `RESUME NEXT`;
+- numeric or named `GOTO`/`GOSUB`, plain `RETURN`, and `RETURN` to a numeric
+  or named label;
+- numeric or named `ON ERROR GOTO`, `ON ERROR GOTO 0`, `RESUME`, `RESUME
+  NEXT`, and `RESUME` to a numeric or named label;
 - the restricted `DEF SEG`, `PEEK`, and `POKE` compatibility device;
 - `SCREEN 0`, 80-column `WIDTH`, `COLOR`, `CLS`, `LOCATE`, and
   `VIEW PRINT` on the private text screen;
-- screen and sequential-file `PRINT`, console and file `INPUT`, and
+- screen and sequential-file `PRINT` including the `?` shorthand, console and file `INPUT`, and
   `LINE INPUT`;
 - `SCREEN 1`, `SCREEN 9`, `PALETTE`, `PSET`, coordinate `POINT`, `LINE`
   including `B` and `BF`, `CIRCLE`, `PAINT`, and packed `GET`/`PUT` with
@@ -179,10 +186,14 @@ partially changing the queue or persistent music settings.
 
 ## Built-in functions and host services
 
-The executable built-ins are `ABS`, `ATN`, `CHR$`, `CINT`, `COS`, `EOF`,
+The executable built-ins are `ABS`, `ATN`, `CHR$`, `CINT`, `COS`, `EOF`, `ERL`,
 `INKEY$`, `INSTR`, `INT`, `LEFT$`, `LEN`, `LTRIM$`, `MID$`, coordinate
 `POINT`, `RND`, `SIN`, `SPACE$`, `STR$`, `TIMER`, `UCASE$`, and `VAL` with
 the arities and type categories defined by the source contract.
+
+`ERL` returns the latest numbered line preceding the trapped instruction, or
+zero when no numbered line precedes it. Its identity comes from immutable
+instruction metadata and therefore also survives nested `$INCLUDE` sources.
 
 Simple scalar string lvalues are passed to read-only built-ins as non-owning
 Cell references. Numeric and expression arguments remain owned stack values,

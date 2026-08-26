@@ -58,8 +58,9 @@ repositories under `ExFiles/Reference/Basic/README.txt`.
 
 ## Source and lexical contract
 
-- A source is a byte sequence of at most 256 KiB plus a caller-owned file
-  name. The frontend does not open files itself.
+- A complete source graph is a byte sequence of at most 256 KiB plus bounded
+  file-name and physical-line identity. The frontend does not open files;
+  the owning loader uses the existing R4OS Storage facade.
 - CRLF, lone LF, and lone CR each end one logical line. Lines and columns are
   one-based; byte spans are half-open offsets into the unchanged source.
 - BASIC keywords and names compare case-insensitively in ASCII. The frontend
@@ -70,25 +71,34 @@ repositories under `ExFiles/Reference/Basic/README.txt`.
   field access. `_` is not a v1 identifier character.
 - The suffixes `$`, `%`, `&`, `!`, and `#` are accepted on identifiers.
   Numeric literals accept `%`, `&`, `!`, and `#`, but never `$`.
-- v1 numeric literals are decimal integers or decimal real values, with an
-  optional decimal point, optional `E` or `D` exponent, and optional numeric
-  suffix. A leading sign is an operator. Hexadecimal and octal literals are
-  outside v1.
+- Decimal numeric literals accept the reference decimal-point, `E`/`D`
+  exponent and `%`/`&`/`!`/`#` suffix forms. Hexadecimal `&H` and octal
+  `&O`/`&` constants use the documented 16-bit range or the trailing-`&`
+  32-bit range. A leading sign remains an operator.
 - String literals are delimited by double quotation marks and cannot cross a
   line or contain an embedded double quotation mark. Bytes `0x80` through
   `0xFF` are preserved inside a literal. NUL in source is rejected. Runtime
   strings remain byte strings; source decoding never silently replaces data.
 - Apostrophe comments and statement-leading `REM` comments consume the rest
-  of their logical line. `'$DYNAMIC`, `'$STATIC`, `REM $DYNAMIC`, and
-  `REM $STATIC` are the only accepted metacommands. Other metacommands are
-  diagnosed.
+  of their logical line. A comment may contain multiple whitespace-separated
+  `$DYNAMIC`, `$STATIC`, and `$INCLUDE: 'relative-file'` metacommands. Text
+  before the first `$` makes the remainder an ordinary comment.
 - A colon separates statements on one line. Empty lines and empty segments
   between separators are accepted. Optional statement arguments may be
   omitted only at grammar positions that explicitly allow an empty comma
   field.
-- Traditional numbered program lines and numeric label declarations are not
-  part of v1. Named labels are supported; a numeric `0` remains valid where
-  the selected error-handling syntax requires it.
+- Numbered program lines range from 0 through 65,529, may be indented, and are
+  labels only: execution remains in source order. Numeric and alphanumeric
+  labels may be mixed, but a direct `IF ... THEN`/`ELSE` target must be a line
+  number; named targets require an explicit `GOTO`.
+- `_` as the final non-whitespace byte joins physical lines without erasing
+  their original spans. `DATA` and `REM` cannot be continued. `?` is exactly
+  the `PRINT` shorthand.
+- `$INCLUDE` resolves only relative R4OS paths against the containing file.
+  At most 64 physical sources and 16 include levels contribute to the
+  256-KiB graph. Each file is physically loaded once; missing sources,
+  cycles, invalid paths, depth, file-count, and aggregate-size failures are
+  compile diagnostics and no partial program is executable.
 
 ## Syntax matrix and fixture coverage
 
@@ -170,9 +180,8 @@ the typed-program phase.
 - `COMMON`, `CHAIN`, `RUN`, `SHELL`, `SYSTEM`, printer/COM/device I/O,
   random/binary file records, directory mutation, and unrestricted hardware
   access.
-- Hexadecimal/octal literals, fixed-length strings, `MID$` assignment,
-  `PRINT USING`, `DRAW`, `PCOPY`, `BLOAD`, `BSAVE`, and general memory or port
-  access.
+- Fixed-length strings, `MID$` assignment, `PRINT USING`, `DRAW`, `PCOPY`,
+  `BLOAD`, `BSAVE`, and general memory or port access.
 - Runtime correctness merely from parse or bind success. Only the subset in
   `VM-CONTRACT.md` has executable semantics.
 

@@ -31,6 +31,20 @@ const canonical_baseline_sha256 = [_]u8{
     0xA8, 0x35, 0xA7, 0x43, 0xE2, 0x46, 0x99, 0xF7,
 };
 
+const SourceGraphReader = struct {
+    files: *const r4os.Files,
+
+    pub fn info(self: *const SourceGraphReader, path: []const u8) r4os.app_storage.FileInfoResult {
+        var parsed = r4os.AbsoluteFilePath.parse(path) catch return .missing;
+        return self.files.info(parsed.asZ());
+    }
+
+    pub fn readAt(self: *const SourceGraphReader, path: []const u8, offset: u32, out: []u8) r4os.app_storage.Transfer {
+        var parsed = r4os.AbsoluteFilePath.parse(path) catch return .{ .failure = -1 };
+        return self.files.readAt(parsed.asZ(), offset, out);
+    }
+};
+
 pub fn r4_app_main(app: *r4os.App) i32 {
     if (containsIgnoreCase(app.args(), "/PERFTEST")) return runPerformanceSelfTest(app);
     if (app.profile != .desktop) return 64;
@@ -49,7 +63,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         });
     };
     const trace = LaunchTrace.parse(launch);
-    var guest_path = r4os.AbsoluteFilePath.parse(launch.guest_path) catch {
+    _ = r4os.AbsoluteFilePath.parse(launch.guest_path) catch {
         if (trace.baseline) return writeBaselineFailure(&files, trace, "guest-path", 65);
         return showStatus(allocator, sys, desk, draw, "R4BASIC - Startfehler", &.{
             "Der uebergebene Gastpfad ist ungueltig.",
@@ -57,7 +71,8 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         });
     };
     timeline.source_begin_ns = monotonicNow(sys);
-    const loaded_source = source_loader.load(allocator, &files, guest_path.asZ()) catch |fault| {
+    const source_reader = SourceGraphReader{ .files = &files };
+    var source_graph = source_loader.loadGraph(allocator, &source_reader, launch.guest_path) catch |fault| {
         if (trace.baseline) return writeBaselineFailure(&files, trace, @errorName(fault), 66);
         return showStatus(allocator, sys, desk, draw, "R4BASIC - Ladefehler", &.{
             "Die BASIC-Datei konnte nicht geladen werden.",
@@ -65,9 +80,8 @@ pub fn r4_app_main(app: *r4os.App) i32 {
             @errorName(fault),
         });
     };
-    const source = loaded_source.bytes;
-    var source_owned = true;
-    defer if (source_owned) allocator.free(source);
+    defer source_graph.deinit(allocator);
+    const source = source_graph.source;
     timeline.source_end_ns = monotonicNow(sys);
     if (trace.baseline and (!std.ascii.eqlIgnoreCase(launch.guest_path, canonical_baseline_path) or !canonicalBaselineSource(source))) {
         return writeBaselineFailure(&files, trace, "source-identity", 67);
@@ -104,8 +118,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         &timeline,
     );
     const compile_vm_before = r4os.vm_allocator.stats();
-    source_owned = false;
-    var program = compiler.compileOwnedObserved(allocator, launch.guest_path, source, compile_progress.observer()) catch |fault| {
+    var program = compiler.compileGraphOwnedObserved(allocator, &source_graph, compile_progress.observer()) catch |fault| {
         if (fault == error.Cancelled) {
             if (compile_progress.failure != 0) {
                 if (trace.baseline) return writeBaselineFailure(&files, trace, "compile-progress", compile_progress.failure);
@@ -185,7 +198,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         trace,
         launch.guest_path,
         source.len,
-        loaded_source.stats,
+        source_graph.stats,
         program.instructions.len,
         program.compile_stats,
         compile_vm_memory,
@@ -1295,13 +1308,15 @@ fn showCompilerDiagnostics(
     var count: usize = 2;
     for (program.diagnostics[0..@min(program.diagnostics.len, lines.len)]) |diagnostic| {
         views[count] = if (diagnostic.catalog_id.len == 0)
-            std.fmt.bufPrint(lines[count - 2][0..], "{d}:{d}: {s}", .{
+            std.fmt.bufPrint(lines[count - 2][0..], "{s}:{d}:{d}: {s}", .{
+                diagnostic.file_name,
                 diagnostic.span.line,
                 diagnostic.span.column,
                 diagnostic.message(),
             }) catch "Diagnose konnte nicht formatiert werden"
         else
-            std.fmt.bufPrint(lines[count - 2][0..], "{d}:{d}: [{s}] {s}", .{
+            std.fmt.bufPrint(lines[count - 2][0..], "{s}:{d}:{d}: [{s}] {s}", .{
+                diagnostic.file_name,
                 diagnostic.span.line,
                 diagnostic.span.column,
                 diagnostic.catalog_id,

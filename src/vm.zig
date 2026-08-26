@@ -3032,6 +3032,7 @@ pub const Vm = struct {
             .ucase_string => self.upperString(arguments[0]),
             .val => self.val(arguments[0]),
             .eof => self.endOfFile(arguments[0]),
+            .erl => self.errorLine(),
             .inkey_string => self.inkeyString(),
             .rnd => self.randomNumber(arguments),
             .timer => self.timerValue(),
@@ -3051,6 +3052,12 @@ pub const Vm = struct {
         if (file.input_head < file.input.items.len) return .{ .integer = 0 };
         if (!file.input_eof) try self.refillFileInput(file);
         return .{ .integer = if (file.input_eof and file.input_head >= file.input.items.len) -1 else 0 };
+    }
+
+    fn errorLine(self: *const Vm) values.Value {
+        const diagnostic = self.trapped_diagnostic orelse return .{ .long = 0 };
+        if (diagnostic.instruction >= self.program.instruction_metadata.len) return .{ .long = 0 };
+        return .{ .long = self.program.instruction_metadata[diagnostic.instruction].basic_line };
     }
 
     fn inkeyString(self: *Vm) ExecutionError!values.Value {
@@ -3367,7 +3374,7 @@ pub const Vm = struct {
             self.readInstructionMetadata(instruction).span
         else
             .{ .start = 0, .end = 0, .line = 1, .column = 1 };
-        return .{ .code = code, .file_name = self.program.file_name, .span = span, .instruction = instruction };
+        return .{ .code = code, .file_name = self.program.fileNameForSpan(span), .span = span, .instruction = instruction };
     }
 };
 

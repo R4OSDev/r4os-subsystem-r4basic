@@ -239,6 +239,7 @@ pub const Builtin = enum(u8) {
     ucase_string,
     val,
     eof,
+    erl,
     inkey_string,
     point,
     rnd,
@@ -253,6 +254,7 @@ pub const Instruction = struct {
 
 pub const InstructionMetadata = struct {
     span: frontend.Span,
+    basic_line: u16 = 0,
     statement_start: u32 = invalid_index,
     statement_next: u32 = invalid_index,
 };
@@ -280,6 +282,7 @@ pub const DiagnosticCode = enum(u8) {
     invalid_record_access,
     invalid_array_argument,
     invalid_error_handler,
+    invalid_line_number,
     invalid_data_item,
     block_mismatch,
     block_not_closed,
@@ -318,6 +321,7 @@ pub const Diagnostic = struct {
             .invalid_record_access => "record value requires a declared field",
             .invalid_array_argument => "array argument must be a compatible whole array",
             .invalid_error_handler => "error handler target is invalid",
+            .invalid_line_number => "BASIC line number must be in the range 0 through 65529",
             .invalid_data_item => "DATA item is not a supported constant",
             .block_mismatch => "block terminator does not match the active block",
             .block_not_closed => "block is not closed before end of source",
@@ -368,6 +372,7 @@ pub const CompileStats = struct {
 pub const Program = struct {
     allocator: std.mem.Allocator,
     file_name: []u8,
+    included_file_names: [][]u8 = &.{},
     source: []u8,
     instructions: []Instruction,
     instruction_metadata: []InstructionMetadata,
@@ -392,6 +397,12 @@ pub const Program = struct {
         return span.bytes(self.source);
     }
 
+    pub fn fileNameForSpan(self: Program, span: frontend.Span) []const u8 {
+        if (span.file_id == 0) return self.file_name;
+        const index = @as(usize, span.file_id) - 1;
+        return if (index < self.included_file_names.len) self.included_file_names[index] else self.file_name;
+    }
+
     pub fn deinit(self: *Program) void {
         for (self.procedures) |procedure| {
             self.allocator.free(procedure.locals);
@@ -407,6 +418,8 @@ pub const Program = struct {
         self.allocator.free(self.instructions);
         self.allocator.free(self.diagnostics);
         self.allocator.free(self.source);
+        for (self.included_file_names) |file_name| self.allocator.free(file_name);
+        if (self.included_file_names.len != 0) self.allocator.free(self.included_file_names);
         self.allocator.free(self.file_name);
         self.* = undefined;
     }

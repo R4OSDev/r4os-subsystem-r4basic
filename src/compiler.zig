@@ -2,6 +2,7 @@ const std = @import("std");
 const frontend = @import("frontend.zig");
 const bytecode = @import("bytecode.zig");
 const conformance = @import("conformance.zig");
+const source_loader = @import("source_loader.zig");
 const values = @import("value.zig");
 
 pub const maximum_instructions: usize = 262_144;
@@ -561,6 +562,7 @@ const Builder = struct {
     allocator: std.mem.Allocator,
     program_allocator: std.mem.Allocator,
     file_name: []u8,
+    included_file_names: [][]u8 = &.{},
     source: []u8,
     tokens: []const frontend.Token,
     index: usize = 0,
@@ -589,6 +591,8 @@ const Builder = struct {
     current_procedure: u32 = bytecode.invalid_index,
     current_procedure_skip: u32 = bytecode.invalid_index,
     arrays_dynamic: bool = false,
+    logical_line_start: bool = true,
+    current_basic_line: u16 = 0,
     stopped: bool = false,
     diagnostics_total: u32 = 0,
     diagnostics_truncated: bool = false,
@@ -616,6 +620,8 @@ const Builder = struct {
         self.record_names.deinit(self.allocator);
         self.label_names.deinit(self.allocator);
         self.allocator.free(self.source);
+        for (self.included_file_names) |file_name| self.allocator.free(file_name);
+        if (self.included_file_names.len != 0) self.allocator.free(self.included_file_names);
         self.allocator.free(self.file_name);
     }
 
@@ -652,18 +658,32 @@ const Builder = struct {
     fn parse(self: *Builder) !void {
         if (!self.reportProgress(.binding, 0, self.tokens.len)) return error.Cancelled;
         while (!self.at(.eof) and !self.stopped) {
-            if (self.consume(.newline) or self.consume(.colon)) continue;
+            if (self.consume(.newline)) {
+                self.logical_line_start = true;
+                continue;
+            }
+            if (self.consume(.colon)) {
+                self.logical_line_start = false;
+                continue;
+            }
+            if (self.logical_line_start and self.at(.number)) {
+                try self.defineProgramLine();
+                self.logical_line_start = false;
+                continue;
+            }
             if (self.at(.metacommand)) {
                 const command = self.advance();
                 if (command.keyword == .dynamic) self.arrays_dynamic = true;
                 if (command.keyword == .static) self.arrays_dynamic = false;
                 continue;
             }
-            if (self.at(.identifier) and self.peek(1).kind == .colon) {
-                try self.defineLabel();
+            if (self.logical_line_start and self.at(.identifier) and self.peek(1).kind == .colon) {
+                try self.defineNamedLabel();
+                self.logical_line_start = false;
                 continue;
             }
 
+            self.logical_line_start = false;
             const before = self.index;
             if (!try self.parseBoundStatement(false)) {
                 if (self.index == before) _ = self.advance();
@@ -711,6 +731,7 @@ const Builder = struct {
     }
 
     fn parseStatement(self: *Builder, inline_statement: bool) std.mem.Allocator.Error!bool {
+        if (self.at(.question)) return self.parsePrintStatement();
         if (self.at(.identifier)) return self.parseAssignmentOrImplicitCall();
         if (!self.at(.keyword)) return self.fail(.unexpected_token);
 
@@ -991,9 +1012,20 @@ const Builder = struct {
         return index;
     }
 
-    fn defineLabel(self: *Builder) !void {
+    fn defineNamedLabel(self: *Builder) !void {
         const name = self.advance().span;
         _ = self.advance();
+        try self.defineLabel(name);
+    }
+
+    fn defineProgramLine(self: *Builder) !void {
+        const token = self.advance();
+        const line = (try self.parseLineNumber(token)) orelse return;
+        self.current_basic_line = line;
+        try self.defineLabel(token.span);
+    }
+
+    fn defineLabel(self: *Builder, name: frontend.Span) !void {
         const scope = self.currentScope();
         if (self.label_names.lookup(self.source, scope, name, &self.stats) != null) {
             try self.addDiagnostic(.duplicate_symbol, name);
@@ -1007,6 +1039,29 @@ const Builder = struct {
             .data_index = @intCast(self.data_items.items.len),
         });
         try self.label_names.insert(self.allocator, self.source, scope, name, label_index, &self.stats);
+    }
+
+    fn parseLineNumber(self: *Builder, token: frontend.Token) !?u16 {
+        const text = self.tokenText(token);
+        if (text.len == 0) {
+            try self.addDiagnostic(.invalid_line_number, token.span);
+            return null;
+        }
+        for (text) |byte| {
+            if (byte < '0' or byte > '9') {
+                try self.addDiagnostic(.invalid_line_number, token.span);
+                return null;
+            }
+        }
+        const value = std.fmt.parseInt(u32, text, 10) catch {
+            try self.addDiagnostic(.invalid_line_number, token.span);
+            return null;
+        };
+        if (value > 65529) {
+            try self.addDiagnostic(.invalid_line_number, token.span);
+            return null;
+        }
+        return @intCast(value);
     }
 
     fn addLabelFixup(self: *Builder, name: frontend.Span, instruction: u32) !void {
@@ -1353,7 +1408,7 @@ const Builder = struct {
             _ = try self.emit(.restore_data, 0, 0, statement.span);
             return true;
         }
-        const label = (try self.expectIdentifier()) orelse return false;
+        const label = (try self.expectLabelTarget()) orelse return false;
         const instruction = try self.emit(.restore_data, bytecode.invalid_index, 0, statement.span);
         try self.data_fixups.append(self.allocator, .{ .name = label.span, .instruction = instruction });
         return true;
@@ -1365,11 +1420,13 @@ const Builder = struct {
         if (!try self.expectKeyword(.goto_)) return false;
         if (self.at(.number)) {
             const target = self.advance();
-            if (!std.mem.eql(u8, self.tokenText(target), "0")) {
-                try self.addDiagnostic(.invalid_error_handler, target.span);
-                return false;
+            if (std.mem.eql(u8, self.tokenText(target), "0")) {
+                _ = try self.emit(.set_error_handler, bytecode.invalid_index, 0, statement.span);
+                return true;
             }
-            _ = try self.emit(.set_error_handler, bytecode.invalid_index, 0, statement.span);
+            if ((try self.parseLineNumber(target)) == null) return false;
+            const instruction = try self.emit(.set_error_handler, bytecode.invalid_index, 0, statement.span);
+            try self.addLabelFixup(target.span, instruction);
             return true;
         }
         const label = (try self.expectIdentifier()) orelse return false;
@@ -1385,12 +1442,14 @@ const Builder = struct {
             return true;
         }
         if (self.at(.number)) {
-            const zero = self.advance();
-            if (!std.mem.eql(u8, self.tokenText(zero), "0")) {
-                try self.addDiagnostic(.invalid_error_handler, zero.span);
-                return false;
+            const target = self.advance();
+            if (std.mem.eql(u8, self.tokenText(target), "0")) {
+                _ = try self.emit(.resume_error, 0, 0, statement.span);
+                return true;
             }
-            _ = try self.emit(.resume_error, 0, 0, statement.span);
+            if ((try self.parseLineNumber(target)) == null) return false;
+            const instruction = try self.emit(.resume_label, bytecode.invalid_index, 0, statement.span);
+            try self.addLabelFixup(target.span, instruction);
             return true;
         }
         if (self.at(.identifier)) {
@@ -2506,7 +2565,7 @@ const Builder = struct {
         const function_token = self.advance();
         var argument_types: [3]bytecode.ValueType = undefined;
         var argument_count: usize = 0;
-        const allows_bare = builtin == .inkey_string or builtin == .timer or builtin == .rnd;
+        const allows_bare = builtin == .inkey_string or builtin == .timer or builtin == .rnd or builtin == .erl;
         if (self.consume(.left_paren)) {
             if (!self.consume(.right_paren)) {
                 while (true) {
@@ -2542,7 +2601,7 @@ const Builder = struct {
             .instr, .mid_string => 2,
             .left_string => 2,
             .point => 2,
-            .rnd, .inkey_string, .timer => 0,
+            .rnd, .inkey_string, .timer, .erl => 0,
             else => 1,
         };
         const expected_max: usize = switch (builtin) {
@@ -2564,6 +2623,7 @@ const Builder = struct {
             .chr_string, .left_string, .ltrim_string, .mid_string, .space_string, .str_string, .ucase_string => .string,
             .inkey_string => .string,
             .cint, .instr, .len, .eof, .peek, .point => .integer,
+            .erl => .long,
             .int => arguments[0],
             .val => .double,
             .rnd, .timer => .single,
@@ -2586,7 +2646,7 @@ const Builder = struct {
             },
             .point => if (!arguments[0].isNumeric() or !arguments[1].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
             .rnd => if (arguments.len == 1 and !arguments[0].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
-            .inkey_string, .timer => {},
+            .inkey_string, .timer, .erl => {},
         }
         return result;
     }
@@ -2637,15 +2697,24 @@ const Builder = struct {
             return true;
         }
 
-        if (!try self.parseBoundStatement(true)) return false;
+        if (!try self.parseIfArm()) return false;
         if (self.consumeKeyword(.else_)) {
             const end_jump = try self.emit(.jump, bytecode.invalid_index, 0, statement.span);
             self.patchJump(false_jump, self.currentIp());
-            if (!try self.parseBoundStatement(true)) return false;
+            if (!try self.parseIfArm()) return false;
             self.patchJump(end_jump, self.currentIp());
         } else {
             self.patchJump(false_jump, self.currentIp());
         }
+        return true;
+    }
+
+    fn parseIfArm(self: *Builder) !bool {
+        const direct_target = self.at(.number);
+        if (!direct_target) return self.parseBoundStatement(true);
+        const label = (try self.expectLabelTarget()) orelse return false;
+        const instruction = try self.emit(.jump, bytecode.invalid_index, 0, label.span);
+        try self.addLabelFixup(label.span, instruction);
         return true;
     }
 
@@ -2915,7 +2984,7 @@ const Builder = struct {
 
     fn parseBranch(self: *Builder, op: bytecode.OpCode) !bool {
         const statement = self.advance();
-        const label = (try self.expectIdentifier()) orelse return false;
+        const label = (try self.expectLabelTarget()) orelse return false;
         const instruction = try self.emit(op, bytecode.invalid_index, 0, statement.span);
         try self.addLabelFixup(label.span, instruction);
         return true;
@@ -2924,8 +2993,8 @@ const Builder = struct {
     fn parseReturn(self: *Builder) !bool {
         const statement = self.advance();
         const instruction = try self.emit(.return_gosub, bytecode.invalid_index, 0, statement.span);
-        if (self.at(.identifier)) {
-            const label = self.advance();
+        if (self.at(.identifier) or self.at(.number)) {
+            const label = (try self.expectLabelTarget()) orelse return false;
             try self.addLabelFixup(label.span, instruction);
         }
         return true;
@@ -3133,6 +3202,7 @@ const Builder = struct {
         return .{
             .allocator = self.program_allocator,
             .file_name = self.file_name,
+            .included_file_names = self.included_file_names,
             .source = self.source,
             .instructions = instructions,
             .instruction_metadata = instruction_metadata,
@@ -3158,7 +3228,7 @@ const Builder = struct {
         try self.diagnostics.append(self.allocator, .{
             .code = code,
             .span = span,
-            .file_name = self.file_name,
+            .file_name = self.fileNameForSpan(span),
         });
     }
 
@@ -3176,7 +3246,7 @@ const Builder = struct {
         try self.diagnostics.append(self.allocator, .{
             .code = code,
             .span = span,
-            .file_name = self.file_name,
+            .file_name = self.fileNameForSpan(span),
             .catalog_id = catalog_id,
         });
     }
@@ -3190,7 +3260,7 @@ const Builder = struct {
         try self.diagnostics.append(self.allocator, .{
             .code = .lexical_error,
             .span = diagnostic.span,
-            .file_name = self.file_name,
+            .file_name = self.fileNameForSpan(diagnostic.span),
             .frontend_code = diagnostic.code,
         });
     }
@@ -3198,6 +3268,12 @@ const Builder = struct {
     fn fail(self: *Builder, code: bytecode.DiagnosticCode) !bool {
         try self.addDiagnostic(code, self.current().span);
         return false;
+    }
+
+    fn fileNameForSpan(self: *const Builder, span: frontend.Span) []const u8 {
+        if (span.file_id == 0) return self.file_name;
+        const index = @as(usize, span.file_id) - 1;
+        return if (index < self.included_file_names.len) self.included_file_names[index] else self.file_name;
     }
 
     fn emit(self: *Builder, op: bytecode.OpCode, a: u32, b: u32, span: frontend.Span) !u32 {
@@ -3209,7 +3285,10 @@ const Builder = struct {
         const index: u32 = @intCast(self.instructions.items.len);
         try self.instructions.append(self.allocator, .{ .op = op, .a = a, .b = b });
         errdefer _ = self.instructions.pop();
-        try self.instruction_metadata.append(self.allocator, .{ .span = span });
+        try self.instruction_metadata.append(self.allocator, .{
+            .span = span,
+            .basic_line = self.current_basic_line,
+        });
         return index;
     }
 
@@ -3282,8 +3361,19 @@ const Builder = struct {
         return self.advance();
     }
 
+    fn expectLabelTarget(self: *Builder) !?frontend.Token {
+        if (self.at(.identifier)) return self.advance();
+        if (self.at(.number)) {
+            const token = self.advance();
+            if ((try self.parseLineNumber(token)) != null) return token;
+            return null;
+        }
+        _ = try self.fail(.expected_identifier);
+        return null;
+    }
+
     fn atBoundary(self: Builder) bool {
-        return self.at(.newline) or self.at(.colon) or self.at(.eof);
+        return self.at(.newline) or self.at(.colon) or self.at(.metacommand) or self.at(.eof);
     }
 
     fn synchronize(self: *Builder) void {
@@ -3311,7 +3401,7 @@ const FrontendObserverBridge = struct {
 };
 
 pub fn compile(allocator: std.mem.Allocator, file_name: []const u8, source: []const u8) !bytecode.Program {
-    return compileInternal(allocator, file_name, .{ .borrowed = source }, null);
+    return compileInternal(allocator, file_name, .{ .borrowed = source }, null, null);
 }
 
 pub fn compileObserved(
@@ -3320,11 +3410,11 @@ pub fn compileObserved(
     source: []const u8,
     observer: ?CompileObserver,
 ) !bytecode.Program {
-    return compileInternal(allocator, file_name, .{ .borrowed = source }, observer);
+    return compileInternal(allocator, file_name, .{ .borrowed = source }, observer, null);
 }
 
 pub fn compileOwned(allocator: std.mem.Allocator, file_name: []const u8, source: []u8) !bytecode.Program {
-    return compileInternal(allocator, file_name, .{ .owned = source }, null);
+    return compileInternal(allocator, file_name, .{ .owned = source }, null, null);
 }
 
 pub fn compileOwnedObserved(
@@ -3333,7 +3423,21 @@ pub fn compileOwnedObserved(
     source: []u8,
     observer: ?CompileObserver,
 ) !bytecode.Program {
-    return compileInternal(allocator, file_name, .{ .owned = source }, observer);
+    return compileInternal(allocator, file_name, .{ .owned = source }, observer, null);
+}
+
+pub fn compileGraphOwnedObserved(
+    allocator: std.mem.Allocator,
+    graph: *source_loader.Graph,
+    observer: ?CompileObserver,
+) !bytecode.Program {
+    if (graph.file_names.len == 0) return error.InvalidSourceGraph;
+    const source = graph.takeSource();
+    return compileInternal(allocator, graph.file_names[0], .{ .owned = source }, observer, .{
+        .file_names = graph.file_names,
+        .line_origins = graph.line_origins,
+        .diagnostics = graph.diagnostics,
+    });
 }
 
 const SourceInput = union(enum) {
@@ -3341,11 +3445,18 @@ const SourceInput = union(enum) {
     owned: []u8,
 };
 
+const SourceGraphContext = struct {
+    file_names: []const []u8,
+    line_origins: []const frontend.LineOrigin,
+    diagnostics: []const frontend.Diagnostic,
+};
+
 fn compileInternal(
     allocator: std.mem.Allocator,
     file_name: []const u8,
     input: SourceInput,
     observer: ?CompileObserver,
+    graph: ?SourceGraphContext,
 ) !bytecode.Program {
     var tracker = AllocationTracker{ .backing = allocator };
     const compile_allocator = tracker.allocator();
@@ -3356,8 +3467,23 @@ fn compileInternal(
     errdefer if (unclaimed_source) |source| allocator.free(source);
 
     const owned_file_name = try compile_allocator.dupe(u8, file_name);
+    var owned_included_file_names: [][]u8 = &.{};
+    var owned_included_count: usize = 0;
     var builder_owns_file = false;
-    errdefer if (!builder_owns_file) compile_allocator.free(owned_file_name);
+    errdefer if (!builder_owns_file) {
+        for (owned_included_file_names[0..owned_included_count]) |included_file_name| compile_allocator.free(included_file_name);
+        if (owned_included_file_names.len != 0) compile_allocator.free(owned_included_file_names);
+        compile_allocator.free(owned_file_name);
+    };
+    if (graph) |context| {
+        if (context.file_names.len > 1) {
+            owned_included_file_names = try compile_allocator.alloc([]u8, context.file_names.len - 1);
+            for (context.file_names[1..]) |included_file_name| {
+                owned_included_file_names[owned_included_count] = try compile_allocator.dupe(u8, included_file_name);
+                owned_included_count += 1;
+            }
+        }
+    }
     const owned_source = switch (input) {
         .borrowed => |source| try compile_allocator.dupe(u8, source),
         .owned => blk: {
@@ -3383,9 +3509,10 @@ fn compileInternal(
             bridge = .{ .observer = value };
             break :blk .{ .context = &bridge, .update_fn = FrontendObserverBridge.update };
         } else null;
-        const lexed = frontend.tokenizeNamedObserved(
+        const lexed = frontend.tokenizeGraphNamedObserved(
             owned_file_name,
             owned_source,
+            if (graph) |context| context.line_origins else &.{},
             tokens,
             lexical_diagnostics,
             frontend_observer,
@@ -3395,6 +3522,7 @@ fn compileInternal(
             .allocator = compile_allocator,
             .program_allocator = allocator,
             .file_name = owned_file_name,
+            .included_file_names = owned_included_file_names,
             .source = owned_source,
             .tokens = tokens[0..lexed.token_count],
             .observer = observer,
@@ -3417,10 +3545,13 @@ fn compileInternal(
         for (lexical_diagnostics[0..lexed.diagnostic_count]) |diagnostic| {
             try builder.addFrontendDiagnostic(diagnostic);
         }
+        if (graph) |context| {
+            for (context.diagnostics) |diagnostic| try builder.addFrontendDiagnostic(diagnostic);
+        }
         if (lexed.diagnostics_truncated) {
             try builder.addDiagnostic(.capacity_exceeded, .{ .start = 0, .end = 0, .line = 1, .column = 1 });
         }
-        if (lexed.token_count != 0 and lexed.ok()) try builder.parse();
+        if (lexed.token_count != 0 and lexed.ok() and (graph == null or graph.?.diagnostics.len == 0)) try builder.parse();
         program = try builder.finish();
     }
     tracker.populate(&program.compile_stats);
@@ -3468,6 +3599,7 @@ fn builtinForKeyword(keyword: frontend.Keyword) ?bytecode.Builtin {
         .ucase_string => .ucase_string,
         .val => .val,
         .eof => .eof,
+        .erl => .erl,
         .inkey_string => .inkey_string,
         .point => .point,
         .rnd => .rnd,
@@ -3478,6 +3610,7 @@ fn builtinForKeyword(keyword: frontend.Keyword) ?bytecode.Builtin {
 
 fn parseNumericConstant(text: []u8) !bytecode.Constant {
     if (text.len == 0) return error.InvalidCharacter;
+    if (text[0] == '&') return parseBasedNumericConstant(text);
     var end = text.len;
     var suffix: ?u8 = null;
     if (text[end - 1] == '%' or text[end - 1] == '&' or text[end - 1] == '!' or text[end - 1] == '#') {
@@ -3508,7 +3641,12 @@ fn parseNumericConstant(text: []u8) !bytecode.Constant {
         }
         if (number >= std.math.minInt(i16) and number <= std.math.maxInt(i16)) return .{ .integer = @intCast(number) };
         if (number >= std.math.minInt(i32) and number <= std.math.maxInt(i32)) return .{ .long = @intCast(number) };
-        return error.Overflow;
+        const real = try std.fmt.parseFloat(f64, number_text);
+        if (!std.math.isFinite(real)) return error.Overflow;
+        if (numericMantissaDigits(number_text) >= 15) return .{ .double = real };
+        const single: f32 = @floatCast(real);
+        if (!std.math.isFinite(single)) return error.Overflow;
+        return .{ .single = single };
     }
 
     var original_exponent: u8 = 0;
@@ -3523,10 +3661,50 @@ fn parseNumericConstant(text: []u8) !bytecode.Constant {
     if (!std.math.isFinite(number)) return error.Overflow;
     if (suffix == '%') return .{ .integer = try values.roundToInteger(number) };
     if (suffix == '&') return .{ .long = try values.roundToLong(number) };
-    if (suffix == '#' or double_exponent) return .{ .double = number };
+    if (suffix == '#' or double_exponent or (suffix == null and !hasExplicitExponent(number_text) and numericMantissaDigits(number_text) > 15)) {
+        return .{ .double = number };
+    }
     const single: f32 = @floatCast(number);
     if (!std.math.isFinite(single)) return error.Overflow;
     return .{ .single = single };
+}
+
+fn parseBasedNumericConstant(text: []const u8) !bytecode.Constant {
+    if (text.len < 2) return error.InvalidCharacter;
+    const force_long = text[text.len - 1] == '&';
+    const end = text.len - @intFromBool(force_long);
+    var start: usize = 1;
+    var base: u8 = 8;
+    if (start < end and (text[start] == 'H' or text[start] == 'h')) {
+        base = 16;
+        start += 1;
+    } else if (start < end and (text[start] == 'O' or text[start] == 'o')) {
+        start += 1;
+    }
+    if (start == end) return error.InvalidCharacter;
+    const value = try std.fmt.parseInt(u64, text[start..end], base);
+    if (force_long) {
+        if (value > std.math.maxInt(u32)) return error.Overflow;
+        return .{ .long = @bitCast(@as(u32, @intCast(value))) };
+    }
+    if (value > std.math.maxInt(u16)) return error.Overflow;
+    return .{ .integer = @bitCast(@as(u16, @intCast(value))) };
+}
+
+fn numericMantissaDigits(text: []const u8) usize {
+    var count: usize = 0;
+    for (text) |byte| {
+        if (byte == 'E' or byte == 'e' or byte == 'D' or byte == 'd') break;
+        if (std.ascii.isDigit(byte)) count += 1;
+    }
+    return count;
+}
+
+fn hasExplicitExponent(text: []const u8) bool {
+    for (text) |byte| {
+        if (byte == 'E' or byte == 'e' or byte == 'D' or byte == 'd') return true;
+    }
+    return false;
 }
 
 fn parseSignedNumericConstant(text: []u8, negative: bool) !bytecode.Constant {

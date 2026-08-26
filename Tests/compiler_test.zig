@@ -59,6 +59,39 @@ const SourceReader = struct {
     }
 };
 
+const GraphFile = struct {
+    path: []const u8,
+    source: []const u8,
+};
+
+const GraphSourceReader = struct {
+    files: []const GraphFile,
+    info_calls: u32 = 0,
+    read_calls: u32 = 0,
+    read_bytes: u64 = 0,
+
+    pub fn info(self: *@This(), path: []const u8) SourceInfoResult {
+        self.info_calls += 1;
+        const file = self.find(path) orelse return .missing;
+        return .{ .value = .{ .size = file.source.len } };
+    }
+
+    pub fn readAt(self: *@This(), path: []const u8, offset: u32, out: []u8) SourceTransfer {
+        self.read_calls += 1;
+        const file = self.find(path) orelse return .{ .failure = -1 };
+        if (offset >= file.source.len) return .end;
+        const count = @min(out.len, file.source.len - offset);
+        @memcpy(out[0..count], file.source[offset .. offset + count]);
+        self.read_bytes += count;
+        return .{ .bytes = @intCast(count) };
+    }
+
+    fn find(self: *const @This(), path: []const u8) ?GraphFile {
+        for (self.files) |file| if (std.ascii.eqlIgnoreCase(file.path, path)) return file;
+        return null;
+    }
+};
+
 test "source loader performs one exact load across the 128 KiB boundary through 256 KiB" {
     const sizes = [_]usize{
         128 * 1024 - 1,
@@ -87,6 +120,125 @@ test "source loader performs one exact load across the 128 KiB boundary through 
     try std.testing.expectEqual(@as(u32, 0), oversized.read_calls);
 }
 
+test "$INCLUDE builds one bounded relative source graph with exact file identity" {
+    const files = [_]GraphFile{
+        .{
+            .path = "C:\\GAME\\MAIN.BAS",
+            .source =
+            \\'$DYNAMIC $INCLUDE: 'INC\\ONE.BI' $STATIC
+            \\'$INCLUDE: 'INC\\ONE.BI'
+            \\Result = One + Two
+            \\END
+            ,
+        },
+        .{
+            .path = "C:\\GAME\\INC\\ONE.BI",
+            .source =
+            \\One = 20
+            \\'$INCLUDE: '..\\SHARED\\TWO.BI'
+            ,
+        },
+        .{ .path = "C:\\GAME\\SHARED\\TWO.BI", .source = "Two = 22\n" },
+    };
+    var reader = GraphSourceReader{ .files = &files };
+    var graph = try core.source_loader.loadGraph(std.testing.allocator, &reader, files[0].path);
+    defer graph.deinit(std.testing.allocator);
+    try std.testing.expect(graph.ok());
+    try std.testing.expectEqual(@as(usize, 3), graph.file_names.len);
+    try std.testing.expectEqual(@as(u32, 3), reader.info_calls);
+    try std.testing.expectEqual(@as(u32, 3), reader.read_calls);
+
+    var program = try core.compiler.compileGraphOwnedObserved(std.testing.allocator, &graph, null);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    try std.testing.expectEqualStrings(files[0].path, program.file_name);
+    try std.testing.expectEqual(@as(usize, 2), program.included_file_names.len);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 16));
+    try expectSingle(&machine, "Result", 42);
+}
+
+test "$INCLUDE token identity reaches nested runtime diagnostics" {
+    const files = [_]GraphFile{
+        .{ .path = "C:\\RUN\\MAIN.BAS", .source = "'$INCLUDE: 'NESTED\\FAULT.BI'\nEND\n" },
+        .{ .path = "C:\\RUN\\NESTED\\FAULT.BI", .source = "Zero = 0\nValue = 1 / Zero\n" },
+    };
+    var reader = GraphSourceReader{ .files = &files };
+    var graph = try core.source_loader.loadGraph(std.testing.allocator, &reader, files[0].path);
+    defer graph.deinit(std.testing.allocator);
+    var program = try core.compiler.compileGraphOwnedObserved(std.testing.allocator, &graph, null);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.runtime_error, machine.runToCompletion(64, 8));
+    const diagnostic = machine.runtime_diagnostic orelse return error.MissingRuntimeDiagnostic;
+    try std.testing.expectEqualStrings(files[1].path, diagnostic.file_name);
+    try std.testing.expectEqual(@as(u32, 2), diagnostic.span.line);
+    try std.testing.expectEqual(@as(u16, 1), diagnostic.span.file_id);
+}
+
+test "$INCLUDE missing cycle depth and aggregate size failures remain atomic diagnostics" {
+    const missing_files = [_]GraphFile{
+        .{ .path = "C:\\SRC\\MAIN.BAS", .source = "'$INCLUDE: 'MISSING.BI'\nEND\n" },
+    };
+    var missing_reader = GraphSourceReader{ .files = &missing_files };
+    var missing = try core.source_loader.loadGraph(std.testing.allocator, &missing_reader, missing_files[0].path);
+    defer missing.deinit(std.testing.allocator);
+    try std.testing.expect(!missing.ok());
+    try std.testing.expectEqual(core.frontend.DiagnosticCode.include_missing, missing.diagnostics[0].code);
+    try std.testing.expectEqual(@as(u32, 1), missing.diagnostics[0].span.line);
+    try std.testing.expectEqualStrings(missing_files[0].path, missing.diagnostics[0].file_name);
+    var missing_program = try core.compiler.compileGraphOwnedObserved(std.testing.allocator, &missing, null);
+    defer missing_program.deinit();
+    try std.testing.expect(!missing_program.ok());
+    try std.testing.expectEqual(@as(usize, 0), missing_program.instructions.len);
+
+    const cycle_files = [_]GraphFile{
+        .{ .path = "C:\\SRC\\MAIN.BAS", .source = "'$INCLUDE: 'A.BI'\nEND\n" },
+        .{ .path = "C:\\SRC\\A.BI", .source = "Value = 1\n'$INCLUDE: 'MAIN.BAS'\n" },
+    };
+    var cycle_reader = GraphSourceReader{ .files = &cycle_files };
+    var cycle = try core.source_loader.loadGraph(std.testing.allocator, &cycle_reader, cycle_files[0].path);
+    defer cycle.deinit(std.testing.allocator);
+    try std.testing.expect(!cycle.ok());
+    try std.testing.expectEqual(core.frontend.DiagnosticCode.include_cycle, cycle.diagnostics[0].code);
+    try std.testing.expectEqual(@as(u32, 2), cycle.diagnostics[0].span.line);
+    try std.testing.expectEqualStrings(cycle_files[1].path, cycle.diagnostics[0].file_name);
+
+    var depth_paths: [core.source_loader.maximum_include_depth + 2][32]u8 = undefined;
+    var depth_sources: [core.source_loader.maximum_include_depth + 2][48]u8 = undefined;
+    var depth_files: [core.source_loader.maximum_include_depth + 2]GraphFile = undefined;
+    for (0..depth_files.len) |index| {
+        const path = try std.fmt.bufPrint(&depth_paths[index], "C:\\DEPTH\\F{d}.BI", .{index});
+        const source = if (index + 1 < depth_files.len)
+            try std.fmt.bufPrint(&depth_sources[index], "'$INCLUDE: 'F{d}.BI'\n", .{index + 1})
+        else
+            try std.fmt.bufPrint(&depth_sources[index], "END\n", .{});
+        depth_files[index] = .{ .path = path, .source = source };
+    }
+    var depth_reader = GraphSourceReader{ .files = &depth_files };
+    var depth = try core.source_loader.loadGraph(std.testing.allocator, &depth_reader, depth_files[0].path);
+    defer depth.deinit(std.testing.allocator);
+    try std.testing.expect(!depth.ok());
+    try std.testing.expectEqual(core.frontend.DiagnosticCode.include_depth_exceeded, depth.diagnostics[0].code);
+
+    const large_source = try std.testing.allocator.alloc(u8, core.frontend.maximum_source_bytes);
+    defer std.testing.allocator.free(large_source);
+    @memset(large_source, ' ');
+    const size_files = [_]GraphFile{
+        .{ .path = "C:\\SIZE\\MAIN.BAS", .source = "'$INCLUDE: 'LARGE.BI'\nEND\n" },
+        .{ .path = "C:\\SIZE\\LARGE.BI", .source = large_source },
+    };
+    var size_reader = GraphSourceReader{ .files = &size_files };
+    var size = try core.source_loader.loadGraph(std.testing.allocator, &size_reader, size_files[0].path);
+    defer size.deinit(std.testing.allocator);
+    try std.testing.expect(!size.ok());
+    try std.testing.expectEqual(core.frontend.DiagnosticCode.include_graph_too_large, size.diagnostics[0].code);
+    try std.testing.expect(size.source.len <= core.frontend.maximum_source_bytes);
+}
+
 test "core compiler emits a bound instruction program" {
     var program = try core.compiler.compile(std.testing.allocator, "smoke.bas", "DEFINT A-Z\nAnswer = 6 * 7\nEND\n");
     defer program.deinit();
@@ -105,6 +257,140 @@ test "core compiler emits a bound instruction program" {
     try std.testing.expectEqual(@as(u32, 1), program.bind_passes);
     try std.testing.expect(program.instructions.len != 0);
     try std.testing.expectEqual(@as(usize, 1), program.globals.len);
+}
+
+test "numbered lines preserve source order and share control-flow labels" {
+    const source =
+        \\20 Value = 1
+        \\10 GOTO 40
+        \\30 Value = 999
+        \\40 GOSUB 100
+        \\50 IF Value = 3 THEN 70 ELSE 60
+        \\60 Value = -1
+        \\70 GOTO Done
+        \\100 Value = Value + 2
+        \\110 RETURN 50
+        \\Done:
+        \\120 Result = Value
+        \\130 END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "numbered.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    try std.testing.expect(program.instruction_metadata.len != 0);
+    try std.testing.expectEqual(@as(u16, 20), program.instruction_metadata[0].basic_line);
+    var saw_line_100 = false;
+    var saw_line_120 = false;
+    for (program.instruction_metadata) |metadata| {
+        saw_line_100 = saw_line_100 or metadata.basic_line == 100;
+        saw_line_120 = saw_line_120 or metadata.basic_line == 120;
+    }
+    try std.testing.expect(saw_line_100 and saw_line_120);
+
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 16));
+    try expectSingle(&machine, "Result", 3);
+
+    const invalid_lines = [_][]const u8{
+        "65530 END\n",
+        "10.0 END\n",
+    };
+    for (invalid_lines) |invalid| {
+        var rejected = try core.compiler.compile(std.testing.allocator, "bad-line.bas", invalid);
+        defer rejected.deinit();
+        try std.testing.expect(!rejected.ok());
+        try std.testing.expect(containsCompileDiagnostic(rejected.diagnostics, .invalid_line_number));
+    }
+    var boundaries = try core.compiler.compile(std.testing.allocator, "line-boundaries.bas", "  0 GOTO 65529\n  65529 END\n");
+    defer boundaries.deinit();
+    try expectProgramOk(&boundaries);
+
+    var named_then = try core.compiler.compile(std.testing.allocator, "named-then.bas", "IF 1 THEN Named\nNamed:\nEND\n");
+    defer named_then.deinit();
+    try std.testing.expect(!named_then.ok());
+}
+
+test "numeric RESTORE ON ERROR RESUME and question-mark PRINT accept numbered targets" {
+    const source =
+        \\10 ON ERROR GOTO 100
+        \\20 Value = 1 / 0
+        \\30 RESTORE 200
+        \\40 READ Result
+        \\50 ? "NUMBERED TARGETS"
+        \\60 END
+        \\100 ErrorLine& = ERL
+        \\110 RESUME 30
+        \\200 DATA 42
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "numbered-errors.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 16));
+    try expectSingle(&machine, "Result", 42);
+    try expectLong(&machine, "ErrorLine&", 20);
+    try std.testing.expect(screenContainsText(&machine, "NUMBERED TARGETS"));
+}
+
+test "line continuation preserves physical spans and rejects DATA continuation" {
+    const source = "Value = 1 + _\r\n2 + _\n3 + _\r4\n? \"CONTINUED\"\nEND\n";
+    var program = try core.compiler.compile(std.testing.allocator, "continuation.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(64, 8));
+    try expectSingle(&machine, "Value", 10);
+    try std.testing.expect(screenContainsText(&machine, "CONTINUED"));
+
+    var data_program = try core.compiler.compile(std.testing.allocator, "data-continuation.bas", "10 DATA 1, _\n2\nEND\n");
+    defer data_program.deinit();
+    try std.testing.expect(!data_program.ok());
+    try std.testing.expect(containsFrontendDiagnostic(data_program.diagnostics, .invalid_line_continuation));
+
+    var comment_program = try core.compiler.compile(std.testing.allocator, "comment-continuation.bas", "10 REM ignored _\n20 Value = 1\n30 END\n");
+    defer comment_program.deinit();
+    try expectProgramOk(&comment_program);
+}
+
+test "hexadecimal octal exponent and suffix literals use QuickBASIC reference types" {
+    const source =
+        \\A = &HFFFF
+        \\B = &HFFFFFFFF&
+        \\C = &O177777
+        \\D = &177777
+        \\E = 2147483648
+        \\F = 123456789012345
+        \\G = 1.234567890123456
+        \\H = 1E2
+        \\I = 1D2
+        \\J = 2%
+        \\K = 2&
+        \\L = 2!
+        \\M = 2#
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "literals.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    try std.testing.expect(hasIntegerConstant(program.constants, -1));
+    try std.testing.expect(hasLongConstant(program.constants, -1));
+    try std.testing.expect(hasSingleConstant(program.constants, 2_147_483_648));
+    try std.testing.expect(hasDoubleConstant(program.constants, 123_456_789_012_345));
+    try std.testing.expect(hasDoubleConstant(program.constants, 1.234567890123456));
+    try std.testing.expect(hasSingleConstant(program.constants, 100));
+    try std.testing.expect(hasDoubleConstant(program.constants, 100));
+    try std.testing.expect(hasIntegerConstant(program.constants, 2));
+    try std.testing.expect(hasLongConstant(program.constants, 2));
+    try std.testing.expect(hasSingleConstant(program.constants, 2));
+    try std.testing.expect(hasDoubleConstant(program.constants, 2));
+
+    var rejected = try core.compiler.compile(std.testing.allocator, "literal-overflow.bas", "Value = &H10000\nEND\n");
+    defer rejected.deinit();
+    try std.testing.expect(!rejected.ok());
+    try std.testing.expect(containsCompileDiagnostic(rejected.diagnostics, .invalid_number));
 }
 
 test "R4BASIC v2 conformance catalog is complete stable and machine readable" {
@@ -141,6 +427,11 @@ test "R4BASIC v2 conformance catalog is complete stable and machine readable" {
             core.conformance.metacommand_count + core.conformance.runtime_error_count,
         identifiers.count(),
     );
+    try expectTargetImplemented(core.conformance.part1_targets[0]);
+    try expectTargetImplemented(core.conformance.metacommand_targets[0]);
+    try std.testing.expectEqual(core.conformance.Status.implemented, core.conformance.part1_targets[1].lexer);
+    try std.testing.expectEqual(core.conformance.Status.implemented, core.conformance.part1_targets[1].syntax);
+    try std.testing.expectEqual(core.conformance.Status.implemented, core.conformance.part1_targets[3].lexer);
 }
 
 test "unimplemented statements stop at catalog-addressed compile diagnostics" {
@@ -326,7 +617,7 @@ test "compiler storage follows token demand and bounds the dense 256 KiB case" {
     try std.testing.expectEqual(@as(usize, 196_609), dense_program.instructions.len);
     try std.testing.expectEqual(dense_program.instructions.len, dense_program.instruction_metadata.len);
     try std.testing.expectEqual(@as(usize, 12), @sizeOf(core.bytecode.Instruction));
-    try std.testing.expectEqual(@as(usize, 24), @sizeOf(core.bytecode.InstructionMetadata));
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(core.bytecode.InstructionMetadata));
     try std.testing.expectEqual(
         @as(u64, @intCast(dense_program.instructions.len * @sizeOf(core.bytecode.Instruction))),
         dense_program.compile_stats.instruction_hot_bytes,
@@ -341,7 +632,7 @@ test "compiler storage follows token demand and bounds the dense 256 KiB case" {
     try std.testing.expect(dense_program.compile_stats.allocator_allocations <= 128);
     try std.testing.expect(dense_program.compile_stats.allocator_copy_bytes <= 8 * 1024 * 1024);
     try std.testing.expect(dense_program.compile_stats.compiler_peak_bytes <= 20 * 1024 * 1024);
-    try std.testing.expect(dense_program.compile_stats.program_bytes <= 8 * 1024 * 1024);
+    try std.testing.expect(dense_program.compile_stats.program_bytes <= 9 * 1024 * 1024);
 }
 
 test "constant interning is bit exact and floating parsing leaves source unchanged" {
@@ -2018,6 +2309,15 @@ fn validateCatalogTarget(
     try identifiers.put(target.id, {});
 }
 
+fn expectTargetImplemented(target: core.conformance.Target) !void {
+    try std.testing.expectEqual(core.conformance.Status.implemented, target.lexer);
+    try std.testing.expectEqual(core.conformance.Status.implemented, target.syntax);
+    try std.testing.expectEqual(core.conformance.Status.implemented, target.binder);
+    try std.testing.expectEqual(core.conformance.Status.implemented, target.vm);
+    try std.testing.expectEqual(core.conformance.Status.implemented, target.errors);
+    try std.testing.expectEqual(core.conformance.Status.implemented, target.coverage);
+}
+
 fn feedInput(machine: *core.vm.Vm, bytes: []const u8) !void {
     for (bytes) |byte| {
         const accepted = switch (byte) {
@@ -2114,5 +2414,42 @@ fn expectArrayRecordInteger(
 
 fn containsCompileDiagnostic(diagnostics: []const core.bytecode.Diagnostic, expected: core.bytecode.DiagnosticCode) bool {
     for (diagnostics) |diagnostic| if (diagnostic.code == expected) return true;
+    return false;
+}
+
+fn containsFrontendDiagnostic(diagnostics: []const core.bytecode.Diagnostic, expected: core.frontend.DiagnosticCode) bool {
+    for (diagnostics) |diagnostic| if (diagnostic.frontend_code == expected) return true;
+    return false;
+}
+
+fn hasIntegerConstant(constants: []const core.bytecode.Constant, expected: i16) bool {
+    for (constants) |constant| switch (constant) {
+        .integer => |value| if (value == expected) return true,
+        else => {},
+    };
+    return false;
+}
+
+fn hasLongConstant(constants: []const core.bytecode.Constant, expected: i32) bool {
+    for (constants) |constant| switch (constant) {
+        .long => |value| if (value == expected) return true,
+        else => {},
+    };
+    return false;
+}
+
+fn hasSingleConstant(constants: []const core.bytecode.Constant, expected: f32) bool {
+    for (constants) |constant| switch (constant) {
+        .single => |value| if (value == expected) return true,
+        else => {},
+    };
+    return false;
+}
+
+fn hasDoubleConstant(constants: []const core.bytecode.Constant, expected: f64) bool {
+    for (constants) |constant| switch (constant) {
+        .double => |value| if (value == expected) return true,
+        else => {},
+    };
     return false;
 }

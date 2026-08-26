@@ -6,14 +6,14 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.70.2
+Stand 0.70.3
 ------------
 
-Diese Ausbaustufe ist das Vertragsfundament des produktiven R4BASIC-v2-
-Subsystemhosts. Explorer
-uebergibt eine absolute BAS-Datei ueber `R4SUBSYS1`; das R4X liest sie durch
-die Storage-Fassade exakt einmal in eine passend grosse Allokation, uebergibt
-diese Allokation ohne Quellkopie an den Compiler und fuehrt eine getrennte VM in
+Diese Ausbaustufe ergaenzt das Vertragsfundament des produktiven R4BASIC-v2-
+Subsystemhosts um das vollstaendige Quelltext- und Programmlinienmodell.
+Explorer uebergibt eine absolute BAS-Datei ueber `R4SUBSYS1`; das R4X liest
+sie und relative `$INCLUDE`-Quellen durch die Storage-Fassade jeweils exakt
+einmal, baut daraus einen begrenzten Quellgraphen und fuehrt eine getrennte VM in
 einem verschiebbaren, skalierbaren und maximierbaren Fenster aus. Der Kern
 umfasst Textbildschirm, Eingabe, Gastzeit, Zufall, sequentielle Dateien,
 instanzlokale Indexed8-Grafik und gepufferte Audioausgabe. Der Compiler
@@ -53,12 +53,28 @@ Grenzen:
 - maximal 40 Byte je einfachem Bezeichnertoken
 - maximal 128 gleichzeitig offene Syntaxbloecke
 
-Der Lexer verarbeitet CRLF, LF und CR als gleichwertige logische
+Der Lexer verarbeitet CRLF, LF und CR als gleichwertige physische
 Zeilenenden. Er faltet Namen nur zum Vergleich in ASCII, behaelt aber die
 Originalbytes im Span. Bytes oberhalb ASCII bleiben innerhalb von
 Stringliteralen erhalten. Unbekannte Bytes, unvollstaendige Zahlen,
 unbeendete Strings, zu lange Namen und nicht zugesagte Metaanweisungen werden
 sichtbar gemeldet.
+
+Nummerierte Zeilen von 0 bis 65.529 und alphanumerische Labels benutzen
+dieselbe gebundene Zielaufloesung. Zeilennummern sortieren nicht; ausgefuehrt
+wird weiterhin die Quellreihenfolge. Direkte THEN-/ELSE-Ziele sind nur
+numerisch, benannte Ziele verlangen GOTO. Unterstrichfortsetzungen erhalten
+Datei, physische Zeile und Spalte jedes Tokens; DATA und REM koennen nicht
+fortgesetzt werden. Das Fragezeichen ist die PRINT-Kurzform. Hexadezimale und
+oktale Konstanten sowie Dezimal-, Exponent- und Typsuffixformen folgen bei der
+Konstantentypwahl der QuickBASIC-Referenz.
+
+`$INCLUDE: 'datei'`, `$STATIC` und `$DYNAMIC` koennen mehrfach in demselben
+Kommentar stehen. Include-Pfade sind relativ zur jeweils enthaltenden
+R4OS-Datei. Der Graph ist auf 64 Dateien, 16 Include-Ebenen und insgesamt
+256 KiB begrenzt. Cache, aktiver Rekursionspfad und eindeutige Datei-IDs
+trennen Wiederverwendung von Zyklen. Missing-, Zyklus-, Tiefen- und
+Groessenfehler werden atomar an der tatsaechlichen Datei und Zeile gemeldet.
 
 Der Compiler-Parser trennt Statements an Zeilenenden und Doppelpunkten. Nach
 einem Syntaxfehler synchronisiert er nur bis zu dieser sicheren Grenze. Dadurch
@@ -70,18 +86,19 @@ Compiler und VM
 ---------------
 
 `src/compiler.zig` fuehrt Parser, Binder und Emitter in einem kontrollierten
-Durchlauf ueber den einmal erzeugten Tokenstrom. Das Ergebnis besitzt eine
-eigene Dateinamenkopie, eigene Quellbytes sowie Tabellen fuer Konstanten,
+Durchlauf ueber den einmal erzeugten Tokenstrom. Das Ergebnis besitzt eigene
+Kopien aller Dateinamen, die gemeinsamen Quellbytes sowie Tabellen fuer Konstanten,
 globale Variablen, Prozeduren und Instruktionen. Die bisherigen geliehenen
-Compile-Einstiege kopieren den Quelltext weiterhin. `compileOwned` und
-`compileOwnedObserved` uebernehmen dagegen die uebergebene Allokation auf
+Compile-Einstiege kopieren den Quelltext weiterhin. `compileOwned`,
+`compileOwnedObserved` und `compileGraphOwnedObserved` uebernehmen dagegen die uebergebene Allokation auf
 jedem Erfolgs-, Fehler- und Abbruchpfad; der produktive Host uebergibt damit
 seinen eingelesenen Quellpuffer ohne zweite Quelltextkopie an das Programm.
-Jede Instruktion verweist auf ihren stabilen Quellspan. Labels werden pro
+Jede Instruktion verweist auf ihren stabilen Quellspan, ihre Datei-ID und die
+letzte vorangehende numerische BASIC-Zeile. Labels werden pro
 Modul- oder Prozedurscope auf feste Instruktionsindizes aufgeloest; unbekannte
 Ziele sind Compile-Diagnosen.
 
-Die 103 unterstuetzten und 84 bewusst reservierten Schluesselwoerter liegen in
+Die 104 unterstuetzten und 123 bewusst reservierten Schluesselwoerter liegen in
 einer zur Compilezeit erzeugten, case-insensitiven Hashtabelle. Die aktuelle
 Belegung benoetigt hoechstens acht Tabellenproben statt eines linearen Laufs
 ueber beide Wortlisten. Globale und lokale Variablen, Prozeduren, TYPE-Namen,
@@ -126,11 +143,11 @@ melden die naechste Ebene deterministisch als `expression_too_deep`.
 Die Hostabnahme verwendet einen spitzenarmen und einen maximal dichten,
 gueltigen 256-KiB-Quelltext. Fuer den spitzenarmen Fall gilt ein angeforderter
 Peak von hoechstens 512 KiB. Der dichte Fall `A=1:` x 65.536 misst mit dem
-Host-Page-Allocator 12.605.977 Byte Peak, 7.340.137 Byte verbleibenden
-Programmzustand, 7.095.028 Byte Anfangslisten, 16 Allokationen, drei
-Reallokationen und null Kopierbytes. Seine 65.536 identischen Integerliterale
+Host-Page-Allocator 15.229.037 Byte Peak, 8.913.013 Byte verbleibenden
+Programmzustand, 8.669.484 Byte Anfangslisten, 19 Allokationen, vier
+Reallokationen und 56 Kopierbytes. Seine 65.536 identischen Integerliterale
 belegen genau eine Konstante. Die Abnahme begrenzt diesen Fall auf 20 MB Peak,
-8 MB Programmzustand, 128 Allokationen und 8 MB Kopierarbeit. Der produktive
+9 MB Programmzustand, 128 Allokationen und 8 MB Kopierarbeit. Der produktive
 GORILLA-Gastmarker verlangt zusaetzlich exakte Tokenkapazitaet, uebernommene
 29.434 Quellbytes, begrenzte Ausdruckstiefe, keine Diagnosen sowie konsistente
 angeforderte und reale VM-Allocatorwerte.
@@ -140,7 +157,7 @@ Byte-Strings, DEFINT und Typsuffixe, skalare sowie mehrdimensionale
 DIM-/DIM-SHARED-Variablen,
 Konstanten, Ausdruecke und Vergleiche. IF/ELSEIF/ELSE, SELECT CASE,
 FOR/NEXT, WHILE/WEND, alle vor- und nachgeprueften DO/LOOP-Formen,
-GOTO sowie GOSUB/RETURN besitzen gebundene Spruenge.
+GOTO sowie GOSUB/RETURN besitzen gebundene numerische und benannte Spruenge.
 
 DECLARE, SUB, FUNCTION, explizite und implizite Aufrufe, skalare und
 zusammengesetzte ByRef- sowie skalare ByVal-Parameter und einzeilige
@@ -196,7 +213,9 @@ Fehlerfluss und privates Kompatibilitaetsgeraet
 
 ON ERROR GOTO, ON ERROR GOTO 0, RESUME und RESUME NEXT besitzen
 instanzlokalen Zustand. Jede Bytecode-Instruktion kennt Anfang und Nachfolger
-ihres BASIC-Statements. RESUME baut deshalb auch bei mehreren
+ihres BASIC-Statements sowie die letzte numerische Programmzeile. ERL liest
+diese unveraenderliche Identitaet aus dem zuletzt gefangenen Fehler. RESUME
+baut deshalb auch bei mehreren
 Operandeninstruktionen das ganze fehlerhafte Statement neu auf; RESUME NEXT
 springt exakt dahinter. Ein unbehandelter Fehler beendet nur seine VM.
 

@@ -12,12 +12,18 @@ pub const Span = struct {
     end: u32,
     line: u32,
     column: u32,
+    file_id: u16 = 0,
 
     pub fn bytes(self: Span, source: []const u8) []const u8 {
         const first: usize = @min(source.len, @as(usize, self.start));
         const last: usize = @min(source.len, @as(usize, self.end));
         return source[first..@max(first, last)];
     }
+};
+
+pub const LineOrigin = struct {
+    file_id: u16,
+    line: u32,
 };
 
 pub const DiagnosticCode = enum {
@@ -27,8 +33,14 @@ pub const DiagnosticCode = enum {
     invalid_byte,
     invalid_identifier,
     invalid_number,
+    invalid_line_continuation,
     unterminated_string,
     unsupported_metacommand,
+    invalid_include,
+    include_missing,
+    include_cycle,
+    include_depth_exceeded,
+    include_graph_too_large,
     expected_statement,
     expected_identifier,
     expected_expression,
@@ -56,8 +68,14 @@ pub const Diagnostic = struct {
             .invalid_byte => "invalid byte in BASIC source",
             .invalid_identifier => "BASIC identifier exceeds the current lexical length limit",
             .invalid_number => "malformed numeric literal",
+            .invalid_line_continuation => "invalid BASIC line continuation",
             .unterminated_string => "unterminated string literal",
             .unsupported_metacommand => "unsupported BASIC metacommand",
+            .invalid_include => "invalid $INCLUDE metacommand",
+            .include_missing => "$INCLUDE source file was not found",
+            .include_cycle => "$INCLUDE graph contains a cycle",
+            .include_depth_exceeded => "$INCLUDE graph is too deep",
+            .include_graph_too_large => "$INCLUDE graph exceeds the source limit",
             .expected_statement => "expected BASIC statement",
             .expected_identifier => "expected BASIC identifier",
             .expected_expression => "expected BASIC expression",
@@ -107,6 +125,7 @@ pub const Keyword = enum(u8) {
     elseif,
     end,
     eof,
+    erl,
     error_,
     exit,
     fn_,
@@ -116,6 +135,7 @@ pub const Keyword = enum(u8) {
     gosub,
     goto_,
     if_,
+    include,
     inkey_string,
     input,
     instr,
@@ -189,6 +209,7 @@ pub const TokenKind = enum(u8) {
     colon,
     comma,
     semicolon,
+    question,
     left_paren,
     right_paren,
     dot,
@@ -300,6 +321,17 @@ pub fn tokenizeNamedObserved(
     diagnostics: []Diagnostic,
     observer: ?TokenizeObserver,
 ) LexResult {
+    return tokenizeGraphNamedObserved(file_name, source, &.{}, tokens, diagnostics, observer);
+}
+
+pub fn tokenizeGraphNamedObserved(
+    file_name: []const u8,
+    source: []const u8,
+    line_origins: []const LineOrigin,
+    tokens: []Token,
+    diagnostics: []Diagnostic,
+    observer: ?TokenizeObserver,
+) LexResult {
     var sink = DiagnosticSink{ .storage = diagnostics, .file_name = file_name };
     if (source.len > maximum_source_bytes) {
         sink.add(.source_too_large, .{ .start = 0, .end = 0, .line = 1, .column = 1 });
@@ -314,6 +346,7 @@ pub fn tokenizeNamedObserved(
         .source = source,
         .tokens = tokens,
         .diagnostics = &sink,
+        .line_origins = line_origins,
         .observer = observer,
     };
     lexer.run();
@@ -369,6 +402,8 @@ const Lexer = struct {
     progress_updates: u32 = 0,
     cancelled: bool = false,
     count_only: bool = false,
+    continuation_forbidden: bool = false,
+    line_origins: []const LineOrigin = &.{},
     keyword_stats: KeywordLookupStats = .{},
 
     fn run(self: *Lexer) void {
@@ -388,6 +423,7 @@ const Lexer = struct {
                 ':' => self.single(.colon, true),
                 ',' => self.single(.comma, false),
                 ';' => self.single(.semicolon, false),
+                '?' => self.single(.question, false),
                 '(' => self.single(.left_paren, false),
                 ')' => self.single(.right_paren, false),
                 '.' => if (self.peekDigit(1)) self.lexNumber() else self.single(.dot, false),
@@ -402,6 +438,8 @@ const Lexer = struct {
                 '<', '>' => self.lexComparison(),
                 '"' => self.lexString(),
                 '0'...'9' => self.lexNumber(),
+                '&' => self.lexBasedNumber(),
+                '_' => self.lexContinuation(),
                 'A'...'Z', 'a'...'z' => self.lexWord(),
                 else => {
                     const span = self.pointSpan();
@@ -411,12 +449,7 @@ const Lexer = struct {
                 },
             }
         }
-        self.emit(.eof, .none, .{
-            .start = @intCast(self.index),
-            .end = @intCast(self.index),
-            .line = self.line,
-            .column = self.column,
-        });
+        self.emit(.eof, .none, self.makeSpan(self.index, self.index, self.line, self.column));
         if (!self.count_only and self.count == self.tokens.len and self.tokens[self.count - 1].kind != .eof) {
             self.tokens[self.count - 1] = .{ .kind = .eof, .span = self.pointSpan() };
         }
@@ -444,6 +477,7 @@ const Lexer = struct {
         self.line += 1;
         self.column = 1;
         self.statement_start = true;
+        self.continuation_forbidden = false;
         self.emit(.newline, .none, self.makeSpan(start, self.index, line, column));
     }
 
@@ -452,16 +486,9 @@ const Lexer = struct {
         const line = self.line;
         const column = self.column;
         self.advanceByte();
-        if (self.index < self.source.len and self.source[self.index] == '$') {
-            self.advanceByte();
-            const name_start = self.index;
-            while (self.index < self.source.len and std.ascii.isAlphabetic(self.source[self.index])) self.advanceByte();
-            const keyword = metacommandKeyword(self.source[name_start..self.index]);
-            const span = self.makeSpan(start, self.index, line, column);
-            if (keyword == .none) self.diagnostics.add(.unsupported_metacommand, span);
-            self.emit(.metacommand, keyword, span);
-        }
-        self.skipToLineEnd();
+        while (self.index < self.source.len and (self.source[self.index] == ' ' or self.source[self.index] == '\t')) self.advanceByte();
+        if (self.index >= self.source.len or self.source[self.index] != '$') return self.skipToLineEnd();
+        self.lexMetacommands(start, line, column);
     }
 
     fn lexWord(self: *Lexer) void {
@@ -479,25 +506,117 @@ const Lexer = struct {
             var probe = self.index;
             while (probe < self.source.len and (self.source[probe] == ' ' or self.source[probe] == '\t')) probe += 1;
             if (probe < self.source.len and self.source[probe] == '$') {
-                self.index = probe + 1;
-                self.column += @intCast(self.index - probe);
-                const name_start = self.index;
-                while (self.index < self.source.len and std.ascii.isAlphabetic(self.source[self.index])) self.advanceByte();
-                const keyword = metacommandKeyword(self.source[name_start..self.index]);
-                const span = self.makeSpan(start, self.index, line, column);
-                if (keyword == .none) self.diagnostics.add(.unsupported_metacommand, span);
-                self.emit(.metacommand, keyword, span);
+                self.column += @intCast(probe - self.index);
+                self.index = probe;
+                self.lexMetacommands(start, line, column);
+                return;
             }
             self.skipToLineEnd();
             return;
         }
 
         const keyword = if (self.count_only) Keyword.none else keywordFor(text, &self.keyword_stats);
+        if (self.statement_start and std.ascii.eqlIgnoreCase(text, "DATA")) self.continuation_forbidden = true;
         self.emit(if (keyword == .none) .identifier else .keyword, keyword, self.makeSpan(start, self.index, line, column));
         self.statement_start = false;
     }
 
+    fn lexBasedNumber(self: *Lexer) void {
+        const start = self.index;
+        const line = self.line;
+        const column = self.column;
+        self.advanceByte();
+        var base: u8 = 8;
+        if (self.index < self.source.len and (self.source[self.index] == 'H' or self.source[self.index] == 'h')) {
+            base = 16;
+            self.advanceByte();
+        } else if (self.index < self.source.len and (self.source[self.index] == 'O' or self.source[self.index] == 'o')) {
+            self.advanceByte();
+        }
+        var saw_digit = false;
+        var invalid = false;
+        while (self.index < self.source.len and std.ascii.isAlphanumeric(self.source[self.index])) {
+            const byte = std.ascii.toUpper(self.source[self.index]);
+            const valid = if (base == 16)
+                std.ascii.isDigit(byte) or (byte >= 'A' and byte <= 'F')
+            else
+                byte >= '0' and byte <= '7';
+            invalid = invalid or !valid;
+            saw_digit = true;
+            self.advanceByte();
+        }
+        if (self.index < self.source.len and self.source[self.index] == '&') self.advanceByte();
+        const span = self.makeSpan(start, self.index, line, column);
+        if (!saw_digit or invalid) self.diagnostics.add(.invalid_number, span);
+        self.emit(.number, .none, span);
+        self.statement_start = false;
+    }
+
+    fn lexContinuation(self: *Lexer) void {
+        const start = self.index;
+        const line = self.line;
+        const column = self.column;
+        self.advanceByte();
+        while (self.index < self.source.len and (self.source[self.index] == ' ' or self.source[self.index] == '\t')) self.advanceByte();
+        const span = self.makeSpan(start, self.index, line, column);
+        if (self.index >= self.source.len or (self.source[self.index] != '\r' and self.source[self.index] != '\n')) {
+            self.diagnostics.add(.invalid_line_continuation, span);
+            self.statement_start = false;
+            return;
+        }
+        if (self.continuation_forbidden) {
+            self.diagnostics.add(.invalid_line_continuation, span);
+            self.lexNewline();
+            return;
+        }
+        if (self.source[self.index] == '\r' and self.index + 1 < self.source.len and self.source[self.index + 1] == '\n') {
+            self.index += 2;
+        } else {
+            self.index += 1;
+        }
+        self.line += 1;
+        self.column = 1;
+    }
+
+    fn lexMetacommands(self: *Lexer, comment_start: usize, line: u32, column: u32) void {
+        while (self.index < self.source.len) {
+            while (self.index < self.source.len and (self.source[self.index] == ' ' or self.source[self.index] == '\t')) self.advanceByte();
+            if (self.index >= self.source.len or self.source[self.index] == '\r' or self.source[self.index] == '\n') break;
+            if (self.source[self.index] != '$') break;
+            const command_start = self.index;
+            self.advanceByte();
+            const name_start = self.index;
+            while (self.index < self.source.len and std.ascii.isAlphabetic(self.source[self.index])) self.advanceByte();
+            const keyword = metacommandKeyword(self.source[name_start..self.index]);
+            var valid = name_start != self.index;
+            if (keyword == .include) {
+                while (self.index < self.source.len and (self.source[self.index] == ' ' or self.source[self.index] == '\t')) self.advanceByte();
+                if (self.index >= self.source.len or self.source[self.index] != ':') {
+                    valid = false;
+                } else {
+                    self.advanceByte();
+                    while (self.index < self.source.len and (self.source[self.index] == ' ' or self.source[self.index] == '\t')) self.advanceByte();
+                    if (self.index >= self.source.len or self.source[self.index] != '\'') {
+                        valid = false;
+                    } else {
+                        self.advanceByte();
+                        const argument_start = self.index;
+                        while (self.index < self.source.len and self.source[self.index] != '\r' and self.source[self.index] != '\n' and self.source[self.index] != '\'') self.advanceByte();
+                        valid = valid and self.index != argument_start and self.index < self.source.len and self.source[self.index] == '\'';
+                        if (self.index < self.source.len and self.source[self.index] == '\'') self.advanceByte();
+                    }
+                }
+            }
+            const span = self.makeSpan(command_start, self.index, line, @intCast(column + command_start - comment_start));
+            if (keyword == .none) self.diagnostics.add(.unsupported_metacommand, span);
+            if (!valid) self.diagnostics.add(.invalid_include, span);
+            self.emit(.metacommand, keyword, span);
+        }
+        self.skipToLineEnd();
+    }
+
     fn lexNumber(self: *Lexer) void {
+        const was_statement_start = self.statement_start;
         const start = self.index;
         const line = self.line;
         const column = self.column;
@@ -521,7 +640,7 @@ const Lexer = struct {
         }
         if (self.index < self.source.len and isNumericTypeSuffix(self.source[self.index])) self.advanceByte();
         self.emit(.number, .none, self.makeSpan(start, self.index, line, column));
-        self.statement_start = false;
+        self.statement_start = was_statement_start;
     }
 
     fn lexString(self: *Lexer) void {
@@ -578,6 +697,7 @@ const Lexer = struct {
         self.advanceByte();
         self.emit(kind, .none, self.makeSpan(start, self.index, line, column));
         self.statement_start = starts_statement;
+        if (starts_statement) self.continuation_forbidden = false;
     }
 
     fn emit(self: *Lexer, kind: TokenKind, keyword: Keyword, span: Span) void {
@@ -611,16 +731,21 @@ const Lexer = struct {
     }
 
     fn pointSpan(self: *const Lexer) Span {
-        return .{
-            .start = @intCast(self.index),
-            .end = @intCast(@min(self.source.len, self.index + 1)),
-            .line = self.line,
-            .column = self.column,
-        };
+        return self.makeSpan(self.index, @min(self.source.len, self.index + 1), self.line, self.column);
     }
 
-    fn makeSpan(_: *const Lexer, start: usize, end: usize, line: u32, column: u32) Span {
-        return .{ .start = @intCast(start), .end = @intCast(end), .line = line, .column = column };
+    fn makeSpan(self: *const Lexer, start: usize, end: usize, line: u32, column: u32) Span {
+        const origin = if (line != 0 and line <= self.line_origins.len)
+            self.line_origins[line - 1]
+        else
+            LineOrigin{ .file_id = 0, .line = line };
+        return .{
+            .start = @intCast(start),
+            .end = @intCast(end),
+            .line = origin.line,
+            .column = column,
+            .file_id = origin.file_id,
+        };
     }
 };
 
@@ -637,6 +762,7 @@ fn isNumericTypeSuffix(byte: u8) bool {
 }
 
 fn metacommandKeyword(text: []const u8) Keyword {
+    if (std.ascii.eqlIgnoreCase(text, "INCLUDE")) return .include;
     if (std.ascii.eqlIgnoreCase(text, "DYNAMIC")) return .dynamic;
     if (std.ascii.eqlIgnoreCase(text, "STATIC")) return .static;
     return .none;
@@ -675,6 +801,7 @@ pub const supported_keyword_entries = [_]KeywordEntry{
     .{ .text = "ELSEIF", .keyword = .elseif },
     .{ .text = "END", .keyword = .end },
     .{ .text = "EOF", .keyword = .eof },
+    .{ .text = "ERL", .keyword = .erl },
     .{ .text = "ERROR", .keyword = .error_ },
     .{ .text = "EXIT", .keyword = .exit },
     .{ .text = "FN", .keyword = .fn_ },
@@ -751,18 +878,24 @@ pub const supported_keyword_entries = [_]KeywordEntry{
 };
 
 pub const unsupported_keyword_words = [_][]const u8{
-    "ASC",     "BASE",   "BLOAD",    "BSAVE",  "CDBL",    "CHAIN",    "CHDIR",
-    "CHDRIVE", "CLNG",   "COMMAND$", "COMMON", "CSNG",    "CVD",      "CVI",
-    "CVL",     "CVS",    "DATE$",    "DRAW",   "ENVIRON", "ENVIRON$", "EQV",
-    "ERASE",   "ERL",    "ERR",      "EXP",    "FIELD",   "FILES",    "FIX",
-    "FRE",     "HEX$",   "IMP",      "INP",    "INPUT$",  "IOCTL",    "IOCTL$",
-    "IS",      "KEY",    "KILL",     "LBOUND", "LCASE$",  "LOAD",     "LOC",
-    "LOCK",    "LOF",    "LOG",      "LPOS",   "LPRINT",  "MKD$",     "MKDIR",
-    "MKI$",    "MKL$",   "MKS$",     "NAME",   "OCT$",    "OPTION",   "OUT",
-    "PCOPY",   "POS",    "PRESERVE", "PRESET", "RANDOM",  "RIGHT$",   "RMDIR",
-    "RUN",     "SADD",   "SAVE",     "SGN",    "SHELL",   "SOUND",    "SPC",
-    "SQR",     "STICK",  "STRIG",    "SWAP",   "SYSTEM",  "TAN",      "TIME$",
-    "UBOUND",  "UNLOCK", "USING",    "VARPTR", "VARSEG",  "WAIT",     "WRITE",
+    "ACCESS",   "ALIAS",   "ASC",      "BASE",   "BINARY",   "BLOAD",   "BSAVE",
+    "CALLS",    "CDBL",    "CDECL",    "CHAIN",  "CHDIR",    "CHDRIVE", "CLEAR",
+    "CLNG",     "COM",     "COMMAND$", "COMMON", "CSNG",     "CSRLIN",  "CVD",
+    "CVDMBF",   "CVI",     "CVL",      "CVS",    "CVSMBF",   "DATE$",   "DEFDBL",
+    "DEFLNG",   "DEFSNG",  "DEFSTR",   "DRAW",   "ENDIF",    "ENVIRON", "ENVIRON$",
+    "EQV",      "ERASE",   "ERDEV",    "ERDEV$", "ERR",      "EXP",     "FIELD",
+    "FILEATTR", "FILES",   "FIX",      "FRE",    "FREEFILE", "HEX$",    "IMP",
+    "INP",      "INPUT$",  "IOCTL",    "IOCTL$", "IS",       "KEY",     "KILL",
+    "LBOUND",   "LCASE$",  "LIST",     "LOAD",   "LOCAL",    "LOC",     "LOCK",
+    "LOF",      "LOG",     "LPOS",     "LPRINT", "LSET",     "MKD$",    "MKDIR",
+    "MKDMBF$",  "MKI$",    "MKL$",     "MKS$",   "MKSMBF$",  "NAME",    "OCT$",
+    "OFF",      "OPTION",  "OUT",      "PCOPY",  "PEN",      "PMAP",    "POS",
+    "PRESERVE", "PRESET",  "RANDOM",   "RESET",  "RIGHT$",   "RMDIR",   "RSET",
+    "RTRIM$",   "RUN",     "SADD",     "SAVE",   "SEEK",     "SETMEM",  "SGN",
+    "SHELL",    "SIGNAL",  "SOUND",    "SPC",    "SQR",      "STICK",   "STOP",
+    "STRIG",    "STRING$", "SWAP",     "SYSTEM", "TAN",      "TIME$",   "TROFF",
+    "TRON",     "UBOUND",  "UEVENT",   "UNLOCK", "USING",    "VARPTR",  "VARPTR$",
+    "VARSEG",   "WAIT",    "WINDOW",   "WRITE",
 };
 
 const KeywordSlot = struct {
