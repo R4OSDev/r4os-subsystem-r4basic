@@ -6,7 +6,7 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.70.7
+Stand 0.70.9
 ------------
 
 Diese Ausbaustufe ergaenzt das Vertragsfundament des produktiven R4BASIC-v2-
@@ -23,6 +23,16 @@ sowie kanonischen pointerfreien Recordlayouts.
 Multi-NEXT, CASE IS, ON GOTO/GOSUB und die gemeinsame Fehleridentitaet von
 ERROR, ERR, ERL, ON ERROR und RESUME. STOP sowie die begrenzte sichtbare
 TRON/TROFF-Ausgabe sind kooperative Interpreterzustaende.
+0.70.8 vervollstaendigt sequentielle, RANDOM- und BINARY-Dateien mit
+kanonischen Recordbytes, FIELD, SEEK, GET/PUT, LOCK/UNLOCK sowie den
+referenzgenauen Positions-, EOF- und Fehlerregeln auf der begrenzten
+asynchronen R4SYS-Storage-Fassade.
+0.70.9 schliesst die R4OS-Plattformgrenze: VM-lokale Arbeitsverzeichnisse,
+typisierte Verwaltungsoperationen und kooperative Wildcardlaeufe,
+COMMAND$/ENVIRON aus R4SUBSYS1, getrennte Wand- und monotone Gastzeit sowie
+atomare RUN-/CHAIN-Programmwechsel im selben R4X. SHELL startet die
+R4OS-Terminalfassade und wartet kooperativ; SYSTEM verwendet den gemeinsamen
+idempotenten Abbaupfad.
 Explorer uebergibt eine absolute BAS-Datei ueber `R4SUBSYS1`; das R4X liest
 sie und relative `$INCLUDE`-Quellen durch die Storage-Fassade jeweils exakt
 einmal, baut daraus einen begrenzten Quellgraphen und fuehrt eine getrennte VM in
@@ -619,6 +629,13 @@ absolute und relative Dateipfade sowie Storage-Fehler direkt getestet. Der
 Dateitest deckt ausserdem Ein-Byte- und exakte Vier-MiB-Eingaben, CR/LF ueber
 Stueckgrenzen, exakte Vier-MiB-Ausgabe, asynchrone Wartezyklen, 4-KiB-
 Teilwrites und den unveraenderten Fehler-/RESUME-Pfad ab. Der
+0.70.9-Plattformtest deckt normalisierte Arbeitsverzeichnisse, Erstellen,
+Loeschen, Umbenennen und DOS-Wildcards, VM-isolierte Kommandozeilen und
+Environments, Kalender-/Uhrvalidierung, TIMER ueber Mitternacht, lokalen RUN,
+atomare RUN-/CHAIN-Uebergaenge, tiefen COMMON-/ALL-Transfer, CHAIN DELETE,
+kooperatives SHELL sowie SYSTEM-Abbau ab. Negative Vektoren pruefen
+Wurzelausbruch, reservierte Geraetenamen, ungueltige Zeitwerte und
+Environmentgrenzen ohne Teilmutation. Der
 Grafikhosttest prueft pixelidentische Integer- und Fractionalbilder,
 Indexed8-ABI- und XRGB-Fallbackpfad, die 15 Bloecke eines Vollframes, getrennte
 sparse Damage-Regionen, Unterdrueckung unveraenderter Frames, mindestens 20
@@ -674,9 +691,8 @@ Noch offene v2-Bereiche
 -----------------------
 
 Der Interpretervertrag zielt auf die vollstaendige QuickBASIC-4.5-Sprache
-und -Laufzeit. Nach 0.70.8 folgen insbesondere Plattform- und
-Dateisystemoperationen, weitere Grafikmodi und -primitive, Audio/Ereignisse
-sowie die private sichere Abbildung historischer Geraete- und
+und -Laufzeit. Nach 0.70.9 folgen insbesondere weitere Grafikmodi und
+-primitive, Audio/Ereignisse sowie die private sichere Abbildung historischer Geraete- und
 Fremdcodeoberflaechen. IDE, Debugger, nativer Compiler, Linker und Editor sind
 getrennte Produkte; Notepad bleibt fuer BAS-Dateien ueber `Open With` als
 separater Editor verfuegbar.

@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 execution foundation
 
-Contract version: `2.4.0`
+Contract version: `2.5.0`
 
 This document freezes the executable R4BASIC foundation and its non-regression
 invariants while the complete v2 target in `COMPATIBILITY.md` and
@@ -70,8 +70,9 @@ created.
   shares exactly that cell while separate VMs and reset never do.
 - Blank and named `COMMON` blocks own source-ordered, typed entries with
   canonical guest offsets. Their metadata contains no host pointer. Optional
-  `SHARED` controls procedure visibility; cross-program transfer is reserved
-  for `CHAIN` in 0.70.9.
+  `SHARED` controls procedure visibility. `CHAIN` transfers only compatible
+  source-ordered COMMON entries, or every compatible same-name global for
+  `ALL`; strings, records, and dynamic arrays are deep-copied.
 - Names and labels compare case-insensitively in ASCII while their original
   source spans remain unchanged.
 - Numbered lines range from 0 through 65,529 and execute in source order; they
@@ -82,6 +83,31 @@ created.
 Arrays and records are normal scoped variables. Array bounds and record
 layouts are immutable program metadata; elements, bounds, data cursors,
 aliases, and error-handler state belong to each VM instance.
+
+## R4OS platform and program transitions
+
+- Each VM owns one current directory per DOS drive. Relative guest paths are
+  normalized against that state, cannot escape a drive root, and become
+  typed R4OS SDK paths before a host operation. Device names and paths above
+  1,023 bytes are rejected before mutation. Directory enumeration and
+  wildcard deletion advance at most one entry per re-executed instruction.
+- `COMMAND$` and the initial environment come from optional `C` and repeated
+  `E` records in the opaque `R4SUBSYS1` request. Environment names compare
+  case-insensitively; order is stable and state, limits, mutation, reset, and
+  teardown remain VM-local.
+- `DATE$` and `TIME$` read or atomically set injected R4OS wall time. `TIMER`
+  is wall seconds modulo one day plus a monotonic fractional component.
+  Scheduling, guest deadlines, and pause adjustment never use settable wall
+  time.
+- A local `RUN` resets the VM and may select a bound numbered line. A path
+  `RUN` or `CHAIN` reports a transition to the R4X coordinator. The target
+  source graph, optional CHAIN DELETE filtering, compilation, and replacement
+  VM construction must all succeed before the previous program or VM is
+  released. The GUI R4X and its window host are never recursively replaced.
+- `SHELL` starts only the R4OS Terminal process facade and polls its process
+  handle cooperatively. `SYSTEM` returns successful guest completion. Normal
+  completion, runtime error, replacement, cancellation, and Close quiesce
+  pending shell/file/audio work and use the same idempotent release order.
 
 ## Arrays, records, and DATA
 

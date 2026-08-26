@@ -27,7 +27,7 @@ input, or graphics.
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.22`
+- Module version: `1.2.23`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -88,6 +88,23 @@ BINARY supports sparse offset writes and `INPUT$`. `LOC`, `LOF`, `EOF`,
 `SEEK`, `FILEATTR`, `FREEFILE`, exact range LOCK/UNLOCK and all classified
 file errors operate on confirmed state. R4SYS supplies asynchronous write-at,
 size-query and instance-owned range-lock operations; no DOS handle escapes.
+
+R4BASIC 1.2.23 completes the R4OS platform boundary. `CHDIR`, `MKDIR`,
+`RMDIR`, `FILES`, `KILL`, and `NAME` resolve VM-local per-drive working
+directories into typed R4OS paths, reject root escape and reserved devices,
+and keep wildcard directory work cooperative. `COMMAND$`, `ENVIRON`, and
+`ENVIRON$` consume bounded `R4SUBSYS1` launch records and retain independent
+state per VM. `DATE$`, `TIME$`, and `TIMER` use injected R4OS wall time while
+all deadlines and host slices remain monotonic.
+
+`RUN` and `CHAIN` replace a guest only after its complete bounded source graph
+has loaded and compiled. The same R4X window host remains alive; `CHAIN`
+deep-copies compatible COMMON state, supports the documented ALL transfer,
+and applies the R4BASIC `DELETE first-last` extension to the target graph
+before compilation. `SHELL` invokes the R4OS Terminal process facade with an
+opaque `/C` argument and polls its process handle cooperatively. `SYSTEM`,
+normal completion, error, cancellation, and Close share one idempotent
+resource teardown.
 
 R4BASIC 1.2.22 uses a shared 262,144-instruction ceiling with adaptive bounded
 clock blocks and an 8-ms production time boundary. Active work requests a

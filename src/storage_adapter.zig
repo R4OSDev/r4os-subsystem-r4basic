@@ -3,6 +3,8 @@ const r4os = @import("r4os");
 const vm = @import("vm.zig");
 
 const path_cache_entries: usize = 4;
+const shell_argument_capacity: usize = 4096;
+const terminal_path = "C:\\R4OS\\SOFTWARE\\TERMINAL\\TERMINAL.R4X";
 
 const Operation = enum(u8) {
     read,
@@ -33,6 +35,9 @@ pub const Adapter = struct {
     cache_raw_len: [path_cache_entries]u16 = .{0} ** path_cache_entries,
     cache_path: [path_cache_entries]r4os.AbsoluteFilePath = undefined,
     cache_next: usize = 0,
+    shell_process: ?r4os.ProcessHandle = null,
+    shell_command: [shell_argument_capacity]u8 = undefined,
+    shell_command_len: u16 = 0,
 
     pub const Stats = struct {
         read_calls: u64 = 0,
@@ -61,12 +66,25 @@ pub const Adapter = struct {
         services.file_info = fileInfo;
         services.file_lock = fileLock;
         services.file_quiesce = quiesce;
+        services.platform_context = self;
+        services.path_info = pathInfo;
+        services.path_delete = pathDelete;
+        services.path_rename = pathRename;
+        services.directory_create = directoryCreate;
+        services.directory_delete = directoryDelete;
+        services.directory_read = directoryRead;
+        services.wall_clock = wallClock;
+        services.wall_clock_set = wallClockSet;
+        services.environment_set = environmentSet;
+        services.shell = shell;
+        services.platform_quiesce = platformQuiesce;
     }
 
     /// R4SYS requests are not cancellable. The VM-owned transfer buffer must
     /// remain alive until a terminal state releases the request binding.
     pub fn deinit(self: *Adapter) void {
         self.quiesceActive();
+        self.quiesceShell();
         self.* = undefined;
     }
 
@@ -103,6 +121,172 @@ pub const Adapter = struct {
                 .info, .lock, .unlock => {},
             }
         }
+    }
+
+    fn platformQuiesce(context: ?*anyopaque) void {
+        const self: *Adapter = @ptrCast(@alignCast(context orelse return));
+        self.quiesceShell();
+    }
+
+    fn pathInfo(context: ?*anyopaque, raw_path: []const u8) vm.PathInfoResult {
+        const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
+        const path_slot = self.cachedPath(raw_path) orelse return .{ .failure = .path_error };
+        const files = r4os.Files{ .sys = self.resources.sys };
+        return switch (files.info(self.cache_path[path_slot].asZ())) {
+            .value => |info| .{ .info = if (info.is_dir != 0) .directory else .file },
+            .missing => .missing,
+            .failure => |raw| .{ .failure = mapPathFailure(raw) },
+        };
+    }
+
+    fn pathDelete(context: ?*anyopaque, raw_path: []const u8) vm.PathOperationResult {
+        const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
+        const path_slot = self.cachedPath(raw_path) orelse return .{ .failure = .path_error };
+        const files = r4os.Files{ .sys = self.resources.sys };
+        return mapPathOperation(files.delete(self.cache_path[path_slot].asZ()));
+    }
+
+    fn pathRename(context: ?*anyopaque, raw_source: []const u8, raw_target: []const u8) vm.PathOperationResult {
+        const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
+        const source_slot = self.cachedPath(raw_source) orelse return .{ .failure = .path_error };
+        const source = self.cache_path[source_slot];
+        const target_slot = self.cachedPath(raw_target) orelse return .{ .failure = .path_error };
+        const target = self.cache_path[target_slot];
+        const files = r4os.Files{ .sys = self.resources.sys };
+        return mapPathOperation(files.rename(source.asZ(), target.asZ()));
+    }
+
+    fn directoryCreate(context: ?*anyopaque, raw_path: []const u8) vm.PathOperationResult {
+        const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
+        const path_slot = self.cachedPath(raw_path) orelse return .{ .failure = .path_error };
+        const files = r4os.Files{ .sys = self.resources.sys };
+        return mapPathOperation(files.createDirectory(self.cache_path[path_slot].asZ()));
+    }
+
+    fn directoryDelete(context: ?*anyopaque, raw_path: []const u8) vm.PathOperationResult {
+        const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
+        const path_slot = self.cachedPath(raw_path) orelse return .{ .failure = .path_error };
+        const files = r4os.Files{ .sys = self.resources.sys };
+        return mapPathOperation(files.deleteDirectory(self.cache_path[path_slot].asZ()));
+    }
+
+    fn directoryRead(context: ?*anyopaque, raw_path: []const u8, index: u32, out: []u8) vm.DirectoryReadResult {
+        const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
+        const path_slot = self.cachedPath(raw_path) orelse return .{ .failure = .path_error };
+        const files = r4os.Files{ .sys = self.resources.sys };
+        var iterator = files.iterate(self.cache_path[path_slot].asZ());
+        iterator.index = index +| 2;
+        return switch (iterator.next(out)) {
+            .entry => |entry| .{ .entry = .{
+                .kind = if (entry.kind == .directory) .directory else .file,
+                .path_length = @intCast(entry.path.len),
+            } },
+            .end => .end,
+            .failure => |raw| .{ .failure = mapPathFailure(raw) },
+        };
+    }
+
+    fn wallClock(context: ?*anyopaque) vm.WallClockResult {
+        const self: *Adapter = @ptrCast(@alignCast(context orelse return .failure));
+        const state = self.resources.sys.timeState();
+        if (state.valid == 0) return .failure;
+        return .{ .value = .{
+            .valid = true,
+            .year = state.year,
+            .month = state.month,
+            .day = state.day,
+            .weekday = state.weekday,
+            .hour = state.hour,
+            .minute = state.minute,
+            .second = state.second,
+        } };
+    }
+
+    fn wallClockSet(context: ?*anyopaque, clock: vm.WallClock) bool {
+        const self: *Adapter = @ptrCast(@alignCast(context orelse return false));
+        var state = self.resources.sys.timeState();
+        state.valid = @intFromBool(clock.valid);
+        state.year = clock.year;
+        state.month = clock.month;
+        state.day = clock.day;
+        state.weekday = clock.weekday;
+        state.hour = clock.hour;
+        state.minute = clock.minute;
+        state.second = clock.second;
+        state.seconds_since_midnight = clock.secondsSinceMidnight();
+        return self.resources.sys.timeSetState(&state) == 0;
+    }
+
+    fn environmentSet(context: ?*anyopaque, raw_name: []const u8, value: []const u8) bool {
+        const self: *Adapter = @ptrCast(@alignCast(context orelse return false));
+        if (raw_name.len == 0 or raw_name.len > vm.maximum_environment_name_bytes) return false;
+        var name: [vm.maximum_environment_name_bytes + 1]u8 = .{0} ** (vm.maximum_environment_name_bytes + 1);
+        @memcpy(name[0..raw_name.len], raw_name);
+        return self.resources.sys.envSet(@ptrCast(&name), value) == 0;
+    }
+
+    fn shell(context: ?*anyopaque, command: []const u8) vm.ShellResult {
+        const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
+        if (std.mem.indexOfScalar(u8, command, 0) != null or command.len + 4 >= self.shell_command.len) {
+            return .{ .failure = .path_error };
+        }
+        if (self.shell_process == null) {
+            const prefix = if (command.len == 0) "" else "/C ";
+            const argument_len = prefix.len + command.len;
+            @memcpy(self.shell_command[0..prefix.len], prefix);
+            @memcpy(self.shell_command[prefix.len..argument_len], command);
+            self.shell_command[argument_len] = 0;
+            self.shell_command_len = @intCast(argument_len);
+            var path = r4os.AbsoluteFilePath.parse(terminal_path) catch return .{ .failure = .path_error };
+            self.shell_process = switch (self.resources.spawnWithConsoleHost(
+                path.asZ(),
+                @ptrCast(&self.shell_command),
+                .console,
+                .terminal_window,
+            )) {
+                .process => |process| process,
+                .failure => |raw| return .{ .failure = mapProcessFailure(raw) },
+            };
+            return .pending;
+        }
+        const expected_prefix = if (command.len == 0) "" else "/C ";
+        if (self.shell_command_len != expected_prefix.len + command.len or
+            !std.mem.eql(u8, self.shell_command[expected_prefix.len..self.shell_command_len], command))
+        {
+            return .{ .failure = .io_error };
+        }
+        var process = &self.shell_process.?;
+        return switch (process.wait(r4os.time_contract.timeoutPoll())) {
+            .exited => |code| blk: {
+                self.shell_process = null;
+                self.shell_command_len = 0;
+                break :blk .{ .exited = code };
+            },
+            .would_block, .timed_out => .pending,
+            .failure => |raw| blk: {
+                self.quiesceShell();
+                break :blk .{ .failure = mapProcessFailure(raw) };
+            },
+        };
+    }
+
+    fn quiesceShell(self: *Adapter) void {
+        const process = if (self.shell_process) |*value| value else return;
+        if (!process.valid()) {
+            self.shell_process = null;
+            self.shell_command_len = 0;
+            return;
+        }
+        _ = process.requestClose();
+        switch (process.wait(r4os.time_contract.timeoutFinite(.{ .nanoseconds = 250 * std.time.ns_per_ms }))) {
+            .exited => {},
+            else => {
+                _ = process.kill();
+                _ = process.wait(r4os.time_contract.timeoutForever());
+            },
+        }
+        self.shell_process = null;
+        self.shell_command_len = 0;
     }
 
     fn read(context: ?*anyopaque, raw_path: []const u8, offset: u32, out: []u8) vm.FileReadResult {
@@ -409,6 +593,36 @@ fn mapSubmissionFailure(raw: i32) vm.FileHostError {
         r4os.abi.io_error_lock_violation => .lock_violation,
         r4os.abi.io_error_too_large => .too_large,
         r4os.abi.io_error_no_instance, r4os.abi.io_error_unsupported => .unavailable,
+        else => .io_error,
+    };
+}
+
+fn mapPathOperation(result: r4os.app_storage.Operation) vm.PathOperationResult {
+    return switch (result) {
+        .ok => .success,
+        .missing => .missing,
+        .failure => |raw| .{ .failure = mapPathFailure(raw) },
+    };
+}
+
+fn mapPathFailure(raw: i32) vm.FileHostError {
+    return switch (raw) {
+        -1, -3 => .path_error,
+        -2 => .path_not_found,
+        -4 => .path_not_found,
+        -5, -7 => .permission_denied,
+        -6, -8 => .io_error,
+        -10 => .too_large,
+        -11 => .permission_denied,
+        else => .io_error,
+    };
+}
+
+fn mapProcessFailure(raw: i32) vm.FileHostError {
+    return switch (raw) {
+        r4os.abi.program_handle_error_not_found => .not_found,
+        r4os.abi.program_handle_error_no_memory => .too_many_files,
+        r4os.abi.program_handle_error_invalid => .path_error,
         else => .io_error,
     };
 }

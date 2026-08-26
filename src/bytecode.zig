@@ -1,7 +1,7 @@
 const std = @import("std");
 const frontend = @import("frontend.zig");
 
-pub const contract_version = "2.4.0";
+pub const contract_version = "2.5.0";
 pub const invalid_index: u32 = std.math.maxInt(u32);
 pub const unknown_dimensions: u8 = std.math.maxInt(u8);
 
@@ -153,6 +153,9 @@ pub const file_argument_position: u32 = 1 << 0;
 pub const file_argument_variable: u32 = 1 << 1;
 pub const file_range_first: u32 = 1 << 0;
 pub const file_range_last: u32 = 1 << 1;
+pub const program_run_path: u32 = 1 << 0;
+pub const program_chain_all: u32 = 1 << 0;
+pub const program_chain_delete: u32 = 1 << 1;
 
 pub const GraphicsBoxMode = enum(u8) {
     line,
@@ -264,6 +267,19 @@ pub const OpCode = enum(u8) {
     file_lock,
     file_unlock,
     file_reset,
+    path_chdir,
+    path_mkdir,
+    path_rmdir,
+    path_files,
+    path_kill,
+    path_rename,
+    environment_set,
+    wall_date_set,
+    wall_time_set,
+    program_run,
+    program_chain,
+    process_shell,
+    system_exit,
     audio_beep,
     audio_play,
     convert,
@@ -363,6 +379,10 @@ pub const Builtin = enum(u8) {
     rnd,
     sgn,
     timer,
+    command_string,
+    date_string,
+    environ_string,
+    time_string,
     sqr,
     tan,
 };

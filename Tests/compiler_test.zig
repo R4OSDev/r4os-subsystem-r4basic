@@ -179,6 +179,36 @@ test "$INCLUDE token identity reaches nested runtime diagnostics" {
     try std.testing.expectEqual(@as(u16, 1), diagnostic.span.file_id);
 }
 
+test "CHAIN DELETE filters numbered target lines before atomic compilation" {
+    const files = [_]GraphFile{.{
+        .path = "C:\\RUN\\DELETE.BAS",
+        .source =
+        \\100 Removed = 1
+        \\150 Removed = 2
+        \\250 Kept = 3
+        \\END
+        ,
+    }};
+    var reader = GraphSourceReader{ .files = &files };
+    var graph = try core.source_loader.loadGraph(std.testing.allocator, &reader, files[0].path);
+    defer graph.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), try core.source_loader.deleteNumberedLines(
+        std.testing.allocator,
+        &graph,
+        100,
+        200,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), graph.line_origins.len);
+    var program = try core.compiler.compileGraphOwnedObserved(std.testing.allocator, &graph, null);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(64, 8));
+    try std.testing.expect(machine.global("Removed") == null);
+    try expectSingle(&machine, "Kept", 3);
+}
+
 test "$INCLUDE missing cycle depth and aggregate size failures remain atomic diagnostics" {
     const missing_files = [_]GraphFile{
         .{ .path = "C:\\SRC\\MAIN.BAS", .source = "'$INCLUDE: 'MISSING.BI'\nEND\n" },
@@ -3225,6 +3255,417 @@ const RandomFiles = struct {
     }
 };
 
+const PlatformHost = struct {
+    const Entry = struct {
+        path: []const u8,
+        kind: core.vm.PathKind,
+        exists: bool = true,
+    };
+
+    entries: [8]Entry = .{
+        .{ .path = "C:\\GAMES", .kind = .directory },
+        .{ .path = "C:\\GAMES\\DATA", .kind = .directory },
+        .{ .path = "C:\\GAMES\\DATA\\OLD.TXT", .kind = .file },
+        .{ .path = "C:\\GAMES\\DATA\\NOTE.TXT", .kind = .file },
+        .{ .path = "C:\\GAMES\\DATA\\TEMP.TMP", .kind = .file },
+        .{ .path = "", .kind = .file, .exists = false },
+        .{ .path = "C:\\GAMES\\DATA\\KEEP.TMP", .kind = .directory },
+        .{ .path = "", .kind = .file, .exists = false },
+    },
+    clock: core.vm.WallClock = .{
+        .valid = true,
+        .year = 2026,
+        .month = 8,
+        .day = 26,
+        .weekday = 3,
+        .hour = 14,
+        .minute = 15,
+        .second = 16,
+    },
+    environment_updates: u32 = 0,
+    mode_fast: bool = false,
+    shell_calls: u32 = 0,
+    quiesce_calls: u32 = 0,
+
+    fn find(self: *@This(), path: []const u8) ?usize {
+        for (self.entries, 0..) |entry, index| {
+            if (entry.exists and std.ascii.eqlIgnoreCase(entry.path, path)) return index;
+        }
+        return null;
+    }
+
+    fn info(context: ?*anyopaque, path: []const u8) core.vm.PathInfoResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        const index = self.find(path) orelse return .missing;
+        return .{ .info = self.entries[index].kind };
+    }
+
+    fn createDirectory(context: ?*anyopaque, path: []const u8) core.vm.PathOperationResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (self.find(path) != null) return .{ .failure = .file_exists };
+        if (!std.ascii.eqlIgnoreCase(path, "C:\\GAMES\\DATA\\NEW")) return .{ .failure = .path_not_found };
+        self.entries[5] = .{ .path = "C:\\GAMES\\DATA\\NEW", .kind = .directory };
+        return .success;
+    }
+
+    fn deleteDirectory(context: ?*anyopaque, path: []const u8) core.vm.PathOperationResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        const index = self.find(path) orelse return .missing;
+        if (self.entries[index].kind != .directory) return .{ .failure = .path_error };
+        self.entries[index].exists = false;
+        return .success;
+    }
+
+    fn deletePath(context: ?*anyopaque, path: []const u8) core.vm.PathOperationResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        const index = self.find(path) orelse return .missing;
+        if (self.entries[index].kind != .file) return .{ .failure = .path_error };
+        self.entries[index].exists = false;
+        return .success;
+    }
+
+    fn renamePath(context: ?*anyopaque, source: []const u8, target: []const u8) core.vm.PathOperationResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        const index = self.find(source) orelse return .missing;
+        if (self.find(target) != null) return .{ .failure = .file_exists };
+        if (!std.ascii.eqlIgnoreCase(target, "C:\\GAMES\\DATA\\RENAMED.TXT")) return .{ .failure = .path_error };
+        self.entries[index].path = "C:\\GAMES\\DATA\\RENAMED.TXT";
+        return .success;
+    }
+
+    fn directoryRead(context: ?*anyopaque, directory: []const u8, requested: u32, out: []u8) core.vm.DirectoryReadResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        var visible: u32 = 0;
+        for (self.entries) |entry| {
+            if (!entry.exists or !directChild(directory, entry.path)) continue;
+            if (visible != requested) {
+                visible += 1;
+                continue;
+            }
+            if (entry.path.len > out.len) return .{ .failure = .too_large };
+            @memcpy(out[0..entry.path.len], entry.path);
+            return .{ .entry = .{ .kind = entry.kind, .path_length = @intCast(entry.path.len) } };
+        }
+        return .end;
+    }
+
+    fn wall(context: ?*anyopaque) core.vm.WallClockResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        return .{ .value = self.clock };
+    }
+
+    fn setWall(context: ?*anyopaque, clock: core.vm.WallClock) bool {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.clock = clock;
+        return true;
+    }
+
+    fn setEnvironment(context: ?*anyopaque, name: []const u8, value: []const u8) bool {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.environment_updates += 1;
+        if (std.ascii.eqlIgnoreCase(name, "MODE")) self.mode_fast = std.mem.eql(u8, value, "FAST");
+        return true;
+    }
+
+    fn shell(context: ?*anyopaque, command: []const u8) core.vm.ShellResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (!std.mem.eql(u8, command, "ECHO OK")) return .{ .failure = .path_error };
+        self.shell_calls += 1;
+        return if (self.shell_calls == 1) .pending else .{ .exited = 7 };
+    }
+
+    fn quiesce(context: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.quiesce_calls += 1;
+    }
+
+    fn directChild(directory: []const u8, path: []const u8) bool {
+        if (path.len <= directory.len or !std.ascii.eqlIgnoreCase(path[0..directory.len], directory)) return false;
+        var start = directory.len;
+        if (directory[directory.len - 1] != '\\') {
+            if (path[start] != '\\') return false;
+            start += 1;
+        }
+        return start < path.len and std.mem.indexOfScalar(u8, path[start..], '\\') == null;
+    }
+};
+
+test "R4OS path environment wall clock shell and SYSTEM semantics remain VM local" {
+    const source =
+        \\CHDIR "DATA"
+        \\MKDIR "NEW"
+        \\NAME "OLD.TXT" AS "RENAMED.TXT"
+        \\FILES "*.TXT"
+        \\KILL "*.TMP"
+        \\ENVIRON "MODE=FAST"
+        \\CommandText$ = COMMAND$
+        \\BaseEnvironment$ = ENVIRON$(1)
+        \\ModeEnvironment$ = ENVIRON$("mode")
+        \\DateText$ = DATE$
+        \\TimeText$ = TIME$
+        \\TimerValue! = TIMER
+        \\DATE$ = "02/29/2028"
+        \\TIME$ = "23:59:58"
+        \\SHELL "ECHO OK"
+        \\SYSTEM
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\PLATFORM.BAS", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var platform = PlatformHost{};
+    const initial_environment = [_]core.vm.EnvironmentInput{.{ .name = "BASE", .value = "ONE" }};
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{
+        .platform_context = &platform,
+        .path_info = PlatformHost.info,
+        .path_delete = PlatformHost.deletePath,
+        .path_rename = PlatformHost.renamePath,
+        .directory_create = PlatformHost.createDirectory,
+        .directory_delete = PlatformHost.deleteDirectory,
+        .directory_read = PlatformHost.directoryRead,
+        .wall_clock = PlatformHost.wall,
+        .wall_clock_set = PlatformHost.setWall,
+        .environment_set = PlatformHost.setEnvironment,
+        .shell = PlatformHost.shell,
+        .platform_quiesce = PlatformHost.quiesce,
+        .guest_directory = "C:\\GAMES",
+        .command_line = "  /quiet Mixed Case",
+        .initial_environment = &initial_environment,
+    });
+    defer machine.deinit();
+    var final_status = core.vm.Status.ready;
+    for (0..64) |cycle| {
+        machine.setGuestTime(@as(u64, @intCast(cycle)) * std.time.ns_per_ms);
+        const result = machine.runSlice(4096);
+        final_status = result.status;
+        if (result.status == .halted or result.status == .runtime_error) break;
+    }
+    try std.testing.expectEqual(core.vm.Status.halted, final_status);
+    try expectString(&machine, "CommandText$", "  /quiet Mixed Case");
+    try expectString(&machine, "BaseEnvironment$", "BASE=ONE");
+    try expectString(&machine, "ModeEnvironment$", "FAST");
+    try expectString(&machine, "DateText$", "08-26-2026");
+    try expectString(&machine, "TimeText$", "14:15:16");
+    try std.testing.expect(machine.global("TimerValue!").?.single >= 51_316 and machine.global("TimerValue!").?.single < 51_317);
+    try std.testing.expect(platform.find("C:\\GAMES\\DATA\\NEW") != null);
+    try std.testing.expect(platform.find("C:\\GAMES\\DATA\\RENAMED.TXT") != null);
+    try std.testing.expect(platform.find("C:\\GAMES\\DATA\\TEMP.TMP") == null);
+    try std.testing.expect(platform.find("C:\\GAMES\\DATA\\KEEP.TMP") != null);
+    try std.testing.expect(platform.mode_fast);
+    try std.testing.expectEqual(@as(u16, 2028), platform.clock.year);
+    try std.testing.expectEqual(@as(u8, 2), platform.clock.month);
+    try std.testing.expectEqual(@as(u8, 29), platform.clock.day);
+    try std.testing.expectEqual(@as(u8, 23), platform.clock.hour);
+    try std.testing.expectEqual(@as(u8, 59), platform.clock.minute);
+    try std.testing.expectEqual(@as(u8, 58), platform.clock.second);
+    try std.testing.expectEqual(@as(u32, 2), platform.shell_calls);
+    try std.testing.expect(platform.quiesce_calls >= 1);
+}
+
+test "platform syntax rejects invalid clocks environment and escaping paths with QuickBASIC errors" {
+    const cases = [_]struct {
+        source: []const u8,
+        code: core.vm.RuntimeCode,
+        number: i32,
+    }{
+        .{ .source = "DATE$ = \"02/30/2028\"\n", .code = .illegal_function_call, .number = 5 },
+        .{ .source = "TIME$ = \"24:00:00\"\n", .code = .illegal_function_call, .number = 5 },
+        .{ .source = "ENVIRON \"MISSING\"\n", .code = .illegal_function_call, .number = 5 },
+        .{ .source = "CHDIR \"..\\..\\..\"\n", .code = .path_file_access, .number = 75 },
+        .{ .source = "MKDIR \"CON\"\n", .code = .bad_file_name, .number = 64 },
+        .{ .source = "RMDIR \"C:\\GAMES\\DATA\"\n", .code = .path_file_access, .number = 75 },
+        .{ .source = "NAME \"C:\\GAMES\\DATA\\OLD.TXT\" AS \"D:\\OLD.TXT\"\n", .code = .path_file_access, .number = 75 },
+    };
+    for (cases, 0..) |case, index| {
+        var name_buffer: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "C:\\GAMES\\INVALID{d}.BAS", .{index});
+        var program = try core.compiler.compile(std.testing.allocator, name, case.source);
+        defer program.deinit();
+        try expectProgramOk(&program);
+        var platform = PlatformHost{};
+        var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{
+            .platform_context = &platform,
+            .path_info = PlatformHost.info,
+            .directory_create = PlatformHost.createDirectory,
+            .wall_clock = PlatformHost.wall,
+            .wall_clock_set = PlatformHost.setWall,
+            .environment_set = PlatformHost.setEnvironment,
+            .guest_directory = "C:\\GAMES\\DATA",
+        });
+        defer machine.deinit();
+        try std.testing.expectEqual(core.vm.Status.runtime_error, machine.runToCompletion(64, 8));
+        const diagnostic = machine.runtime_diagnostic orelse return error.MissingPlatformDiagnostic;
+        try std.testing.expectEqual(case.code, diagnostic.code);
+        try std.testing.expectEqual(case.number, diagnostic.qbasicErrorNumber());
+    }
+}
+
+test "two VM environments isolate mutations and reset to their injected state" {
+    const source =
+        \\Before$ = ENVIRON$("MODE")
+        \\BeforeIndex$ = ENVIRON$(1)
+        \\ENVIRON "MODE=CHANGED"
+        \\After$ = ENVIRON$("MODE")
+        \\AfterIndex$ = ENVIRON$(1)
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\ENV.BAS", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    const environment_a = [_]core.vm.EnvironmentInput{
+        .{ .name = "MODE", .value = "ONE" },
+        .{ .name = "KEEP", .value = "A" },
+    };
+    const environment_b = [_]core.vm.EnvironmentInput{
+        .{ .name = "MODE", .value = "TWO" },
+        .{ .name = "KEEP", .value = "B" },
+    };
+    var platform_a = PlatformHost{};
+    var platform_b = PlatformHost{};
+    var machine_a = try core.vm.Vm.init(std.testing.allocator, &program, .{
+        .platform_context = &platform_a,
+        .environment_set = PlatformHost.setEnvironment,
+        .initial_environment = &environment_a,
+    });
+    defer machine_a.deinit();
+    var machine_b = try core.vm.Vm.init(std.testing.allocator, &program, .{
+        .platform_context = &platform_b,
+        .environment_set = PlatformHost.setEnvironment,
+        .initial_environment = &environment_b,
+    });
+    defer machine_b.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine_a.runToCompletion(64, 8));
+    try std.testing.expectEqual(core.vm.Status.halted, machine_b.runToCompletion(64, 8));
+    try expectString(&machine_a, "Before$", "ONE");
+    try expectString(&machine_b, "Before$", "TWO");
+    try expectString(&machine_a, "BeforeIndex$", "MODE=ONE");
+    try expectString(&machine_b, "BeforeIndex$", "MODE=TWO");
+    try expectString(&machine_a, "After$", "CHANGED");
+    try expectString(&machine_b, "After$", "CHANGED");
+    try expectString(&machine_a, "AfterIndex$", "MODE=CHANGED");
+    try expectString(&machine_b, "AfterIndex$", "MODE=CHANGED");
+    try machine_a.reset();
+    try std.testing.expectEqual(core.vm.Status.halted, machine_a.runToCompletion(64, 8));
+    try expectString(&machine_a, "Before$", "ONE");
+}
+
+test "TIMER follows wall-day midnight while retaining monotone subsecond pacing" {
+    const ClockSequence = struct {
+        calls: u8 = 0,
+
+        fn wall(context: ?*anyopaque) core.vm.WallClockResult {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            const before_midnight = self.calls == 0;
+            self.calls += 1;
+            return .{ .value = .{
+                .valid = true,
+                .year = 2026,
+                .month = 12,
+                .day = if (before_midnight) 31 else 1,
+                .weekday = if (before_midnight) 4 else 5,
+                .hour = if (before_midnight) 23 else 0,
+                .minute = if (before_midnight) 59 else 0,
+                .second = if (before_midnight) 59 else 0,
+            } };
+        }
+    };
+    var program = try core.compiler.compile(
+        std.testing.allocator,
+        "C:\\GAMES\\MIDNIGHT.BAS",
+        "Before! = TIMER\nAfter! = TIMER\nEND\n",
+    );
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var clock = ClockSequence{};
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{
+        .platform_context = &clock,
+        .wall_clock = ClockSequence.wall,
+    });
+    defer machine.deinit();
+    machine.setGuestTime(500 * std.time.ns_per_ms);
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(64, 8));
+    try std.testing.expectApproxEqAbs(@as(f32, 86_399.5), machine.global("Before!").?.single, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), machine.global("After!").?.single, 0.01);
+}
+
+test "RUN restarts locally and path RUN requests one same-host transition" {
+    const local_source =
+        \\A = 1
+        \\RUN 100
+        \\A = 99
+        \\END
+        \\100 B = 42
+        \\END
+    ;
+    var local_program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\LOCALRUN.BAS", local_source);
+    defer local_program.deinit();
+    try expectProgramOk(&local_program);
+    var local_machine = try core.vm.Vm.init(std.testing.allocator, &local_program, .{});
+    defer local_machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, local_machine.runToCompletion(128, 16));
+    try expectSingle(&local_machine, "A", 0);
+    try expectSingle(&local_machine, "B", 42);
+
+    var path_program = try core.compiler.compile(
+        std.testing.allocator,
+        "C:\\GAMES\\PATHRUN.BAS",
+        "RUN \"NEXT.BAS\"\n",
+    );
+    defer path_program.deinit();
+    try expectProgramOk(&path_program);
+    var path_machine = try core.vm.Vm.init(std.testing.allocator, &path_program, .{});
+    defer path_machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.transition, path_machine.runToCompletion(64, 8));
+    var transition = path_machine.takeTransition() orelse return error.MissingRunTransition;
+    defer transition.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.vm.TransitionKind.run, transition.kind);
+    try std.testing.expectEqualStrings("C:\\GAMES\\NEXT.BAS", transition.path);
+}
+
+test "CHAIN transfers COMMON arrays and ALL values with explicit DELETE metadata" {
+    const source =
+        \\COMMON Shared&, Names$()
+        \\DIM Names$(1)
+        \\Shared& = 42
+        \\Names$(0) = "ALPHA"
+        \\Names$(1) = "BETA"
+        \\Local& = 7
+        \\CHAIN "NEXT.BAS", ALL, DELETE 100-200
+    ;
+    const target_source =
+        \\COMMON Shared&, Names$()
+        \\CopiedShared& = Shared&
+        \\CopiedFirst$ = Names$(0)
+        \\CopiedSecond$ = Names$(1)
+        \\CopiedLocal& = Local&
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\CHAIN1.BAS", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.transition, machine.runToCompletion(256, 16));
+    var transition = machine.takeTransition() orelse return error.MissingChainTransition;
+    defer transition.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.vm.TransitionKind.chain, transition.kind);
+    try std.testing.expect(transition.preserve_all);
+    try std.testing.expect(transition.delete_enabled);
+    try std.testing.expectEqual(@as(u16, 100), transition.delete_first);
+    try std.testing.expectEqual(@as(u16, 200), transition.delete_last);
+
+    var target_program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\NEXT.BAS", target_source);
+    defer target_program.deinit();
+    try expectProgramOk(&target_program);
+    var target_machine = try core.vm.Vm.init(std.testing.allocator, &target_program, .{});
+    defer target_machine.deinit();
+    try machine.transferCommonTo(&target_machine, transition.preserve_all);
+    try std.testing.expectEqual(core.vm.Status.halted, target_machine.runToCompletion(256, 16));
+    try expectLong(&target_machine, "CopiedShared&", 42);
+    try expectString(&target_machine, "CopiedFirst$", "ALPHA");
+    try expectString(&target_machine, "CopiedSecond$", "BETA");
+    try expectLong(&target_machine, "CopiedLocal&", 7);
+}
+
 test "RANDOM BINARY FIELD GET PUT SEEK metadata and locks preserve partial transfers" {
     const source =
         \\TYPE RowType
@@ -3831,6 +4272,7 @@ fn runFileIoCooperatively(machine: *core.vm.Vm, maximum_cycles: usize) !u64 {
             .halted => return waiting_cycles,
             .cancelled => return error.FileIoCancelled,
             .runtime_error => return error.FileIoRuntimeError,
+            .transition => return error.UnexpectedProgramTransition,
         }
     }
     return error.FileIoDidNotFinish;

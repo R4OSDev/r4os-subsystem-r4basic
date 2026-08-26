@@ -1,6 +1,7 @@
 const std = @import("std");
 const r4os = @import("r4os");
 const audio = @import("audio.zig");
+const bytecode = @import("bytecode.zig");
 const compiler = @import("compiler.zig");
 const frontend = @import("frontend.zig");
 const graphics_screen = @import("graphics_screen.zig");
@@ -62,6 +63,12 @@ pub fn r4_app_main(app: *r4os.App) i32 {
             "Eine BAS-Datei muss ueber Explorer oder Open With gestartet werden.",
         });
     };
+    const guest_start = GuestStartContext.parse(launch) catch |fault| {
+        return showStatus(allocator, sys, desk, draw, "R4BASIC - Startfehler", &.{
+            "Der BASIC-Startkontext ist ungueltig.",
+            @errorName(fault),
+        });
+    };
     const trace = LaunchTrace.parse(launch);
     _ = r4os.AbsoluteFilePath.parse(launch.guest_path) catch {
         if (trace.baseline) return writeBaselineFailure(&files, trace, "guest-path", 65);
@@ -80,7 +87,9 @@ pub fn r4_app_main(app: *r4os.App) i32 {
             @errorName(fault),
         });
     };
-    defer source_graph.deinit(allocator);
+    defer {
+        source_graph.deinit(allocator);
+    }
     const source = source_graph.source;
     timeline.source_end_ns = monotonicNow(sys);
     if (trace.baseline and (!std.ascii.eqlIgnoreCase(launch.guest_path, canonical_baseline_path) or !canonicalBaselineSource(source))) {
@@ -132,8 +141,10 @@ pub fn r4_app_main(app: *r4os.App) i32 {
             @errorName(fault),
         });
     };
-    const compile_vm_memory = CompileVmMemory.capture(compile_vm_before, r4os.vm_allocator.stats());
-    defer program.deinit();
+    var compile_vm_memory = CompileVmMemory.capture(compile_vm_before, r4os.vm_allocator.stats());
+    defer {
+        program.deinit();
+    }
     timeline.compile_end_ns = monotonicNow(sys);
     if (!program.ok()) {
         if (trace.baseline) return writeBaselineFailure(&files, trace, "compiler-diagnostic", 69);
@@ -145,6 +156,9 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     var storage = storage_adapter.Adapter.init(app.resources());
     defer storage.deinit();
     storage.install(&services);
+    services.guest_directory = parentPath(launch.guest_path);
+    services.command_line = guest_start.command_line;
+    services.initial_environment = guest_start.environment[0..guest_start.environment_count];
     var machine = vm.Vm.init(allocator, &program, services) catch |fault| {
         if (trace.baseline) return writeBaselineFailure(&files, trace, @errorName(fault), 70);
         return showStatus(allocator, sys, desk, draw, "R4BASIC - Laufzeitfehler", &.{
@@ -152,10 +166,197 @@ pub fn r4_app_main(app: *r4os.App) i32 {
             @errorName(fault),
         });
     };
-    defer machine.deinit();
+    defer {
+        machine.deinit();
+    }
     timeline.vm_end_ns = monotonicNow(sys);
-    var guest_adapter = runtime_adapter.Adapter.initSystem(&machine, &sys);
+    var current_path: []const u8 = launch.guest_path;
+    var current_path_owned = false;
+    defer if (current_path_owned) allocator.free(current_path);
+    var current_trace = trace;
 
+    while (true) {
+        const outcome = runGuestRuntime(
+            app,
+            sys,
+            &files,
+            &window_host,
+            &machine,
+            &storage,
+            &timeline,
+            current_trace,
+            current_path,
+            source_graph.stats,
+            &program,
+            compile_vm_memory,
+        ) orelse {
+            if (current_trace.baseline) return writeBaselineFailure(&files, current_trace, "runtime-init", 72);
+            return showStatus(allocator, sys, desk, draw, "R4BASIC - Laufzeitfehler", &.{
+                "Die kooperative Subsystemlaufzeit konnte nicht initialisiert werden.",
+            });
+        };
+        if (current_trace.baseline) return if (outcome.state == .closed and outcome.snapshot_written)
+            0
+        else if (outcome.exit_code == 0)
+            error_trace_write
+        else
+            outcome.exit_code;
+        if (outcome.state == .closed) return 0;
+
+        if (machine.status == .transition) {
+            var transition = machine.takeTransition() orelse return showStatus(
+                allocator,
+                sys,
+                desk,
+                draw,
+                "R4BASIC - Laufzeitfehler",
+                &.{"Der angeforderte Programmwechsel war unvollstaendig."},
+            );
+            var transition_owned = true;
+            defer if (transition_owned) transition.deinit(allocator);
+
+            timeline.source_begin_ns = monotonicNow(sys);
+            var replacement_graph = source_loader.loadGraph(allocator, &source_reader, transition.path) catch |fault| {
+                return showStatus(allocator, sys, desk, draw, "R4BASIC - Ladefehler", &.{
+                    "RUN oder CHAIN konnte die BASIC-Datei nicht laden.",
+                    transition.path,
+                    @errorName(fault),
+                });
+            };
+            var replacement_graph_owned = true;
+            defer if (replacement_graph_owned) replacement_graph.deinit(allocator);
+            if (transition.delete_enabled) {
+                _ = source_loader.deleteNumberedLines(
+                    allocator,
+                    &replacement_graph,
+                    transition.delete_first,
+                    transition.delete_last,
+                ) catch |fault| {
+                    return showStatus(allocator, sys, desk, draw, "R4BASIC - CHAIN-Fehler", &.{
+                        "Der DELETE-Zeilenbereich konnte nicht atomar auf das Ziel angewendet werden.",
+                        @errorName(fault),
+                    });
+                };
+            }
+            timeline.source_end_ns = monotonicNow(sys);
+
+            timeline.compile_begin_ns = monotonicNow(sys);
+            compile_text.reset();
+            var replacement_progress = CompileProgressView.init(
+                sys,
+                &window_host,
+                &compile_text,
+                &compile_display,
+                baseName(transition.path),
+                &timeline,
+            );
+            const replacement_vm_before = r4os.vm_allocator.stats();
+            var replacement_program = compiler.compileGraphOwnedObserved(
+                allocator,
+                &replacement_graph,
+                replacement_progress.observer(),
+            ) catch |fault| {
+                if (fault == error.Cancelled and replacement_progress.failure != 0) return replacement_progress.failure;
+                return showStatus(allocator, sys, desk, draw, "R4BASIC - Compilerfehler", &.{
+                    "RUN oder CHAIN konnte das Zielprogramm nicht kompilieren.",
+                    @errorName(fault),
+                });
+            };
+            var replacement_program_owned = true;
+            defer if (replacement_program_owned) replacement_program.deinit();
+            const replacement_compile_memory = CompileVmMemory.capture(replacement_vm_before, r4os.vm_allocator.stats());
+            timeline.compile_end_ns = monotonicNow(sys);
+            if (!replacement_program.ok()) return showCompilerDiagnostics(allocator, sys, desk, draw, &replacement_program);
+
+            timeline.vm_begin_ns = monotonicNow(sys);
+            var replacement_machine = vm.Vm.init(allocator, &replacement_program, services) catch |fault| {
+                return showStatus(allocator, sys, desk, draw, "R4BASIC - Laufzeitfehler", &.{
+                    "Die Ziel-VM fuer RUN oder CHAIN konnte nicht angelegt werden.",
+                    @errorName(fault),
+                });
+            };
+            var replacement_machine_owned = true;
+            defer if (replacement_machine_owned) replacement_machine.deinit();
+            replacement_machine.inheritPlatformState(&machine) catch |fault| {
+                return showStatus(allocator, sys, desk, draw, "R4BASIC - Laufzeitfehler", &.{
+                    "Der instanzlokale BASIC-Kontext konnte nicht uebernommen werden.",
+                    @errorName(fault),
+                });
+            };
+            if (transition.kind == .chain) machine.transferCommonTo(&replacement_machine, transition.preserve_all) catch |fault| {
+                return showStatus(allocator, sys, desk, draw, "R4BASIC - CHAIN-Fehler", &.{
+                    "COMMON beziehungsweise ALL ist mit dem Zielprogramm nicht kompatibel.",
+                    @errorName(fault),
+                });
+            };
+            timeline.vm_end_ns = monotonicNow(sys);
+
+            machine.deinit();
+            program.deinit();
+            source_graph.deinit(allocator);
+            machine = replacement_machine;
+            replacement_machine_owned = false;
+            program = replacement_program;
+            replacement_program_owned = false;
+            source_graph = replacement_graph;
+            replacement_graph_owned = false;
+            compile_vm_memory = replacement_compile_memory;
+            if (current_path_owned) allocator.free(current_path);
+            current_path = transition.path;
+            current_path_owned = true;
+            transition_owned = false;
+            current_trace = .{};
+            continue;
+        }
+
+        if (machine.status == .runtime_error) {
+            return showRuntimeDiagnostic(allocator, sys, desk, draw, &machine, outcome.audio_degraded);
+        }
+        if (outcome.state == .failed) {
+            var failure_text: [64]u8 = undefined;
+            const formatted_failure = std.fmt.bufPrint(failure_text[0..], "Hostfehler: {d}", .{outcome.exit_code}) catch "Hostfehlercode nicht darstellbar";
+            return showStatus(allocator, sys, desk, draw, "R4BASIC - Hostfehler", &.{
+                "Die Subsystemlaufzeit hat diese Gastinstanz kontrolliert beendet.",
+                formatted_failure,
+                if (outcome.audio_degraded) "Audio war bereits degradiert; andere Gastinstanzen bleiben unabhaengig." else "Andere Gastinstanzen bleiben unabhaengig.",
+            });
+        }
+        const completion = if (machine.status == .cancelled)
+            "Das BASIC-Programm wurde beendet."
+        else
+            "Das BASIC-Programm ist beendet.";
+        var exit_text: [64]u8 = undefined;
+        const formatted_exit = std.fmt.bufPrint(exit_text[0..], "Exitcode: {d}", .{outcome.exit_code}) catch "Exitcode nicht darstellbar";
+        return showStatus(allocator, sys, desk, draw, "R4BASIC - Programmende", &.{
+            completion,
+            formatted_exit,
+            if (outcome.audio_degraded) "Audio war nicht verfuegbar; Grafik und Gastzeit liefen weiter." else "Audio wurde regulaer geschlossen.",
+        });
+    }
+}
+
+const RuntimeOutcome = struct {
+    exit_code: i32,
+    state: runtime_api.LifecycleState,
+    audio_degraded: bool,
+    snapshot_written: bool,
+};
+
+fn runGuestRuntime(
+    app: *r4os.App,
+    sys: r4os.r4sys.Context,
+    files: *const r4os.Files,
+    window_host: *host_api.Host,
+    machine: *vm.Vm,
+    storage: *storage_adapter.Adapter,
+    timeline: *LaunchTimeline,
+    trace: LaunchTrace,
+    guest_path: []const u8,
+    source_load: source_loader.Stats,
+    program: *const bytecode.Program,
+    compile_vm_memory: CompileVmMemory,
+) ?RuntimeOutcome {
+    var guest_adapter = runtime_adapter.Adapter.initSystem(machine, &sys);
     var audio_sink_storage: runtime_api.R4AudioSink = undefined;
     var sink: ?runtime_api.AudioSink = null;
     if (app.audio()) |app_audio| {
@@ -179,63 +380,39 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         .queue_storage = audio_queue[0..],
         .scratch = audio_scratch[0..],
         .sink = sink,
-    }) catch {
-        if (trace.baseline) return writeBaselineFailure(&files, trace, "runtime-init", 72);
-        return showStatus(allocator, sys, desk, draw, "R4BASIC - Laufzeitfehler", &.{
-            "Die kooperative Subsystemlaufzeit konnte nicht initialisiert werden.",
-        });
-    };
-    defer runtime.shutdown();
-    timeline.host_ready_ns = monotonicNow(sys);
+    }) catch return null;
 
+    timeline.host_ready_ns = monotonicNow(sys);
     var runtime_host = RuntimeHost.init(
         sys,
-        &files,
-        &window_host,
+        files,
+        window_host,
         &guest_adapter,
-        &storage,
-        &timeline,
+        storage,
+        timeline,
         trace,
-        launch.guest_path,
-        source.len,
-        source_graph.stats,
+        guest_path,
+        program.source.len,
+        source_load,
         program.instructions.len,
         program.compile_stats,
         compile_vm_memory,
-        baseName(launch.guest_path),
+        baseName(guest_path),
     );
     runtime_host.runtime = &runtime;
     runtime_host.applyNormalTitle();
     _ = window_host.setMinimumSize(320, 200);
     runtime_host.trace_armed = true;
     timeline.runtime_begin_ns = monotonicNow(sys);
-
-    const exit = runtime.run(&sys, guest_adapter.driver(), runtime_host.driver());
-    if (trace.baseline) return if (runtime.state == .closed and runtime_host.snapshot_written) 0 else if (exit == 0) error_trace_write else exit;
-    if (runtime.state == .closed) return 0;
-    if (machine.status == .runtime_error) {
-        return showRuntimeDiagnostic(allocator, sys, desk, draw, &machine, runtime_host.audio_degraded);
-    }
-    if (runtime.state == .failed) {
-        var failure_text: [64]u8 = undefined;
-        const formatted_failure = std.fmt.bufPrint(failure_text[0..], "Hostfehler: {d}", .{exit}) catch "Hostfehlercode nicht darstellbar";
-        return showStatus(allocator, sys, desk, draw, "R4BASIC - Hostfehler", &.{
-            "Die Subsystemlaufzeit hat diese Gastinstanz kontrolliert beendet.",
-            formatted_failure,
-            if (runtime_host.audio_degraded) "Audio war bereits degradiert; andere Gastinstanzen bleiben unabhaengig." else "Andere Gastinstanzen bleiben unabhaengig.",
-        });
-    }
-    const completion = if (machine.status == .cancelled)
-        "Das BASIC-Programm wurde beendet."
-    else
-        "Das BASIC-Programm ist beendet.";
-    var exit_text: [64]u8 = undefined;
-    const formatted_exit = std.fmt.bufPrint(exit_text[0..], "Exitcode: {d}", .{exit}) catch "Exitcode nicht darstellbar";
-    return showStatus(allocator, sys, desk, draw, "R4BASIC - Programmende", &.{
-        completion,
-        formatted_exit,
-        if (runtime_host.audio_degraded) "Audio war nicht verfuegbar; Grafik und Gastzeit liefen weiter." else "Audio wurde regulaer geschlossen.",
-    });
+    const exit_code = runtime.run(&sys, guest_adapter.driver(), runtime_host.driver());
+    const outcome = RuntimeOutcome{
+        .exit_code = exit_code,
+        .state = runtime.state,
+        .audio_degraded = runtime_host.audio_degraded,
+        .snapshot_written = runtime_host.snapshot_written,
+    };
+    runtime.shutdown();
+    return outcome;
 }
 
 const performance_numeric_source =
@@ -481,6 +658,41 @@ fn containsIgnoreCase(value: []const u8, needle: []const u8) bool {
     }
     return false;
 }
+
+const GuestStartContext = struct {
+    command_line: []const u8 = "",
+    environment: [launch_api.max_options]vm.EnvironmentInput = undefined,
+    environment_count: usize = 0,
+
+    const Error = error{
+        DuplicateCommand,
+        InvalidEnvironment,
+    };
+
+    fn parse(request: launch_api.Request) (launch_api.Error || Error)!GuestStartContext {
+        var result = GuestStartContext{};
+        var command_seen = false;
+        var iterator = request.options();
+        while (try iterator.next()) |option| {
+            if (std.ascii.eqlIgnoreCase(option.key, launch_api.command_key)) {
+                if (command_seen) return error.DuplicateCommand;
+                result.command_line = option.value;
+                command_seen = true;
+                continue;
+            }
+            if (!std.ascii.eqlIgnoreCase(option.key, launch_api.environment_key)) continue;
+            const separator = std.mem.indexOfScalar(u8, option.value, '=') orelse return error.InvalidEnvironment;
+            const name = option.value[0..separator];
+            const value = option.value[separator + 1 ..];
+            if (name.len == 0 or name.len > vm.maximum_environment_name_bytes or
+                value.len > vm.maximum_environment_value_bytes or result.environment_count >= result.environment.len) return error.InvalidEnvironment;
+            for (name) |byte| if (byte < 0x21 or byte > 0x7E or byte == '=') return error.InvalidEnvironment;
+            result.environment[result.environment_count] = .{ .name = name, .value = value };
+            result.environment_count += 1;
+        }
+        return result;
+    }
+};
 
 const LaunchTrace = struct {
     active: bool = false,
@@ -1430,4 +1642,13 @@ fn baseName(path: []const u8) []const u8 {
         if (byte == '\\' or byte == '/') start = index + 1;
     }
     return if (start < path.len) path[start..] else path;
+}
+
+fn parentPath(path: []const u8) []const u8 {
+    var separator: ?usize = null;
+    for (path, 0..) |byte, index| {
+        if (byte == '\\' or byte == '/') separator = index;
+    }
+    const index = separator orelse return "C:\\";
+    return path[0 .. index + 1];
 }

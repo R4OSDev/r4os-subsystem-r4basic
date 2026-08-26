@@ -346,7 +346,7 @@ fn step(context: *anyopaque, budget: u32, guest_now_ns: u64) runtime.StepResult 
     }
     if (time_limited) self.performance.time_limited_steps +%= 1 else if (result.status == .yielded and executed == allowed) self.performance.budget_limited_steps +%= 1;
     if (result.status == .waiting) self.performance.waiting_steps +%= 1;
-    const terminal = result.status == .halted or result.status == .cancelled or result.status == .runtime_error;
+    const terminal = result.status == .halted or result.status == .cancelled or result.status == .runtime_error or result.status == .transition;
     const frame_ready = frameReady(
         self,
         guest_now_ns,
@@ -364,6 +364,7 @@ fn step(context: *anyopaque, budget: u32, guest_now_ns: u64) runtime.StepResult 
             runtime.StepResult.complete(self.machine.exit_code, frame_ready).withOperations(executed),
         .cancelled => runtime.StepResult.complete(self.machine.exit_code, frame_ready).withOperations(executed),
         .runtime_error => runtime.StepResult.fail(self.machine.exit_code).withOperations(executed),
+        .transition => runtime.StepResult.complete(0, frame_ready).withOperations(executed),
     };
 }
 

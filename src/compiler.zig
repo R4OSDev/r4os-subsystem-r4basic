@@ -874,6 +874,19 @@ const Builder = struct {
             .lock => self.parseFileLock(false),
             .unlock => self.parseFileLock(true),
             .reset => self.parseSimpleOp(.file_reset),
+            .chdir => self.parseStringStatement(.path_chdir),
+            .mkdir => self.parseStringStatement(.path_mkdir),
+            .rmdir => self.parseStringStatement(.path_rmdir),
+            .files => self.parseFiles(),
+            .kill => self.parseStringStatement(.path_kill),
+            .name => self.parseName(),
+            .environ => self.parseStringStatement(.environment_set),
+            .date_string => self.parseClockSet(.wall_date_set),
+            .time_string => self.parseClockSet(.wall_time_set),
+            .run => self.parseRun(),
+            .chain => self.parseChain(),
+            .shell => self.parseShell(),
+            .system => self.parseSimpleOp(.system_exit),
             .beep => self.parseAudioBeep(),
             .play => self.parseAudioPlay(),
             .return_ => self.parseReturn(),
@@ -2897,6 +2910,123 @@ const Builder = struct {
         return true;
     }
 
+    fn parseStringStatement(self: *Builder, op: bytecode.OpCode) !bool {
+        const statement = self.advance();
+        const value_type = (try self.parseExpression()) orelse return false;
+        if (value_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+        _ = try self.emit(op, 0, 0, statement.span);
+        return true;
+    }
+
+    fn parseFiles(self: *Builder) !bool {
+        const statement = self.advance();
+        if (self.atBoundary()) {
+            const empty = try self.addConstant(.{ .string = .{
+                .start = statement.span.end,
+                .end = statement.span.end,
+                .line = statement.span.line,
+                .column = statement.span.column,
+                .file_id = statement.span.file_id,
+            } });
+            _ = try self.emit(.push_constant, empty, 0, statement.span);
+        } else {
+            const value_type = (try self.parseExpression()) orelse return false;
+            if (value_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+        }
+        _ = try self.emit(.path_files, 0, 0, statement.span);
+        return true;
+    }
+
+    fn parseName(self: *Builder) !bool {
+        const statement = self.advance();
+        const source_type = (try self.parseExpression()) orelse return false;
+        if (source_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+        if (!try self.expectKeyword(.as)) return false;
+        const target_type = (try self.parseExpression()) orelse return false;
+        if (target_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+        _ = try self.emit(.path_rename, 0, 0, statement.span);
+        return true;
+    }
+
+    fn parseClockSet(self: *Builder, op: bytecode.OpCode) !bool {
+        const statement = self.advance();
+        if (!try self.expect(.equal)) return false;
+        const value_type = (try self.parseExpression()) orelse return false;
+        if (value_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+        _ = try self.emit(op, 0, 0, statement.span);
+        return true;
+    }
+
+    fn parseRun(self: *Builder) !bool {
+        const statement = self.advance();
+        if (self.atBoundary()) {
+            _ = try self.emit(.program_run, bytecode.invalid_index, 0, statement.span);
+            return true;
+        }
+        if (self.at(.number) and self.peek(1).kind != .dot) {
+            const label = self.advance();
+            const instruction = try self.emit(.program_run, bytecode.invalid_index, 0, statement.span);
+            try self.addLabelFixup(label.span, instruction);
+            return true;
+        }
+        const value_type = (try self.parseExpression()) orelse return false;
+        if (value_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+        _ = try self.emit(.program_run, bytecode.invalid_index, bytecode.program_run_path, statement.span);
+        return true;
+    }
+
+    fn parseChain(self: *Builder) !bool {
+        const statement = self.advance();
+        const path_type = (try self.parseExpression()) orelse return false;
+        if (path_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+        var flags: u32 = 0;
+        var first: u16 = 0;
+        var last: u16 = 0;
+        while (self.consume(.comma)) {
+            if (self.consumeKeyword(.all)) {
+                flags |= bytecode.program_chain_all;
+                continue;
+            }
+            if (self.consumeKeyword(.delete)) {
+                const first_token = if (self.at(.number)) self.advance() else return self.fail(.expected_token);
+                first = (try self.parseLineNumber(first_token)) orelse return false;
+                last = first;
+                if (self.consume(.minus)) {
+                    const last_token = if (self.at(.number)) self.advance() else return self.fail(.expected_token);
+                    last = (try self.parseLineNumber(last_token)) orelse return false;
+                    if (last < first) {
+                        try self.addDiagnostic(.invalid_line_number, last_token.span);
+                        return false;
+                    }
+                }
+                flags |= bytecode.program_chain_delete;
+                continue;
+            }
+            return self.fail(.unexpected_token);
+        }
+        _ = try self.emit(.program_chain, flags, (@as(u32, first) << 16) | last, statement.span);
+        return true;
+    }
+
+    fn parseShell(self: *Builder) !bool {
+        const statement = self.advance();
+        if (self.atBoundary()) {
+            const empty = try self.addConstant(.{ .string = .{
+                .start = statement.span.end,
+                .end = statement.span.end,
+                .line = statement.span.line,
+                .column = statement.span.column,
+                .file_id = statement.span.file_id,
+            } });
+            _ = try self.emit(.push_constant, empty, 0, statement.span);
+        } else {
+            const command_type = (try self.parseExpression()) orelse return false;
+            if (command_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+        }
+        _ = try self.emit(.process_shell, 0, 0, statement.span);
+        return true;
+    }
+
     fn parseAudioPlay(self: *Builder) !bool {
         const statement = self.advance();
         const command_type = (try self.parseExpression()) orelse return false;
@@ -3809,7 +3939,8 @@ const Builder = struct {
         const function_token = self.advance();
         var argument_types: [3]bytecode.ValueType = undefined;
         var argument_count: usize = 0;
-        const allows_bare = builtin == .inkey_string or builtin == .timer or builtin == .rnd or builtin == .err or builtin == .erl or builtin == .csrlin or builtin == .freefile;
+        const allows_bare = builtin == .inkey_string or builtin == .timer or builtin == .rnd or builtin == .err or builtin == .erl or builtin == .csrlin or builtin == .freefile or
+            builtin == .command_string or builtin == .date_string or builtin == .time_string;
         if (self.consume(.left_paren)) {
             if (!self.consume(.right_paren)) {
                 while (true) {
@@ -3845,7 +3976,7 @@ const Builder = struct {
             .instr, .mid_string => 2,
             .left_string, .right_string, .string_string, .screen => 2,
             .point, .fileattr => 2,
-            .rnd, .inkey_string, .timer, .err, .erl, .csrlin, .freefile => 0,
+            .rnd, .inkey_string, .timer, .err, .erl, .csrlin, .freefile, .command_string, .date_string, .time_string => 0,
             else => 1,
         };
         const expected_max: usize = switch (builtin) {
@@ -3888,6 +4019,7 @@ const Builder = struct {
             .ucase_string,
             => .string,
             .inkey_string => .string,
+            .command_string, .date_string, .environ_string, .time_string => .string,
             .asc, .cint, .cvi, .csrlin, .err, .instr, .len, .eof, .fileattr, .freefile, .peek, .point, .pos, .screen, .sgn => .integer,
             .erl, .loc, .lof, .seek => .long,
             .fix, .int => arguments[0],
@@ -3953,7 +4085,8 @@ const Builder = struct {
                 }
             },
             .rnd => if (arguments.len == 1 and !arguments[0].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
-            .inkey_string, .timer, .err, .erl, .csrlin, .freefile => {},
+            .environ_string => if (arguments[0] != .string and !arguments[0].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
+            .inkey_string, .timer, .err, .erl, .csrlin, .freefile, .command_string, .date_string, .time_string => {},
         }
         return result;
     }
@@ -5046,6 +5179,10 @@ fn builtinForKeyword(keyword: frontend.Keyword) ?bytecode.Builtin {
         .rnd => .rnd,
         .sgn => .sgn,
         .timer => .timer,
+        .command_string => .command_string,
+        .date_string => .date_string,
+        .environ_string => .environ_string,
+        .time_string => .time_string,
         .sqr => .sqr,
         .tan => .tan,
         else => null,

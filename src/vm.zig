@@ -6,7 +6,7 @@ const graphics_screen = @import("graphics_screen.zig");
 const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "2.4.0";
+pub const contract_version = "2.5.0";
 pub const default_instruction_budget: u32 = 262_144;
 pub const timer_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
@@ -25,6 +25,11 @@ pub const random_mask: u32 = 0x00FF_FFFF;
 pub const default_random_seed: u32 = 0x0005_0000;
 pub const numeric_format_buffer_bytes: usize = 128;
 pub const maximum_trace_entries: usize = 256;
+pub const maximum_guest_path_bytes: usize = 1023;
+pub const maximum_environment_name_bytes: usize = 32;
+pub const maximum_environment_value_bytes: usize = 512;
+pub const maximum_environment_block_bytes: usize = 2048;
+pub const maximum_environment_entries: usize = 64;
 
 pub const MathOperation = enum(u8) {
     atn,
@@ -83,6 +88,62 @@ pub const FileLockResult = union(enum) {
     failure: FileHostError,
 };
 
+pub const PathKind = enum(u8) { file, directory };
+
+pub const PathInfoResult = union(enum) {
+    info: PathKind,
+    missing,
+    failure: FileHostError,
+};
+
+pub const PathOperationResult = union(enum) {
+    success,
+    missing,
+    failure: FileHostError,
+};
+
+pub const DirectoryEntry = struct {
+    kind: PathKind,
+    path_length: u16,
+};
+
+pub const DirectoryReadResult = union(enum) {
+    entry: DirectoryEntry,
+    end,
+    failure: FileHostError,
+};
+
+pub const WallClock = struct {
+    valid: bool = false,
+    year: u16 = 1980,
+    month: u8 = 1,
+    day: u8 = 1,
+    weekday: u8 = 0,
+    hour: u8 = 0,
+    minute: u8 = 0,
+    second: u8 = 0,
+
+    pub fn secondsSinceMidnight(self: WallClock) u32 {
+        return @as(u32, self.hour) * 3600 + @as(u32, self.minute) * 60 + self.second;
+    }
+};
+
+pub const WallClockResult = union(enum) {
+    value: WallClock,
+    failure,
+};
+
+pub const EnvironmentInput = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+pub const ShellResult = union(enum) {
+    pending,
+    exited: i32,
+    failure: FileHostError,
+};
+
 pub const HostServices = struct {
     context: ?*anyopaque = null,
     math: *const fn (?*anyopaque, MathOperation, f64, f64) HostMathError!f64 = defaultMath,
@@ -95,7 +156,21 @@ pub const HostServices = struct {
     file_info: *const fn (?*anyopaque, []const u8) FileInfoResult = unavailableFileInfo,
     file_lock: *const fn (?*anyopaque, []const u8, u32, u32, bool) FileLockResult = unavailableFileLock,
     file_quiesce: *const fn (?*anyopaque) void = ignoreFileQuiesce,
+    platform_context: ?*anyopaque = null,
+    path_info: *const fn (?*anyopaque, []const u8) PathInfoResult = unavailablePathInfo,
+    path_delete: *const fn (?*anyopaque, []const u8) PathOperationResult = unavailablePathOperation,
+    path_rename: *const fn (?*anyopaque, []const u8, []const u8) PathOperationResult = unavailablePathRename,
+    directory_create: *const fn (?*anyopaque, []const u8) PathOperationResult = unavailablePathOperation,
+    directory_delete: *const fn (?*anyopaque, []const u8) PathOperationResult = unavailablePathOperation,
+    directory_read: *const fn (?*anyopaque, []const u8, u32, []u8) DirectoryReadResult = unavailableDirectoryRead,
+    wall_clock: *const fn (?*anyopaque) WallClockResult = unavailableWallClock,
+    wall_clock_set: *const fn (?*anyopaque, WallClock) bool = rejectWallClock,
+    environment_set: *const fn (?*anyopaque, []const u8, []const u8) bool = rejectEnvironment,
+    shell: *const fn (?*anyopaque, []const u8) ShellResult = unavailableShell,
+    platform_quiesce: *const fn (?*anyopaque) void = ignoreFileQuiesce,
     guest_directory: []const u8 = "",
+    command_line: []const u8 = "",
+    initial_environment: []const EnvironmentInput = &.{},
     initial_random_seed: u32 = default_random_seed,
 };
 
@@ -191,6 +266,23 @@ pub const Status = enum(u8) {
     halted,
     cancelled,
     runtime_error,
+    transition,
+};
+
+pub const TransitionKind = enum(u8) { run, chain };
+
+pub const ProgramTransition = struct {
+    kind: TransitionKind,
+    path: []u8,
+    preserve_all: bool = false,
+    delete_enabled: bool = false,
+    delete_first: u16 = 0,
+    delete_last: u16 = 0,
+
+    pub fn deinit(self: *ProgramTransition, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.* = undefined;
+    }
 };
 
 pub const SliceResult = struct {
@@ -324,6 +416,11 @@ pub const PerformanceStats = struct {
 pub const InitError = error{
     OutOfMemory,
     InvalidProgram,
+};
+
+pub const ProgramTransferError = error{
+    OutOfMemory,
+    IncompatibleCommon,
 };
 
 const ExecutionError = values.Fault || error{
@@ -747,6 +844,33 @@ const PendingFileTransfer = struct {
     }
 };
 
+const EnvironmentValue = struct {
+    name: []u8,
+    value: []u8,
+
+    fn deinit(self: *EnvironmentValue, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.value);
+        self.* = undefined;
+    }
+};
+
+const PendingDirectory = struct {
+    instruction: u32,
+    kill: bool,
+    directory: []u8,
+    pattern: []u8,
+    index: u32 = 0,
+    matches: u32 = 0,
+    header_written: bool = false,
+
+    fn deinit(self: *PendingDirectory, allocator: std.mem.Allocator) void {
+        allocator.free(self.directory);
+        allocator.free(self.pattern);
+        self.* = undefined;
+    }
+};
+
 const module_frame = bytecode.invalid_index;
 
 pub const Vm = struct {
@@ -851,6 +975,14 @@ pub const Vm = struct {
     pending_open_number: u8 = 0,
     next_file_generation: u64 = 1,
     pending_file_transfer: ?PendingFileTransfer = null,
+    initial_guest_directory: []u8 = &.{},
+    drive_directories: [26]?[]u8 = .{null} ** 26,
+    current_drive: u8 = 2,
+    command_line: []u8 = &.{},
+    initial_environment: std.ArrayList(EnvironmentValue) = .empty,
+    environment: std.ArrayList(EnvironmentValue) = .empty,
+    pending_directory: ?PendingDirectory = null,
+    transition: ?ProgramTransition = null,
     active_print_file: ?u8 = null,
     print_using_cursor: usize = 0,
     write_item_count: usize = 0,
@@ -874,7 +1006,7 @@ pub const Vm = struct {
         if (!program.ok() or program.instructions.len != program.instruction_metadata.len) return error.InvalidProgram;
         const globals = try allocateGlobals(allocator, program);
         const random_state = normalizeRandomSeed(host.initial_random_seed);
-        return .{
+        var machine = Vm{
             .allocator = allocator,
             .program = program,
             .host = host,
@@ -884,10 +1016,14 @@ pub const Vm = struct {
             .random_last = randomValue(random_state),
             .audio_engine = audio.Engine.init(allocator),
         };
+        errdefer machine.deinit();
+        try machine.initializePlatformState();
+        return machine;
     }
 
     pub fn deinit(self: *Vm) void {
         self.host.file_quiesce(self.fileHostContext());
+        self.host.platform_quiesce(self.platformHostContext());
         self.discardPendingFileTransfer();
         self.discardStackFrom(0);
         self.stack.deinit(self.allocator);
@@ -906,6 +1042,9 @@ pub const Vm = struct {
         self.audio_engine.deinit();
         self.discardFiles();
         self.open_files.deinit(self.allocator);
+        self.discardPendingDirectory();
+        if (self.transition) |*transition| transition.deinit(self.allocator);
+        self.deinitPlatformState();
         self.graphics.deinit(self.allocator);
         deinitGlobals(self.allocator, self.globals);
         self.* = undefined;
@@ -913,6 +1052,12 @@ pub const Vm = struct {
 
     pub fn requestCancel(self: *Vm) void {
         self.cancel_requested = true;
+    }
+
+    pub fn takeTransition(self: *Vm) ?ProgramTransition {
+        const transition = self.transition orelse return null;
+        self.transition = null;
+        return transition;
     }
 
     pub fn isStopped(self: *const Vm) bool {
@@ -1154,6 +1299,7 @@ pub const Vm = struct {
 
     pub fn reset(self: *Vm) InitError!void {
         self.host.file_quiesce(self.fileHostContext());
+        self.host.platform_quiesce(self.platformHostContext());
         const replacement = try allocateGlobals(self.allocator, self.program);
         errdefer deinitGlobals(self.allocator, replacement);
 
@@ -1253,6 +1399,10 @@ pub const Vm = struct {
         self.random_last = randomValue(self.random_state);
         self.discardPendingFileTransfer();
         self.discardFiles();
+        self.discardPendingDirectory();
+        if (self.transition) |*transition| transition.deinit(self.allocator);
+        self.transition = null;
+        try self.resetPlatformState();
         self.active_print_file = null;
         self.print_using_cursor = 0;
         self.write_item_count = 0;
@@ -1270,7 +1420,7 @@ pub const Vm = struct {
     }
 
     pub fn runSlice(self: *Vm, instruction_budget: u32) SliceResult {
-        if (self.status == .halted or self.status == .cancelled or self.status == .runtime_error) {
+        if (self.status == .halted or self.status == .cancelled or self.status == .runtime_error or self.status == .transition) {
             return .{ .status = self.status, .instructions = 0 };
         }
         self.cancel_flag_checks +%= 1;
@@ -1347,7 +1497,7 @@ pub const Vm = struct {
             }
             executed += 1;
             self.total_instructions += 1;
-            if (self.status == .halted) return .{ .status = .halted, .instructions = executed };
+            if (self.status == .halted or self.status == .transition) return .{ .status = self.status, .instructions = executed };
             if (self.stopped) {
                 self.status = .waiting;
                 return .{ .status = .waiting, .instructions = executed };
@@ -1667,6 +1817,9 @@ pub const Vm = struct {
             .trace_on,
             .trace_off,
             .stop,
+            .program_run,
+            .program_chain,
+            .system_exit,
             .halt,
             => .control,
             .screen_mode_probe,
@@ -1716,6 +1869,16 @@ pub const Vm = struct {
             .file_lock,
             .file_unlock,
             .file_reset,
+            .path_chdir,
+            .path_mkdir,
+            .path_rmdir,
+            .path_files,
+            .path_kill,
+            .path_rename,
+            .environment_set,
+            .wall_date_set,
+            .wall_time_set,
+            .process_shell,
             .audio_beep,
             .audio_play,
             .call_builtin,
@@ -1803,6 +1966,19 @@ pub const Vm = struct {
             .file_lock => try self.lockFile(false, instruction.a),
             .file_unlock => try self.lockFile(true, instruction.a),
             .file_reset => try self.resetFiles(),
+            .path_chdir => try self.changeDirectory(),
+            .path_mkdir => try self.makeDirectory(),
+            .path_rmdir => try self.removeDirectory(),
+            .path_files => try self.processDirectory(instruction_index, false),
+            .path_kill => try self.processDirectory(instruction_index, true),
+            .path_rename => try self.renamePath(),
+            .environment_set => try self.setEnvironment(),
+            .wall_date_set => try self.setWallDate(),
+            .wall_time_set => try self.setWallTime(),
+            .program_run => try self.runProgram(instruction.a, instruction.b),
+            .program_chain => try self.chainProgram(instruction.a, instruction.b),
+            .process_shell => try self.shellCommand(),
+            .system_exit => try self.systemExit(),
             .audio_beep => try self.audioBeep(instruction_index),
             .audio_play => try self.audioPlay(instruction_index),
             .convert => try self.convertTop(bytecode.decodeValueType(instruction.a)),
@@ -4253,6 +4429,210 @@ pub const Vm = struct {
         return self.host.file_context orelse self.host.context;
     }
 
+    fn platformHostContext(self: *Vm) ?*anyopaque {
+        return self.host.platform_context orelse self.host.context;
+    }
+
+    pub fn inheritPlatformState(self: *Vm, source: *const Vm) InitError!void {
+        var replacement_directories: [26]?[]u8 = .{null} ** 26;
+        errdefer for (&replacement_directories) |*directory| if (directory.*) |bytes| self.allocator.free(bytes);
+        for (source.drive_directories, 0..) |directory, index| {
+            if (directory) |bytes| replacement_directories[index] = try self.allocator.dupe(u8, bytes);
+        }
+        var replacement_environment = try self.cloneEnvironment(&source.environment);
+        errdefer deinitEnvironmentList(self.allocator, &replacement_environment);
+
+        for (self.environment.items) |entry| _ = self.host.environment_set(self.platformHostContext(), entry.name, "");
+        for (replacement_environment.items) |entry| _ = self.host.environment_set(self.platformHostContext(), entry.name, entry.value);
+        for (&self.drive_directories) |*directory| if (directory.*) |bytes| self.allocator.free(bytes);
+        deinitEnvironmentList(self.allocator, &self.environment);
+        self.drive_directories = replacement_directories;
+        self.current_drive = source.current_drive;
+        self.environment = replacement_environment;
+        self.guest_now_ns = source.guest_now_ns;
+        self.random_state = source.random_state;
+        self.random_last = source.random_last;
+    }
+
+    pub fn transferCommonTo(self: *const Vm, target: *Vm, preserve_all: bool) ProgramTransferError!void {
+        for (target.program.common_blocks) |target_block| {
+            const source_block = self.findCommonBlock(target.program, target_block) orelse return error.IncompatibleCommon;
+            if (source_block.entries.len != target_block.entries.len or source_block.byte_size != target_block.byte_size) {
+                return error.IncompatibleCommon;
+            }
+            for (target_block.entries, 0..) |target_entry, index| {
+                const source_entry = source_block.entries[index];
+                if (source_entry.byte_size != target_entry.byte_size or
+                    source_entry.global_index >= self.program.globals.len or target_entry.global_index >= target.program.globals.len)
+                {
+                    return error.IncompatibleCommon;
+                }
+                try self.transferGlobalTo(target, source_entry.global_index, target_entry.global_index);
+            }
+        }
+        if (!preserve_all) return;
+        for (target.program.globals, 0..) |target_variable, target_index| {
+            if (target_variable.is_common or target_variable.hidden) continue;
+            const target_name = target_variable.name.bytes(target.program.source);
+            const source_index = self.findGlobalByName(target_name) orelse continue;
+            if (self.program.globals[source_index].is_common or self.program.globals[source_index].hidden) continue;
+            try self.transferGlobalTo(target, source_index, target_index);
+        }
+    }
+
+    fn findCommonBlock(
+        self: *const Vm,
+        target_program: *const bytecode.Program,
+        target: bytecode.CommonBlock,
+    ) ?bytecode.CommonBlock {
+        for (self.program.common_blocks) |candidate| {
+            if (candidate.named != target.named) continue;
+            if (!target.named or std.ascii.eqlIgnoreCase(
+                candidate.name.bytes(self.program.source),
+                target.name.bytes(target_program.source),
+            )) return candidate;
+        }
+        return null;
+    }
+
+    fn findGlobalByName(self: *const Vm, name: []const u8) ?usize {
+        for (self.program.globals, 0..) |variable, index| {
+            if (std.ascii.eqlIgnoreCase(variable.name.bytes(self.program.source), name)) return index;
+        }
+        return null;
+    }
+
+    fn transferGlobalTo(self: *const Vm, target: *Vm, source_index: usize, target_index: usize) ProgramTransferError!void {
+        const source_variable = self.program.globals[source_index];
+        const target_variable = target.program.globals[target_index];
+        if (!variablesTransferCompatible(self.program, source_variable, target.program, target_variable)) {
+            return error.IncompatibleCommon;
+        }
+        var replacement = cloneVariableAcrossPrograms(
+            target.allocator,
+            self.program,
+            source_variable,
+            target.program,
+            target_variable,
+            &self.globals[source_index],
+        ) catch |fault| return switch (fault) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.IncompatibleCommon,
+        };
+        errdefer replacement.deinit(target.allocator);
+        const old_payload = arrayCellPayloadBytes(target.program, &target.globals[target_index]) catch return error.IncompatibleCommon;
+        const new_payload = arrayCellPayloadBytes(target.program, &replacement) catch return error.IncompatibleCommon;
+        const live_without_old = target.array_live_payload_bytes -| @as(u64, @intCast(old_payload));
+        if (live_without_old +| @as(u64, @intCast(new_payload)) > array_live_payload_limit_bytes) return error.OutOfMemory;
+        target.globals[target_index].deinit(target.allocator);
+        target.globals[target_index] = replacement;
+        target.array_live_payload_bytes = live_without_old + @as(u64, @intCast(new_payload));
+        target.maximum_array_live_payload_bytes = @max(target.maximum_array_live_payload_bytes, target.array_live_payload_bytes);
+    }
+
+    fn initializePlatformState(self: *Vm) InitError!void {
+        const requested_base = if (self.host.guest_directory.len != 0)
+            self.host.guest_directory
+        else if (isAbsoluteGuestPath(self.program.file_name))
+            self.program.file_name[0 .. lastPathSeparator(self.program.file_name) orelse 3]
+        else
+            "C:\\";
+        self.initial_guest_directory = normalizeAbsoluteGuestPath(self.allocator, requested_base) catch
+            try self.allocator.dupe(u8, "C:\\");
+        self.current_drive = std.ascii.toUpper(self.initial_guest_directory[0]) - 'A';
+        self.drive_directories[self.current_drive] = try self.allocator.dupe(u8, self.initial_guest_directory);
+
+        self.command_line = try self.allocator.dupe(u8, self.host.command_line);
+
+        for (self.host.initial_environment) |entry| {
+            try self.setEnvironmentIn(&self.initial_environment, entry.name, entry.value);
+        }
+        self.environment = try self.cloneEnvironment(&self.initial_environment);
+        for (self.environment.items) |entry| _ = self.host.environment_set(self.platformHostContext(), entry.name, entry.value);
+    }
+
+    fn resetPlatformState(self: *Vm) InitError!void {
+        const replacement_directory = try self.allocator.dupe(u8, self.initial_guest_directory);
+        errdefer self.allocator.free(replacement_directory);
+        var replacement_environment = try self.cloneEnvironment(&self.initial_environment);
+        errdefer deinitEnvironmentList(self.allocator, &replacement_environment);
+
+        for (self.environment.items) |entry| _ = self.host.environment_set(self.platformHostContext(), entry.name, "");
+        for (replacement_environment.items) |entry| _ = self.host.environment_set(self.platformHostContext(), entry.name, entry.value);
+        for (&self.drive_directories) |*directory| if (directory.*) |bytes| {
+            self.allocator.free(bytes);
+            directory.* = null;
+        };
+        self.current_drive = std.ascii.toUpper(self.initial_guest_directory[0]) - 'A';
+        self.drive_directories[self.current_drive] = replacement_directory;
+        deinitEnvironmentList(self.allocator, &self.environment);
+        self.environment = replacement_environment;
+    }
+
+    fn deinitPlatformState(self: *Vm) void {
+        for (&self.drive_directories) |*directory| if (directory.*) |bytes| {
+            self.allocator.free(bytes);
+            directory.* = null;
+        };
+        if (self.initial_guest_directory.len != 0) self.allocator.free(self.initial_guest_directory);
+        if (self.command_line.len != 0) self.allocator.free(self.command_line);
+        deinitEnvironmentList(self.allocator, &self.initial_environment);
+        deinitEnvironmentList(self.allocator, &self.environment);
+        self.initial_guest_directory = &.{};
+        self.command_line = &.{};
+    }
+
+    fn cloneEnvironment(self: *Vm, source: *const std.ArrayList(EnvironmentValue)) InitError!std.ArrayList(EnvironmentValue) {
+        var result: std.ArrayList(EnvironmentValue) = .empty;
+        errdefer deinitEnvironmentList(self.allocator, &result);
+        try result.ensureTotalCapacityPrecise(self.allocator, source.items.len);
+        for (source.items) |entry| {
+            const name = try self.allocator.dupe(u8, entry.name);
+            const value = self.allocator.dupe(u8, entry.value) catch |fault| {
+                self.allocator.free(name);
+                return fault;
+            };
+            result.appendAssumeCapacity(.{ .name = name, .value = value });
+        }
+        return result;
+    }
+
+    fn setEnvironmentIn(
+        self: *Vm,
+        target: *std.ArrayList(EnvironmentValue),
+        raw_name: []const u8,
+        value: []const u8,
+    ) InitError!void {
+        const name = std.mem.trim(u8, raw_name, " \t");
+        if (!validEnvironmentName(name) or value.len > maximum_environment_value_bytes) return error.InvalidProgram;
+        var existing: ?usize = null;
+        for (target.items, 0..) |entry, index| if (std.ascii.eqlIgnoreCase(entry.name, name)) {
+            existing = index;
+            break;
+        };
+        const replaced = if (existing) |index| environmentEntryBytes(target.items[index]) else 0;
+        const total = environmentListBytes(target) - replaced + name.len + 1 + value.len + 1;
+        if (total > maximum_environment_block_bytes or (existing == null and target.items.len >= maximum_environment_entries)) {
+            return error.InvalidProgram;
+        }
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        const owned_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned_value);
+        if (existing) |index| {
+            var previous = target.items[index];
+            target.items[index] = .{ .name = owned_name, .value = owned_value };
+            previous.deinit(self.allocator);
+        } else {
+            try target.append(self.allocator, .{ .name = owned_name, .value = owned_value });
+        }
+    }
+
+    fn discardPendingDirectory(self: *Vm) void {
+        if (self.pending_directory) |*pending| pending.deinit(self.allocator);
+        self.pending_directory = null;
+    }
+
     fn popFileNumber(self: *Vm) ExecutionError!usize {
         var value = try self.popValue();
         defer value.deinit(self.allocator);
@@ -4273,19 +4653,394 @@ pub const Vm = struct {
     }
 
     fn resolveGuestPath(self: *Vm, raw_path: []const u8) ExecutionError![]u8 {
-        if (raw_path.len == 0 or containsInvalidPathByte(raw_path) or isReservedDevicePath(raw_path)) return error.BadFileName;
-        if (isAbsoluteGuestPath(raw_path)) return self.allocator.dupe(u8, raw_path);
-        if (std.mem.indexOfScalar(u8, raw_path, ':') != null) return error.BadFileName;
-
-        var base = self.host.guest_directory;
-        if (base.len == 0) {
-            const file_name = self.program.file_name;
-            if (!isAbsoluteGuestPath(file_name)) return error.BadFileName;
-            base = file_name[0 .. lastPathSeparator(file_name) orelse return error.BadFileName];
+        if (raw_path.len == 0 or raw_path.len > maximum_guest_path_bytes or containsInvalidPathByte(raw_path) or isReservedDevicePath(raw_path)) {
+            return error.BadFileName;
         }
-        if (!isAbsoluteGuestPath(base)) return error.BadFileName;
-        const needs_separator = base.len != 0 and base[base.len - 1] != '\\' and base[base.len - 1] != '/';
-        return std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{ base, if (needs_separator) "\\" else "", raw_path });
+        var drive_index: u8 = self.current_drive;
+        var suffix = raw_path;
+        var rooted = false;
+        if (raw_path.len >= 2 and std.ascii.isAlphabetic(raw_path[0]) and raw_path[1] == ':') {
+            drive_index = std.ascii.toUpper(raw_path[0]) - 'A';
+            suffix = raw_path[2..];
+            rooted = suffix.len != 0 and (suffix[0] == '\\' or suffix[0] == '/');
+        } else if (std.mem.indexOfScalar(u8, raw_path, ':') != null) {
+            return error.BadFileName;
+        } else {
+            rooted = raw_path[0] == '\\' or raw_path[0] == '/';
+        }
+        if (isAbsoluteGuestPath(raw_path)) return normalizeAbsoluteGuestPath(self.allocator, raw_path);
+
+        var root_storage = [_]u8{ @as(u8, 'A') + drive_index, ':', '\\' };
+        const base = if (rooted)
+            root_storage[0..]
+        else if (self.drive_directories[drive_index]) |directory|
+            directory
+        else
+            root_storage[0..];
+        if (suffix.len == 0) return self.allocator.dupe(u8, base);
+        var relative_start: usize = 0;
+        while (relative_start < suffix.len and (suffix[relative_start] == '\\' or suffix[relative_start] == '/')) : (relative_start += 1) {}
+        const relative = suffix[relative_start..];
+        const combined = try std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{
+            base,
+            if (base.len == 3 or base[base.len - 1] == '\\' or base[base.len - 1] == '/') "" else "\\",
+            relative,
+        });
+        defer self.allocator.free(combined);
+        return normalizeAbsoluteGuestPath(self.allocator, combined);
+    }
+
+    fn changeDirectory(self: *Vm) ExecutionError!void {
+        var raw = try self.popValue();
+        defer raw.deinit(self.allocator);
+        const path = switch (raw) {
+            .string => |bytes| bytes,
+            else => return error.TypeMismatch,
+        };
+        const resolved = try self.resolveGuestPath(path);
+        var resolved_owned = true;
+        defer if (resolved_owned) self.allocator.free(resolved);
+        switch (self.host.path_info(self.platformHostContext(), resolved)) {
+            .info => |kind| if (kind != .directory) return error.PathNotFound,
+            .missing => return error.PathNotFound,
+            .failure => |failure| return fileHostFault(failure),
+        }
+        const drive: u8 = std.ascii.toUpper(resolved[0]) - 'A';
+        if (self.drive_directories[drive]) |previous| self.allocator.free(previous);
+        self.drive_directories[drive] = resolved;
+        resolved_owned = false;
+        self.current_drive = drive;
+    }
+
+    fn makeDirectory(self: *Vm) ExecutionError!void {
+        var raw = try self.popValue();
+        defer raw.deinit(self.allocator);
+        const path = switch (raw) {
+            .string => |bytes| bytes,
+            else => return error.TypeMismatch,
+        };
+        const resolved = try self.resolveGuestPath(path);
+        defer self.allocator.free(resolved);
+        switch (self.host.path_info(self.platformHostContext(), resolved)) {
+            .info => return error.FileExists,
+            .missing => {},
+            .failure => |failure| return fileHostFault(failure),
+        }
+        switch (self.host.directory_create(self.platformHostContext(), resolved)) {
+            .success => {},
+            .missing => return error.FileExists,
+            .failure => |failure| return fileHostFault(failure),
+        }
+    }
+
+    fn removeDirectory(self: *Vm) ExecutionError!void {
+        var raw = try self.popValue();
+        defer raw.deinit(self.allocator);
+        const path = switch (raw) {
+            .string => |bytes| bytes,
+            else => return error.TypeMismatch,
+        };
+        const resolved = try self.resolveGuestPath(path);
+        defer self.allocator.free(resolved);
+        for (self.drive_directories) |directory| {
+            if (directory) |current| {
+                if (std.ascii.eqlIgnoreCase(current, resolved)) return error.PathFileAccess;
+            }
+        }
+        switch (self.host.directory_delete(self.platformHostContext(), resolved)) {
+            .success => {},
+            .missing => return error.PathNotFound,
+            .failure => |failure| return fileHostFault(failure),
+        }
+    }
+
+    fn renamePath(self: *Vm) ExecutionError!void {
+        var target_value = try self.popValue();
+        defer target_value.deinit(self.allocator);
+        var source_value = try self.popValue();
+        defer source_value.deinit(self.allocator);
+        const target_raw = switch (target_value) {
+            .string => |bytes| bytes,
+            else => return error.TypeMismatch,
+        };
+        const source_raw = switch (source_value) {
+            .string => |bytes| bytes,
+            else => return error.TypeMismatch,
+        };
+        const source = try self.resolveGuestPath(source_raw);
+        defer self.allocator.free(source);
+        const target = try self.resolveGuestPath(target_raw);
+        defer self.allocator.free(target);
+        if (std.ascii.toUpper(source[0]) != std.ascii.toUpper(target[0])) return error.PathFileAccess;
+        switch (self.host.path_info(self.platformHostContext(), source)) {
+            .info => {},
+            .missing => return error.FileNotFound,
+            .failure => |failure| return fileHostFault(failure),
+        }
+        switch (self.host.path_info(self.platformHostContext(), target)) {
+            .info => return error.FileExists,
+            .missing => {},
+            .failure => |failure| return fileHostFault(failure),
+        }
+        switch (self.host.path_rename(self.platformHostContext(), source, target)) {
+            .success => {},
+            .missing => return error.FileNotFound,
+            .failure => |failure| return fileHostFault(failure),
+        }
+    }
+
+    fn processDirectory(self: *Vm, instruction_index: u32, kill: bool) ExecutionError!void {
+        if (self.pending_directory == null) {
+            const raw = try self.stackStringAt(self.stack.items.len -| 1);
+            self.pending_directory = try self.prepareDirectoryOperation(instruction_index, raw, kill);
+        }
+        var pending = &self.pending_directory.?;
+        if (pending.instruction != instruction_index or pending.kill != kill) return error.InvalidInstruction;
+
+        var storage: [maximum_guest_path_bytes + 1]u8 = undefined;
+        const result = self.host.directory_read(
+            self.platformHostContext(),
+            pending.directory,
+            pending.index,
+            &storage,
+        );
+        switch (result) {
+            .entry => |entry| {
+                if (entry.path_length == 0 or entry.path_length > storage.len) {
+                    self.discardPendingDirectory();
+                    return error.PathFileAccess;
+                }
+                const canonical = normalizeAbsoluteGuestPath(self.allocator, storage[0..entry.path_length]) catch |fault| {
+                    self.discardPendingDirectory();
+                    return fault;
+                };
+                defer self.allocator.free(canonical);
+                const separator = lastPathSeparator(canonical) orelse {
+                    self.discardPendingDirectory();
+                    return error.PathFileAccess;
+                };
+                const name = canonical[separator + 1 ..];
+                const pattern_matches = dosWildcardMatch(pending.pattern, name);
+                const deletes_entry = kill and pattern_matches and entry.kind == .file;
+                if (pattern_matches and (!kill or entry.kind == .file)) {
+                    pending.matches +|= 1;
+                    if (deletes_entry) {
+                        switch (self.host.path_delete(self.platformHostContext(), canonical)) {
+                            .success => {},
+                            .missing => {
+                                self.discardPendingDirectory();
+                                return error.FileNotFound;
+                            },
+                            .failure => |failure| {
+                                self.discardPendingDirectory();
+                                return fileHostFault(failure);
+                            },
+                        }
+                    } else {
+                        try self.printBytes(name);
+                        try self.printNewline();
+                        self.host_display_requested = true;
+                    }
+                }
+                // KILL ignores directories. Only a successfully removed file
+                // keeps the same live index so the shifted successor is read.
+                if (!deletes_entry) pending.index +|= 1;
+                self.wait_wake_ns = self.guest_now_ns;
+                return error.WouldBlock;
+            },
+            .end => {
+                const matches = pending.matches;
+                self.discardPendingDirectory();
+                self.discardStackFrom(self.stack.items.len - 1);
+                if (matches == 0) return error.FileNotFound;
+            },
+            .failure => |failure| {
+                self.discardPendingDirectory();
+                return fileHostFault(failure);
+            },
+        }
+    }
+
+    fn prepareDirectoryOperation(self: *Vm, instruction: u32, raw: []const u8, kill: bool) ExecutionError!PendingDirectory {
+        var component_start: usize = 0;
+        if (lastPathSeparator(raw)) |separator| {
+            component_start = separator + 1;
+        } else if (raw.len >= 2 and std.ascii.isAlphabetic(raw[0]) and raw[1] == ':') {
+            component_start = 2;
+        }
+        const raw_directory = raw[0..component_start];
+        const raw_pattern = if (raw.len == 0 or component_start == raw.len) "*.*" else raw[component_start..];
+        if (!validDosPattern(raw_pattern)) return error.BadFileName;
+
+        const directory = if (raw_directory.len == 0)
+            try self.allocator.dupe(u8, self.drive_directories[self.current_drive] orelse "C:\\")
+        else
+            try self.resolveGuestPath(raw_directory);
+        errdefer self.allocator.free(directory);
+        const pattern = try self.allocator.dupe(u8, raw_pattern);
+        return .{
+            .instruction = instruction,
+            .kill = kill,
+            .directory = directory,
+            .pattern = pattern,
+        };
+    }
+
+    fn setEnvironment(self: *Vm) ExecutionError!void {
+        var input_value = try self.popValue();
+        defer input_value.deinit(self.allocator);
+        const input = switch (input_value) {
+            .string => |bytes| bytes,
+            else => return error.TypeMismatch,
+        };
+        const separator = std.mem.indexOfScalar(u8, input, '=') orelse blk: {
+            if (input.len != 0 and input[input.len - 1] == ';') break :blk input.len - 1;
+            return error.IllegalFunctionCall;
+        };
+        const raw_name = std.mem.trim(u8, input[0..separator], " \t");
+        const value = input[separator + 1 ..];
+        if (!validEnvironmentName(raw_name) or value.len > maximum_environment_value_bytes) return error.IllegalFunctionCall;
+
+        var existing: ?usize = null;
+        for (self.environment.items, 0..) |entry, index| if (std.ascii.eqlIgnoreCase(entry.name, raw_name)) {
+            existing = index;
+            break;
+        };
+        if (value.len == 0) {
+            if (!self.host.environment_set(self.platformHostContext(), raw_name, "")) return error.HostFailure;
+            if (existing) |index| {
+                self.environment.items[index].deinit(self.allocator);
+                _ = self.environment.orderedRemove(index);
+            }
+            return;
+        }
+
+        const replaced = if (existing) |index| environmentEntryBytes(self.environment.items[index]) else 0;
+        const total = environmentListBytes(&self.environment) - replaced + raw_name.len + 1 + value.len + 1;
+        if (total > maximum_environment_block_bytes or
+            (existing == null and self.environment.items.len >= maximum_environment_entries)) return error.OutOfMemory;
+        const owned_name = try self.allocator.alloc(u8, raw_name.len);
+        errdefer self.allocator.free(owned_name);
+        for (raw_name, 0..) |byte, index| owned_name[index] = std.ascii.toUpper(byte);
+        const owned_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned_value);
+        if (existing == null) try self.environment.ensureUnusedCapacity(self.allocator, 1);
+        if (!self.host.environment_set(self.platformHostContext(), owned_name, owned_value)) return error.HostFailure;
+        if (existing) |index| {
+            var previous = self.environment.items[index];
+            self.environment.items[index] = .{ .name = owned_name, .value = owned_value };
+            previous.deinit(self.allocator);
+        } else {
+            self.environment.appendAssumeCapacity(.{ .name = owned_name, .value = owned_value });
+        }
+    }
+
+    fn setWallDate(self: *Vm) ExecutionError!void {
+        var input_value = try self.popValue();
+        defer input_value.deinit(self.allocator);
+        const input = switch (input_value) {
+            .string => |bytes| bytes,
+            else => return error.TypeMismatch,
+        };
+        const parsed = parseWallDate(input) orelse return error.IllegalFunctionCall;
+        var clock = try self.currentWallClock();
+        clock.year = parsed.year;
+        clock.month = parsed.month;
+        clock.day = parsed.day;
+        clock.weekday = weekdayForDate(clock.year, clock.month, clock.day);
+        if (!self.host.wall_clock_set(self.platformHostContext(), clock)) return error.HostFailure;
+    }
+
+    fn setWallTime(self: *Vm) ExecutionError!void {
+        var input_value = try self.popValue();
+        defer input_value.deinit(self.allocator);
+        const input = switch (input_value) {
+            .string => |bytes| bytes,
+            else => return error.TypeMismatch,
+        };
+        const parsed = parseWallTime(input) orelse return error.IllegalFunctionCall;
+        var clock = try self.currentWallClock();
+        clock.hour = parsed.hour;
+        clock.minute = parsed.minute;
+        clock.second = parsed.second;
+        if (!self.host.wall_clock_set(self.platformHostContext(), clock)) return error.HostFailure;
+    }
+
+    fn currentWallClock(self: *Vm) ExecutionError!WallClock {
+        return switch (self.host.wall_clock(self.platformHostContext())) {
+            .value => |clock| if (validWallClock(clock)) clock else error.HostFailure,
+            .failure => error.HostFailure,
+        };
+    }
+
+    fn runProgram(self: *Vm, target: u32, flags: u32) ExecutionError!void {
+        if ((flags & ~bytecode.program_run_path) != 0) return error.InvalidInstruction;
+        if ((flags & bytecode.program_run_path) != 0) {
+            const raw = try self.stackStringAt(self.stack.items.len -| 1);
+            const path = try self.resolveGuestPath(raw);
+            defer self.allocator.free(path);
+            try self.closeAllFiles();
+            const owned_path = try self.allocator.dupe(u8, path);
+            self.discardStackFrom(self.stack.items.len - 1);
+            self.transition = .{ .kind = .run, .path = owned_path };
+            self.status = .transition;
+            return;
+        }
+        const restart_at = if (target == bytecode.invalid_index) self.program.module_entry else target;
+        if (restart_at >= self.program.instructions.len) return error.InvalidInstruction;
+        self.reset() catch |fault| return switch (fault) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidProgram => error.InvalidInstruction,
+        };
+        self.instruction_pointer = restart_at;
+    }
+
+    fn chainProgram(self: *Vm, flags: u32, packed_range: u32) ExecutionError!void {
+        if ((flags & ~(bytecode.program_chain_all | bytecode.program_chain_delete)) != 0) return error.InvalidInstruction;
+        const raw = try self.stackStringAt(self.stack.items.len -| 1);
+        const path = try self.resolveGuestPath(raw);
+        defer self.allocator.free(path);
+        try self.closeAllFiles();
+        const owned_path = try self.allocator.dupe(u8, path);
+        self.discardStackFrom(self.stack.items.len - 1);
+        self.transition = .{
+            .kind = .chain,
+            .path = owned_path,
+            .preserve_all = (flags & bytecode.program_chain_all) != 0,
+            .delete_enabled = (flags & bytecode.program_chain_delete) != 0,
+            .delete_first = if ((flags & bytecode.program_chain_delete) != 0) @truncate(packed_range >> 16) else 0,
+            .delete_last = if ((flags & bytecode.program_chain_delete) != 0) @truncate(packed_range) else 0,
+        };
+        self.status = .transition;
+    }
+
+    fn shellCommand(self: *Vm) ExecutionError!void {
+        const command = try self.stackStringAt(self.stack.items.len -| 1);
+        switch (self.host.shell(self.platformHostContext(), command)) {
+            .pending => {
+                self.wait_wake_ns = self.guest_now_ns +| file_poll_interval_ns;
+                return error.WouldBlock;
+            },
+            .exited => self.discardStackFrom(self.stack.items.len - 1),
+            .failure => |failure| return fileHostFault(failure),
+        }
+    }
+
+    fn systemExit(self: *Vm) ExecutionError!void {
+        try self.closeAllFiles();
+        self.host.platform_quiesce(self.platformHostContext());
+        self.discardStackFrom(0);
+        self.status = .halted;
+        self.exit_code = 0;
+    }
+
+    fn stackStringAt(self: *Vm, index: usize) ExecutionError![]const u8 {
+        if (index >= self.stack.items.len) return error.StackUnderflow;
+        const value = try self.stackValueAt(index);
+        return switch (value) {
+            .string => |bytes| bytes,
+            else => error.TypeMismatch,
+        };
     }
 
     fn convertTop(self: *Vm, target: bytecode.ValueType) ExecutionError!void {
@@ -4652,6 +5407,10 @@ pub const Vm = struct {
             .rnd => self.randomNumber(arguments),
             .sgn => signum(arguments[0]),
             .timer => self.timerValue(),
+            .command_string => .{ .string = try self.allocator.dupe(u8, self.command_line) },
+            .date_string => self.dateString(),
+            .environ_string => self.environmentString(arguments[0]),
+            .time_string => self.timeString(),
             .point => blk: {
                 const x = try values.asLong(arguments[0]);
                 const y = try values.asLong(arguments[1]);
@@ -4794,7 +5553,55 @@ pub const Vm = struct {
             }
             self.next_timer_poll_ns = self.guest_now_ns +| timer_poll_interval_ns;
         }
-        return .{ .single = self.timerSeconds() };
+        const fraction = @as(f32, @floatFromInt(self.guest_now_ns % std.time.ns_per_s)) /
+            @as(f32, @floatFromInt(std.time.ns_per_s));
+        return .{ .single = switch (self.host.wall_clock(self.platformHostContext())) {
+            .value => |clock| if (validWallClock(clock))
+                @as(f32, @floatFromInt(clock.secondsSinceMidnight())) + fraction
+            else
+                self.timerSeconds(),
+            .failure => self.timerSeconds(),
+        } };
+    }
+
+    fn dateString(self: *Vm) ExecutionError!values.Value {
+        const clock = try self.currentWallClock();
+        return .{ .string = try std.fmt.allocPrint(self.allocator, "{d:0>2}-{d:0>2}-{d:0>4}", .{
+            clock.month,
+            clock.day,
+            clock.year,
+        }) };
+    }
+
+    fn timeString(self: *Vm) ExecutionError!values.Value {
+        const clock = try self.currentWallClock();
+        return .{ .string = try std.fmt.allocPrint(self.allocator, "{d:0>2}:{d:0>2}:{d:0>2}", .{
+            clock.hour,
+            clock.minute,
+            clock.second,
+        }) };
+    }
+
+    fn environmentString(self: *Vm, argument: values.Value) ExecutionError!values.Value {
+        switch (argument) {
+            .string => |name| {
+                if (!validEnvironmentName(name)) return .{ .string = try self.allocator.alloc(u8, 0) };
+                for (self.environment.items) |entry| {
+                    if (std.ascii.eqlIgnoreCase(entry.name, name)) {
+                        return .{ .string = try self.allocator.dupe(u8, entry.value) };
+                    }
+                }
+                return .{ .string = try self.allocator.alloc(u8, 0) };
+            },
+            .integer, .long, .single, .double => {
+                const raw_index = try values.asLong(argument);
+                if (raw_index < 1) return error.IllegalFunctionCall;
+                const index: usize = @intCast(raw_index - 1);
+                if (index >= self.environment.items.len) return .{ .string = try self.allocator.alloc(u8, 0) };
+                const entry = self.environment.items[index];
+                return .{ .string = try std.fmt.allocPrint(self.allocator, "{s}={s}", .{ entry.name, entry.value }) };
+            },
+        }
     }
 
     fn hostMath(self: *Vm, operation: MathOperation, input: values.Value, unused: values.Value) ExecutionError!values.Value {
@@ -5826,6 +6633,182 @@ fn isReservedDevicePath(path: []const u8) bool {
     return false;
 }
 
+fn normalizeAbsoluteGuestPath(allocator: std.mem.Allocator, input: []const u8) ExecutionError![]u8 {
+    if (!isAbsoluteGuestPath(input) or input.len > maximum_guest_path_bytes) return error.BadFileName;
+
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+    try result.ensureTotalCapacityPrecise(allocator, @min(input.len, maximum_guest_path_bytes));
+    try result.appendSlice(allocator, &.{ std.ascii.toUpper(input[0]), ':', '\\' });
+
+    var component_starts: [256]u16 = undefined;
+    var depth: usize = 0;
+    var cursor: usize = 3;
+    while (cursor <= input.len) {
+        const start = cursor;
+        while (cursor < input.len and input[cursor] != '\\' and input[cursor] != '/') : (cursor += 1) {}
+        const component = input[start..cursor];
+        cursor += 1;
+        if (component.len == 0 or std.mem.eql(u8, component, ".")) continue;
+        if (std.mem.eql(u8, component, "..")) {
+            if (depth == 0) return error.PathFileAccess;
+            depth -= 1;
+            const component_start: usize = component_starts[depth];
+            result.items.len = if (component_start == 3) 3 else component_start - 1;
+            continue;
+        }
+        if (component.len > 255 or component[component.len - 1] == ' ' or component[component.len - 1] == '.' or
+            containsInvalidPathByte(component) or std.mem.indexOfScalar(u8, component, ':') != null or
+            isReservedDevicePath(component) or depth == component_starts.len)
+        {
+            return error.BadFileName;
+        }
+        if (result.items.len != 3) try result.append(allocator, '\\');
+        component_starts[depth] = @intCast(result.items.len);
+        depth += 1;
+        try result.appendSlice(allocator, component);
+        if (result.items.len > maximum_guest_path_bytes) return error.BadFileName;
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+fn deinitEnvironmentList(allocator: std.mem.Allocator, list: *std.ArrayList(EnvironmentValue)) void {
+    for (list.items) |*entry| entry.deinit(allocator);
+    list.deinit(allocator);
+    list.* = .empty;
+}
+
+fn environmentEntryBytes(entry: EnvironmentValue) usize {
+    return entry.name.len + 1 + entry.value.len + 1;
+}
+
+fn environmentListBytes(list: *const std.ArrayList(EnvironmentValue)) usize {
+    var total: usize = 0;
+    for (list.items) |entry| total += environmentEntryBytes(entry);
+    return total;
+}
+
+fn validEnvironmentName(name: []const u8) bool {
+    if (name.len == 0 or name.len > maximum_environment_name_bytes) return false;
+    for (name) |byte| if (byte < 0x21 or byte > 0x7E or byte == '=') return false;
+    return true;
+}
+
+fn validDosPattern(pattern: []const u8) bool {
+    if (pattern.len == 0 or pattern.len > 255 or pattern[pattern.len - 1] == ' ') return false;
+    for (pattern) |byte| {
+        if (byte < 0x20 or byte == 0x7F or byte == '"' or byte == '<' or byte == '>' or byte == '|' or
+            byte == ':' or byte == '\\' or byte == '/') return false;
+    }
+    if (std.mem.indexOfAny(u8, pattern, "*?") == null and isReservedDevicePath(pattern)) return false;
+    return true;
+}
+
+fn dosWildcardMatch(pattern: []const u8, name: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(pattern, "*.*")) return true;
+    var pattern_index: usize = 0;
+    var name_index: usize = 0;
+    var star_index: ?usize = null;
+    var star_name_index: usize = 0;
+    while (name_index < name.len) {
+        if (pattern_index < pattern.len and
+            (pattern[pattern_index] == '?' or std.ascii.toUpper(pattern[pattern_index]) == std.ascii.toUpper(name[name_index])))
+        {
+            pattern_index += 1;
+            name_index += 1;
+        } else if (pattern_index < pattern.len and pattern[pattern_index] == '*') {
+            star_index = pattern_index;
+            pattern_index += 1;
+            star_name_index = name_index;
+        } else if (star_index) |star| {
+            pattern_index = star + 1;
+            star_name_index += 1;
+            name_index = star_name_index;
+        } else {
+            return false;
+        }
+    }
+    while (pattern_index < pattern.len and pattern[pattern_index] == '*') pattern_index += 1;
+    return pattern_index == pattern.len;
+}
+
+fn parseWallDate(input: []const u8) ?WallClock {
+    var parts: [3][]const u8 = undefined;
+    var count: usize = 0;
+    var start: usize = 0;
+    for (input, 0..) |byte, index| {
+        if (byte != '-' and byte != '/') continue;
+        if (count >= parts.len) return null;
+        parts[count] = input[start..index];
+        count += 1;
+        start = index + 1;
+    }
+    if (count != 2) return null;
+    parts[2] = input[start..];
+    const month = parseUnsigned(u8, parts[0]) orelse return null;
+    const day = parseUnsigned(u8, parts[1]) orelse return null;
+    var year = parseUnsigned(u16, parts[2]) orelse return null;
+    if (parts[2].len == 2) year += if (year < 80) 2000 else 1900;
+    if (parts[2].len != 2 and parts[2].len != 4) return null;
+    const result = WallClock{ .valid = true, .year = year, .month = month, .day = day };
+    return if (validWallDate(result)) result else null;
+}
+
+fn parseWallTime(input: []const u8) ?WallClock {
+    var parts: [3][]const u8 = .{ "", "0", "0" };
+    var count: usize = 0;
+    var start: usize = 0;
+    for (input, 0..) |byte, index| {
+        if (byte != ':') continue;
+        if (count >= 2) return null;
+        parts[count] = input[start..index];
+        count += 1;
+        start = index + 1;
+    }
+    parts[count] = input[start..];
+    count += 1;
+    if (count == 0 or count > 3) return null;
+    const hour = parseUnsigned(u8, parts[0]) orelse return null;
+    const minute = parseUnsigned(u8, parts[1]) orelse return null;
+    const second = parseUnsigned(u8, parts[2]) orelse return null;
+    const result = WallClock{ .valid = true, .hour = hour, .minute = minute, .second = second };
+    return if (validWallTime(result)) result else null;
+}
+
+fn parseUnsigned(comptime T: type, bytes: []const u8) ?T {
+    if (bytes.len == 0) return null;
+    return std.fmt.parseInt(T, bytes, 10) catch null;
+}
+
+fn validWallClock(clock: WallClock) bool {
+    return clock.valid and validWallDate(clock) and validWallTime(clock) and clock.weekday <= 6;
+}
+
+fn validWallDate(clock: WallClock) bool {
+    if (clock.year < 1980 or clock.year > 2099 or clock.month < 1 or clock.month > 12 or clock.day < 1) return false;
+    return clock.day <= daysInMonth(clock.year, clock.month);
+}
+
+fn validWallTime(clock: WallClock) bool {
+    return clock.hour < 24 and clock.minute < 60 and clock.second < 60;
+}
+
+fn daysInMonth(year: u16, month: u8) u8 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)) 29 else 28,
+        else => 0,
+    };
+}
+
+fn weekdayForDate(year_value: u16, month_value: u8, day: u8) u8 {
+    const offsets = [_]u8{ 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    var year: u32 = year_value;
+    if (month_value < 3) year -= 1;
+    return @intCast((year + year / 4 - year / 100 + year / 400 + offsets[month_value - 1] + day) % 7);
+}
+
 fn decodeIeeeString(input: values.Value, target: bytecode.ValueType) ExecutionError!values.Value {
     const length: usize = switch (target) {
         .integer => 2,
@@ -6145,6 +7128,38 @@ fn unavailableFileLock(_: ?*anyopaque, _: []const u8, _: u32, _: u32, _: bool) F
     return .{ .failure = .unavailable };
 }
 
+fn unavailablePathInfo(_: ?*anyopaque, _: []const u8) PathInfoResult {
+    return .{ .failure = .unavailable };
+}
+
+fn unavailablePathOperation(_: ?*anyopaque, _: []const u8) PathOperationResult {
+    return .{ .failure = .unavailable };
+}
+
+fn unavailablePathRename(_: ?*anyopaque, _: []const u8, _: []const u8) PathOperationResult {
+    return .{ .failure = .unavailable };
+}
+
+fn unavailableDirectoryRead(_: ?*anyopaque, _: []const u8, _: u32, _: []u8) DirectoryReadResult {
+    return .{ .failure = .unavailable };
+}
+
+fn unavailableWallClock(_: ?*anyopaque) WallClockResult {
+    return .failure;
+}
+
+fn rejectWallClock(_: ?*anyopaque, _: WallClock) bool {
+    return false;
+}
+
+fn rejectEnvironment(_: ?*anyopaque, _: []const u8, _: []const u8) bool {
+    return false;
+}
+
+fn unavailableShell(_: ?*anyopaque, _: []const u8) ShellResult {
+    return .{ .failure = .unavailable };
+}
+
 fn ignoreFileQuiesce(_: ?*anyopaque) void {}
 
 fn allocateGlobals(allocator: std.mem.Allocator, program: *const bytecode.Program) InitError![]Cell {
@@ -6347,6 +7362,164 @@ fn cloneCell(allocator: std.mem.Allocator, program: *const bytecode.Program, sou
             },
             .array => return error.TypeMismatch,
         },
+    };
+}
+
+fn variablesTransferCompatible(
+    source_program: *const bytecode.Program,
+    source: bytecode.Variable,
+    target_program: *const bytecode.Program,
+    target: bytecode.Variable,
+) bool {
+    if (source.value_type != target.value_type or source.isArray() != target.isArray() or
+        source.fixed_string_length != target.fixed_string_length) return false;
+    if ((source.record_type == bytecode.invalid_index) != (target.record_type == bytecode.invalid_index)) return false;
+    if (source.record_type != bytecode.invalid_index and
+        !recordTypesTransferCompatible(source_program, source.record_type, target_program, target.record_type, 0)) return false;
+    return true;
+}
+
+fn recordTypesTransferCompatible(
+    source_program: *const bytecode.Program,
+    source_index: u32,
+    target_program: *const bytecode.Program,
+    target_index: u32,
+    depth: usize,
+) bool {
+    if (depth > 32 or source_index >= source_program.record_types.len or target_index >= target_program.record_types.len) return false;
+    const source = source_program.record_types[source_index];
+    const target = target_program.record_types[target_index];
+    if (source.byte_size != target.byte_size or source.fields.len != target.fields.len) return false;
+    for (source.fields, target.fields) |source_field, target_field| {
+        if (source_field.value_type != target_field.value_type or source_field.fixed_string_length != target_field.fixed_string_length or
+            source_field.offset != target_field.offset or
+            ((source_field.record_type == bytecode.invalid_index) != (target_field.record_type == bytecode.invalid_index))) return false;
+        if (source_field.record_type != bytecode.invalid_index and !recordTypesTransferCompatible(
+            source_program,
+            source_field.record_type,
+            target_program,
+            target_field.record_type,
+            depth + 1,
+        )) return false;
+    }
+    return true;
+}
+
+fn cloneVariableAcrossPrograms(
+    allocator: std.mem.Allocator,
+    source_program: *const bytecode.Program,
+    source_variable: bytecode.Variable,
+    target_program: *const bytecode.Program,
+    target_variable: bytecode.Variable,
+    source_cell: *const Cell,
+) ExecutionError!Cell {
+    const resolved = resolveCellConst(source_cell) orelse return error.InvalidInstruction;
+    if (!source_variable.isArray()) return cloneElementAcrossPrograms(
+        allocator,
+        source_program,
+        source_variable,
+        target_program,
+        target_variable,
+        resolved,
+    );
+    const source_array = switch (resolved.owned) {
+        .array => |array| array,
+        else => return error.TypeMismatch,
+    };
+    if (source_array.value_type != target_variable.value_type or
+        source_array.fixed_string_length != target_variable.fixed_string_length) return error.TypeMismatch;
+    const dimensions = try allocator.dupe(Dimension, source_array.dimensions);
+    errdefer allocator.free(dimensions);
+    var storage: ArrayStorage = switch (source_array.storage) {
+        .integer => |items| .{ .integer = try allocator.dupe(i16, items) },
+        .long => |items| .{ .long = try allocator.dupe(i32, items) },
+        .single => |items| .{ .single = try allocator.dupe(f32, items) },
+        .double => |items| .{ .double = try allocator.dupe(f64, items) },
+        .cells => |items| cells: {
+            const replacement = try allocator.alloc(Cell, items.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (replacement[0..initialized]) |*cell| cell.deinit(allocator);
+                allocator.free(replacement);
+            }
+            for (items, 0..) |*item, index| {
+                replacement[index] = try cloneElementAcrossPrograms(
+                    allocator,
+                    source_program,
+                    source_variable,
+                    target_program,
+                    target_variable,
+                    resolveCellConst(item) orelse return error.InvalidInstruction,
+                );
+                initialized += 1;
+            }
+            break :cells .{ .cells = replacement };
+        },
+    };
+    errdefer storage.deinit(allocator);
+    return .{ .owned = .{ .array = .{
+        .value_type = target_variable.value_type,
+        .record_type = target_variable.record_type,
+        .fixed_string_length = target_variable.fixed_string_length,
+        .expected_dimensions = target_variable.dimensions,
+        .is_dynamic = target_variable.is_dynamic,
+        .dimensions = dimensions,
+        .storage = storage,
+    } } };
+}
+
+fn cloneElementAcrossPrograms(
+    allocator: std.mem.Allocator,
+    source_program: *const bytecode.Program,
+    source_variable: bytecode.Variable,
+    target_program: *const bytecode.Program,
+    target_variable: bytecode.Variable,
+    source: *const Cell,
+) ExecutionError!Cell {
+    if (target_variable.record_type == bytecode.invalid_index) {
+        return switch (source.owned) {
+            .scalar => |value| .{ .owned = .{ .scalar = try value.clone(allocator) } },
+            .fixed_string => |string| if (string.length == target_variable.fixed_string_length)
+                .{ .owned = .{ .fixed_string = .{ .value = try string.value.clone(allocator), .length = string.length } } }
+            else
+                error.TypeMismatch,
+            else => error.TypeMismatch,
+        };
+    }
+    if (!recordTypesTransferCompatible(
+        source_program,
+        source_variable.record_type,
+        target_program,
+        target_variable.record_type,
+        0,
+    )) return error.TypeMismatch;
+    const byte_size: usize = target_program.record_types[target_variable.record_type].byte_size;
+    const bytes = try allocator.alloc(u8, byte_size);
+    defer allocator.free(bytes);
+    try encodeRecord(source_program, source, bytes);
+    var replacement = try allocateElement(
+        allocator,
+        target_program,
+        target_variable.value_type,
+        target_variable.record_type,
+        target_variable.fixed_string_length,
+    );
+    errdefer replacement.deinit(allocator);
+    try decodeRecord(target_program, &replacement, bytes);
+    return replacement;
+}
+
+fn arrayCellPayloadBytes(program: *const bytecode.Program, cell: *const Cell) ExecutionError!usize {
+    const resolved = resolveCellConst(cell) orelse return error.InvalidInstruction;
+    return switch (resolved.owned) {
+        .array => |array| arrayLogicalPayloadBytes(
+            program,
+            array.value_type,
+            array.record_type,
+            array.fixed_string_length,
+            array.storage.len(),
+        ),
+        else => 0,
     };
 }
 

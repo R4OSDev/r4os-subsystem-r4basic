@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 QuickBASIC 4.5 target contract
 
-Contract version: `2.4.0`
+Contract version: `2.5.0`
 
 R4BASIC v2 targets the complete Microsoft QuickBASIC 4.5 interpreter language
 and runtime. The target is not limited by GORILLA.BAS or by the historical v1

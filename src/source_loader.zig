@@ -349,6 +349,75 @@ pub fn loadGraph(allocator: std.mem.Allocator, reader: anytype, root_path: []con
     };
 }
 
+/// R4Basic's interpreted CHAIN extension applies a requested DELETE range to
+/// the fully loaded target graph before compilation. This keeps the switch
+/// atomic and gives numbered source lines one unambiguous meaning even when
+/// the target uses textual includes.
+pub fn deleteNumberedLines(
+    allocator: std.mem.Allocator,
+    graph: *Graph,
+    first: u16,
+    last: u16,
+) std.mem.Allocator.Error!usize {
+    std.debug.assert(first <= last);
+    var replacement_source: std.ArrayList(u8) = .empty;
+    errdefer replacement_source.deinit(allocator);
+    try replacement_source.ensureTotalCapacityPrecise(allocator, graph.source.len);
+    var replacement_origins: std.ArrayList(frontend.LineOrigin) = .empty;
+    errdefer replacement_origins.deinit(allocator);
+    try replacement_origins.ensureTotalCapacityPrecise(allocator, graph.line_origins.len);
+
+    var offset: usize = 0;
+    var origin_index: usize = 0;
+    var deleted: usize = 0;
+    while (offset < graph.source.len) : (origin_index += 1) {
+        var content_end = offset;
+        while (content_end < graph.source.len and graph.source[content_end] != '\r' and graph.source[content_end] != '\n') content_end += 1;
+        var line_end = content_end;
+        if (line_end < graph.source.len) {
+            if (graph.source[line_end] == '\r' and line_end + 1 < graph.source.len and graph.source[line_end + 1] == '\n') {
+                line_end += 2;
+            } else {
+                line_end += 1;
+            }
+        }
+        const number = numberedLine(graph.source[offset..content_end]);
+        const remove = if (number) |value| value >= first and value <= last else false;
+        if (remove) {
+            deleted += 1;
+        } else {
+            try replacement_source.appendSlice(allocator, graph.source[offset..line_end]);
+            if (origin_index < graph.line_origins.len) try replacement_origins.append(allocator, graph.line_origins[origin_index]);
+        }
+        offset = line_end;
+    }
+    while (origin_index < graph.line_origins.len) : (origin_index += 1) {
+        try replacement_origins.append(allocator, graph.line_origins[origin_index]);
+    }
+
+    const source = try replacement_source.toOwnedSlice(allocator);
+    errdefer allocator.free(source);
+    const origins = try replacement_origins.toOwnedSlice(allocator);
+    allocator.free(graph.source);
+    if (graph.line_origins.len != 0) allocator.free(graph.line_origins);
+    graph.source = source;
+    graph.line_origins = origins;
+    return deleted;
+}
+
+fn numberedLine(line: []const u8) ?u16 {
+    var cursor: usize = 0;
+    while (cursor < line.len and (line[cursor] == ' ' or line[cursor] == '\t')) cursor += 1;
+    const start = cursor;
+    var value: u32 = 0;
+    while (cursor < line.len and std.ascii.isDigit(line[cursor])) : (cursor += 1) {
+        value = value * 10 + line[cursor] - '0';
+        if (value > 65_529) return null;
+    }
+    if (cursor == start) return null;
+    return @intCast(value);
+}
+
 fn commentPayloadStart(line: []const u8) ?usize {
     var index: usize = 0;
     var statement_start = true;
