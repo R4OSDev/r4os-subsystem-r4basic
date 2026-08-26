@@ -28,6 +28,12 @@ Primaere Sprachreferenz:
   Transkription unter
   https://www.pcjs.org/documents/books/mspl13/basic/qblang/ diente auf der
   Linux-Entwicklungsumgebung als identische primaere Lesefassung.
+- Fuer VM-Vertrag 2.7 wurden PSET/PRESET, LINE-Stilmasken, CIRCLE-Winkel und
+  Aspect, PAINT-Tiles und Hintergrundslices, die DRAW-Makrosprache, alle
+  GET/PUT-Aktionen und Arraylayouts sowie BLOAD/BSAVE und dessen sieben Byte
+  grosser Header direkt aus der Language Reference und dem Grafikkapitel von
+  Programming in BASIC ausgewertet. Die drei zulaessigen BSAVE-Dateiendungen
+  wurden zusaetzlich gegen Microsoft Knowledge Base Q34407 abgeglichen.
 - Daraus uebernommen wurden ausschliesslich Sprachsemantik und Grenzen;
   Parser-, Speicher-, Alias-, Bytecode- und Fehlerflusscode sind eine neue
   eigenstaendige R4OS-Implementierung.

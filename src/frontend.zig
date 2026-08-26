@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const contract_version = "2.6.0";
+pub const contract_version = "2.7.0";
 pub const maximum_source_bytes: usize = 256 * 1024;
 pub const maximum_identifier_bytes: usize = 40;
 pub const maximum_expression_depth: usize = 128;
@@ -105,7 +105,9 @@ pub const Keyword = enum(u8) {
     atn,
     base,
     beep,
+    bload,
     binary,
+    bsave,
     byref,
     byval,
     call,
@@ -146,6 +148,7 @@ pub const Keyword = enum(u8) {
     dim,
     do_,
     double,
+    draw,
     dynamic,
     else_,
     elseif,
@@ -225,6 +228,7 @@ pub const Keyword = enum(u8) {
     point,
     pos,
     poke,
+    preset,
     preserve,
     print,
     pset,
@@ -870,7 +874,9 @@ pub const supported_keyword_entries = [_]KeywordEntry{
     .{ .text = "ATN", .keyword = .atn },
     .{ .text = "BASE", .keyword = .base },
     .{ .text = "BEEP", .keyword = .beep },
+    .{ .text = "BLOAD", .keyword = .bload },
     .{ .text = "BINARY", .keyword = .binary },
+    .{ .text = "BSAVE", .keyword = .bsave },
     .{ .text = "BYREF", .keyword = .byref },
     .{ .text = "BYVAL", .keyword = .byval },
     .{ .text = "CALL", .keyword = .call },
@@ -911,6 +917,7 @@ pub const supported_keyword_entries = [_]KeywordEntry{
     .{ .text = "DIM", .keyword = .dim },
     .{ .text = "DO", .keyword = .do_ },
     .{ .text = "DOUBLE", .keyword = .double },
+    .{ .text = "DRAW", .keyword = .draw },
     .{ .text = "ELSE", .keyword = .else_ },
     .{ .text = "ELSEIF", .keyword = .elseif },
     .{ .text = "END", .keyword = .end },
@@ -988,6 +995,7 @@ pub const supported_keyword_entries = [_]KeywordEntry{
     .{ .text = "POINT", .keyword = .point },
     .{ .text = "POS", .keyword = .pos },
     .{ .text = "POKE", .keyword = .poke },
+    .{ .text = "PRESET", .keyword = .preset },
     .{ .text = "PRESERVE", .keyword = .preserve },
     .{ .text = "PRINT", .keyword = .print },
     .{ .text = "PSET", .keyword = .pset },
@@ -1054,15 +1062,14 @@ pub const supported_keyword_entries = [_]KeywordEntry{
 };
 
 pub const unsupported_keyword_words = [_][]const u8{
-    "ALIAS",  "BLOAD",   "BSAVE",   "CALLS",
-    "CDECL",  "CHDRIVE", "COM",     "DRAW",
-    "ENDIF",  "ERDEV",   "ERDEV$",  "FRE",
-    "INP",    "IOCTL",   "IOCTL$",  "KEY",
-    "LIST",   "LOAD",    "LOCAL",   "LPOS",
-    "LPRINT", "OFF",     "OUT",     "PEN",
-    "PRESET", "SADD",    "SAVE",    "SETMEM",
-    "SIGNAL", "SOUND",   "STICK",   "STRIG",
-    "UEVENT", "VARPTR",  "VARPTR$", "VARSEG",
+    "ALIAS",  "CALLS",  "CDECL",   "CHDRIVE",
+    "COM",    "ENDIF",  "ERDEV",   "ERDEV$",
+    "FRE",    "INP",    "IOCTL",   "IOCTL$",
+    "KEY",    "LIST",   "LOAD",    "LOCAL",
+    "LPOS",   "LPRINT", "OFF",     "OUT",
+    "PEN",    "SADD",   "SAVE",    "SETMEM",
+    "SIGNAL", "SOUND",  "STICK",   "STRIG",
+    "UEVENT", "VARPTR", "VARPTR$", "VARSEG",
     "WAIT",
 };
 

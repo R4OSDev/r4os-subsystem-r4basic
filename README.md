@@ -28,7 +28,7 @@ input, or graphics.
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.24`
+- Module version: `1.2.25`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -119,11 +119,33 @@ validated atomic updates.
 
 `VIEW` fill and its outside border, `WINDOW`/`WINDOW SCREEN`, `PMAP`, `STEP`,
 and current-point queries share one reversible transform and clipping path.
+PMAP physical coordinates remain viewport-relative, while `POINT(0..1)`
+follows the coordinate convention selected by `VIEW` versus `VIEW SCREEN`.
+Graphics mode changes and graphics `CLS` establish the center point; `PAINT`
+preserves it.
 Palette changes recolor existing indices without rewriting pixels. Page and
 copy counters supplement the bounded eight-region damage ledger; a hidden or
 unchanged page produces no false frame, visible-page rebinding is generation
 safe, and the presentation path retains 128 by 128 maximum tiles without
 per-pixel R4DRAW calls.
+
+R4BASIC 1.2.25 completes the QuickBASIC graphics primitives and image-data
+paths on that foundation. `PSET`/`PRESET`, omitted and independent `STEP`
+line endpoints, boxes, 16-bit styles, circles, ellipses, radial arcs, solid
+and tiled `PAINT`, and the complete bounded `DRAW` macro language share the
+same coordinate, clipping, current-point, span, and damage contracts. Invalid
+DRAW macros are fully parsed and validated before pixels or persistent macro
+state can change. One combined primitive/pattern raster hash for every
+graphics mode fixes the result independently of host presentation.
+
+Graphics `GET` and `PUT` now cover every mode, INTEGER/LONG/SINGLE/DOUBLE
+arrays, arbitrary complete index tuples including storage beyond 64 KiB, and
+`PSET`, `PRESET`, `AND`, `OR`, and default `XOR`. They touch only the exact
+packed image prefix. `BLOAD` and `BSAVE` resumably transfer the seven-byte
+QuickBASIC memory-image format through the asynchronous Storage facade. Each
+VM owns its real-mode guest address space; only active packed `A000`/`B800`
+video ranges are mapped, and no guest address is ever a host pointer. Input
+also accepts the validated BASICA and GW-BASIC trailer variants atomically.
 
 R4BASIC 1.2.22 uses a shared 262,144-instruction ceiling with adaptive bounded
 clock blocks and an 8-ms production time boundary. Active work requests a
@@ -174,12 +196,13 @@ resolved bounded targets. ERROR, ERR, ERL, ON ERROR and every RESUME form
 share exact diagnostics across call frames. STOP is an event-only pause and
 TRON/TROFF emit visible markers while retaining only a 256-entry trace ring.
 
-Text rows, lines, filled regions and flood fill now commit one accumulated
-damage region per operation. Same-size `SCREEN` changes clear and reuse their
-surface, invisible full-circle polygons are rejected before their segment
-trigonometry, and numeric-array `GET`/`PUT` use only the packed image prefix
-without a whole-array conversion buffer. Pixel-exact full-raster hashes and
-the unchanged checksum-bound GORILLA acceptance guard the QBasic output.
+Text rows, styled lines, filled regions, tiled flood fill, decoded images and
+packed video loads commit bounded accumulated damage per operation. Same-size
+`SCREEN` changes clear and reuse their surface, invisible full-circle polygons
+are rejected before their segment trigonometry, and numeric-array `GET`/`PUT`
+use only the packed image prefix without a whole-array conversion buffer.
+Pixel-exact per-mode full-raster hashes and the unchanged checksum-bound
+GORILLA acceptance guard the QuickBASIC output.
 
 The build starters map the current local R4OS SDK and Contract checkouts from
 `Settings.R4S`. The URL and hash in `build.zig.zon` record the last verified

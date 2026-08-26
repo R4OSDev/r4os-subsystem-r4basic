@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 QuickBASIC 4.5 target contract
 
-Contract version: `2.6.0`
+Contract version: `2.7.0`
 
 R4BASIC v2 targets the complete Microsoft QuickBASIC 4.5 interpreter language
 and runtime. The target is not limited by GORILLA.BAS or by the historical v1
@@ -125,11 +125,12 @@ the same grammar family. All fixture paths are below `Tests/Fixtures/`.
 | EXPR-02 | Numeric conversion, IEEE/MBF byte conversion, math, string, time, graphics and host-query built-ins currently marked implemented in `src/conformance.zig` | yes | `positive_io_graphics.bas` and inline numeric/byte/error vectors | `negative_expressions.bas` |
 | TEXT-01 | Per-page text `SCREEN`, mode-valid optional-axis `WIDTH`, mode-specific `COLOR`, exact `CLS`, `LOCATE`, `VIEW PRINT`, `PRINT`, `PRINT USING`, `WRITE`, `INPUT`, `LINE INPUT`, and `INPUT$` | yes | `positive_io_graphics.bas` plus inline formatting/input and 0.70.10 mode/page vectors | `negative_statements.bas` plus inline mode/color boundaries |
 | TIME-01 | `RANDOMIZE`, `RND`, `TIMER`, extended two-byte `INKEY$`, and `SLEEP` syntax | yes | `positive_io_graphics.bas` plus inline queue vectors | `negative_expressions.bas`, `negative_statements.bas` |
-| GFX-01 | Logical `SCREEN 0`, `1`, `2`, `7`-`13` mode matrices; APAGE/VPAGE/`PCOPY`; `PALETTE`/`USING`; `VIEW`, `WINDOW`, `PMAP`, all `POINT` forms; `PSET`, `LINE` including `B`/`BF`, `CIRCLE`, and `PAINT` | yes | `positive_io_graphics.bas` plus inline 0.70.10 mode/page/transform vectors | `negative_statements.bas`, `negative_expressions.bas`, plus inline page/color/palette boundaries |
-| GFX-02 | Graphics `GET` and `PUT` with `PSET` and `XOR` actions | yes | `positive_io_graphics.bas` | `negative_statements.bas` |
+| GFX-01 | Logical `SCREEN 0`, `1`, `2`, `7`-`13` mode matrices; APAGE/VPAGE/`PCOPY`; `PALETTE`/`USING`; `VIEW`, `WINDOW`, `PMAP`, all `POINT` forms; `PSET`/`PRESET`; styled `LINE`/`B`/`BF`; complete `CIRCLE`, `PAINT` tiling, and bounded `DRAW` | yes | `positive_io_graphics.bas` plus inline 0.70.10/0.70.11 mode, page, transform, primitive and macro vectors | `negative_statements.bas`, `negative_expressions.bas`, plus inline page, color, palette, macro and tile boundaries |
+| GFX-02 | Graphics `GET` and `PUT` in every logical mode, from every numeric array type and element, with `PSET`, `PRESET`, `AND`, `OR`, and default `XOR` actions | yes | `positive_io_graphics.bas` plus inline all-mode/all-type/far-element vectors | `negative_statements.bas` plus inline header, capacity and surface-boundary vectors |
 | AUDIO-01 | `BEEP` and `PLAY` expression syntax | yes | `positive_io_graphics.bas`, `vm_audio.bas` | `negative_statements.bas` |
 | FILE-01 | Old/new `OPEN` for `INPUT`, `OUTPUT`, `APPEND`, `RANDOM`, or `BINARY`; access/lock/LEN, `CLOSE`/`RESET`, sequential formatting/input, FIELD/LSET/RSET, typed GET/PUT, BINARY `INPUT$`, SEEK/LOC/LOF/EOF/FILEATTR/FREEFILE, and exact LOCK/UNLOCK | yes | `vm_sequential_files.bas` plus inline one-byte, sparse, record/UDT, exact-64-KiB, positioned-output, metadata, lock and catchable-error vectors | inline bad-mode, bad-record, FIELD, path/storage and device-name vectors |
-| HW-01 | Selected `DEF SEG`, `PEEK`, and `POKE` syntax for a later private compatibility device | yes | `positive_io_graphics.bas` | `negative_expressions.bas` |
+| MEM-01 | Asynchronous `BLOAD`/`BSAVE` with the seven-byte memory-image header, QuickBASIC/BASICA/GW-BASIC input variants, private real-mode guest segments, and packed active video segments | yes | `positive_io_graphics.bas` plus inline partial-transfer, malformed-input and byte-roundtrip vectors | `negative_statements.bas` plus inline bounds and storage-failure vectors |
+| HW-01 | `DEF SEG` selects every 16-bit segment for memory images; `PEEK` and `POKE` remain restricted to the private compatibility byte until the 0.70.13 guest machine | yes | `positive_io_graphics.bas` plus inline segment-isolation vectors | `negative_expressions.bas` |
 
 The optional `Tests/gorilla_acceptance.zig` step additionally verifies the
 local file size and SHA-256 before passing the unchanged bytes through the
@@ -186,7 +187,7 @@ the typed-program phase.
   codes. Invalid bytes or malformed grammar never disappear as comments or
   successful empty input.
 
-## Historical v1 exclusions, now scheduled v2 targets
+## Historical v1 exclusions under the v2 contract
 
 - Full QuickBASIC 4.5 and BASICA/GW-BASIC line-number compatibility were not
   v1 promises. They are v2 implementation targets where the QuickBASIC 4.5
@@ -195,7 +196,8 @@ the typed-program phase.
 - `CHAIN`, `RUN`, `SHELL`, `SYSTEM`, printer/COM/device I/O,
   random/binary file records, directory mutation, and unrestricted hardware
   access.
-- `DRAW`, `PCOPY`, `BLOAD`, `BSAVE`, and general memory or port access.
+- `DRAW`, `PCOPY`, `BLOAD`, and `BSAVE` were v1 exclusions and are implemented
+  by contract 2.7.0. General memory and port access remains staged.
 - Runtime correctness merely from parse or bind success. Only the subset in
   `VM-CONTRACT.md` has executable semantics.
 

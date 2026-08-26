@@ -254,6 +254,136 @@ test "graphics primitives and packed images have pixel-exact references" {
     try std.testing.expectEqual(@as(u64, 0xf09378bb86921a3e), imageHash(packed_image));
 }
 
+test "all graphics modes share exact GET PUT layouts actions and far-edge bounds" {
+    const modes = [_]i32{ 1, 2, 7, 8, 9, 10, 11, 12, 13 };
+    var screen: core.graphics_screen.Screen = .{};
+    defer screen.deinit(std.testing.allocator);
+    for (modes) |mode| {
+        try screen.setMode(std.testing.allocator, mode);
+        _ = screen.takeDamage();
+        const spec = core.graphics_screen.modeSpec(mode) orelse return error.MissingModeSpec;
+        const maximum: u8 = @intCast(spec.attributes - 1);
+        const source: u8 = @min(maximum, 3);
+        for (0..8) |x| try screen.pset(.{ .x = @intCast(x), .y = 0 }, if ((x & 1) == 0) source else 0);
+        for (0..8) |x| try screen.pset(.{ .x = @intCast(x), .y = 1 }, if ((x & 1) == 0) 0 else source);
+
+        const image = try screen.capture(std.testing.allocator, .{ .x = 0, .y = 0 }, .{ .x = 7, .y = 1 });
+        defer std.testing.allocator.free(image);
+        const width_bits: usize = 8 * spec.bits_per_pixel_per_plane;
+        const expected_bytes = 4 + ((width_bits + 7) / 8) * spec.planes * 2;
+        try std.testing.expectEqual(expected_bytes, image.len);
+        try std.testing.expectEqual(@as(u16, @intCast(width_bits)), std.mem.readInt(u16, image[0..2], .little));
+        try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, image[2..4], .little));
+
+        const far = core.graphics_screen.Point{ .x = @intCast(spec.width - 8), .y = @intCast(spec.height - 2) };
+        try screen.put(far, image, .pset);
+        try std.testing.expectEqual(@as(i32, source), try screen.point(far));
+        try std.testing.expectError(
+            error.IllegalFunctionCall,
+            screen.put(.{ .x = @intCast(spec.width - 7), .y = far.y }, image, .pset),
+        );
+
+        const origins = [_]core.graphics_screen.Point{
+            .{ .x = 20, .y = 10 },
+            .{ .x = 40, .y = 10 },
+            .{ .x = 60, .y = 10 },
+            .{ .x = 80, .y = 10 },
+            .{ .x = 100, .y = 10 },
+        };
+        for (origins) |origin| try screen.pset(origin, maximum);
+        try screen.put(origins[0], image, .pset);
+        try screen.put(origins[1], image, .preset);
+        try screen.put(origins[2], image, .and_);
+        try screen.put(origins[3], image, .or_);
+        try screen.put(origins[4], image, .xor);
+        try std.testing.expectEqual(@as(i32, source), try screen.point(origins[0]));
+        try std.testing.expectEqual(@as(i32, source ^ maximum), try screen.point(origins[1]));
+        try std.testing.expectEqual(@as(i32, source & maximum), try screen.point(origins[2]));
+        try std.testing.expectEqual(@as(i32, source | maximum), try screen.point(origins[3]));
+        try std.testing.expectEqual(@as(i32, source ^ maximum), try screen.point(origins[4]));
+    }
+}
+
+test "every graphics mode has one pixel-exact primitive and pattern golden" {
+    const modes = [_]i32{ 1, 2, 7, 8, 9, 10, 11, 12, 13 };
+    const goldens = [_]u64{
+        0xae6e1bd6b09c9de4,
+        0x6da12e0e4f7d9f44,
+        0x107d0438e2371836,
+        0x61522562ab2faca2,
+        0x9d6cfc7e5d8b5e36,
+        0xe2a68cc24cbd313c,
+        0x78a8171e55c2a16b,
+        0xdac99bc67a91cb25,
+        0x1955f1b3af57a92e,
+    };
+    var screen: core.graphics_screen.Screen = .{};
+    defer screen.deinit(std.testing.allocator);
+    for (modes, goldens) |mode, golden| {
+        try screen.setMode(std.testing.allocator, mode);
+        _ = screen.takeDamage();
+        const spec = core.graphics_screen.modeSpec(mode) orelse return error.MissingModeSpec;
+        const color: i32 = @min(spec.attributes - 1, 5);
+
+        try screen.pset(.{ .x = 2, .y = 2 }, color);
+        try screen.pset(.{ .x = 2, .y = 2 }, 0);
+        try screen.pset(.{ .x = -1, .y = -1 }, color);
+        try screen.lineStyled(.{ .x = -20, .y = 4 }, .{ .x = 45, .y = 19 }, color, .line, 0xA55A);
+        const step_end = screen.resolveRelativeTo(.{ .x = 8, .y = 24 }, 24, 18);
+        try screen.lineStyled(.{ .x = 8, .y = 24 }, step_end, color, .box, 0xF0F0);
+        try screen.line(.{ .x = 38, .y = 25 }, .{ .x = 58, .y = 41 }, color, .filled_box);
+        try screen.circle(.{ .x = 72, .y = 58 }, 21, color, -0.25, -4.75, 1.4);
+        try screen.circle(.{ .x = 0, .y = 0 }, 17, color, null, null, null);
+
+        try screen.line(.{ .x = 90, .y = 35 }, .{ .x = 116, .y = 57 }, color, .box);
+        var tile: [8]u8 = undefined;
+        const plane_count: usize = spec.planes;
+        const tile_length = plane_count * 2;
+        for (0..2) |row| for (0..plane_count) |plane| {
+            tile[row * plane_count + plane] = if (((row + plane) & 1) == 0) 0xAA else 0x55;
+        };
+        try screen.paintTile(std.testing.allocator, .{ .x = 100, .y = 45 }, tile[0..tile_length], color, null);
+
+        const view = screen.view() orelse return error.MissingGraphicsRaster;
+        try std.testing.expectEqual(golden, imageHash(view.pixels));
+        const stats = screen.performanceStats();
+        try std.testing.expect(stats.maximum_paint_queue <= 3);
+        try std.testing.expect(screen.takeDamage().count <= 8);
+    }
+}
+
+test "packed video ranges and tiled PAINT round trip without host memory" {
+    var screen: core.graphics_screen.Screen = .{};
+    defer screen.deinit(std.testing.allocator);
+    try screen.setMode(std.testing.allocator, 13);
+    _ = screen.takeDamage();
+    try screen.writePackedRange(0, &[_]u8{ 7, 8, 9 });
+    try std.testing.expectEqual(@as(i32, 7), try screen.point(.{ .x = 0, .y = 0 }));
+    try std.testing.expectEqual(@as(i32, 9), try screen.point(.{ .x = 2, .y = 0 }));
+    var packed_bytes: [3]u8 = undefined;
+    try screen.readPackedRange(0, packed_bytes[0..]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 7, 8, 9 }, packed_bytes[0..]);
+
+    try screen.setMode(std.testing.allocator, 1);
+    _ = screen.takeDamage();
+    try screen.paintTile(std.testing.allocator, .{ .x = 0, .y = 0 }, &[_]u8{0b00011011}, null, null);
+    try std.testing.expectEqual(@as(i32, 0), try screen.point(.{ .x = 0, .y = 0 }));
+    try std.testing.expectEqual(@as(i32, 1), try screen.point(.{ .x = 1, .y = 0 }));
+    try std.testing.expectEqual(@as(i32, 2), try screen.point(.{ .x = 2, .y = 0 }));
+    try std.testing.expectEqual(@as(i32, 3), try screen.point(.{ .x = 3, .y = 0 }));
+    try std.testing.expectError(
+        error.IllegalFunctionCall,
+        screen.paintTile(std.testing.allocator, .{ .x = 0, .y = 0 }, &[_]u8{ 1, 2, 3 }, null, &[_]u8{ 1, 2, 3 }),
+    );
+    try std.testing.expectError(
+        error.IllegalFunctionCall,
+        screen.paintTile(std.testing.allocator, .{ .x = 0, .y = 0 }, &[_]u8{ 1, 2 }, null, &[_]u8{3}),
+    );
+    const stats = screen.performanceStats();
+    try std.testing.expect(stats.maximum_paint_queue <= 2);
+    try std.testing.expectEqual(@as(u64, 200), stats.paint_spans);
+}
+
 test "filled regions and PAINT use one damage commit and bounded spans" {
     var screen: core.graphics_screen.Screen = .{};
     defer screen.deinit(std.testing.allocator);
@@ -279,6 +409,22 @@ test "filled regions and PAINT use one damage commit and bounded spans" {
     try std.testing.expectEqual(@as(u64, 0), paint_after.paint_duplicate_pops - paint_before.paint_duplicate_pops);
     try std.testing.expect(paint_after.maximum_paint_queue <= 2);
     try std.testing.expectEqual(@as(u64, 1), paint_after.damage_commits - paint_before.damage_commits);
+}
+
+test "solid PAINT without a border crosses every color until its paint color" {
+    var screen: core.graphics_screen.Screen = .{};
+    defer screen.deinit(std.testing.allocator);
+    try screen.setMode(std.testing.allocator, 1);
+    try screen.line(.{ .x = 1, .y = 1 }, .{ .x = 8, .y = 8 }, 1, .box);
+    try screen.pset(.{ .x = 3, .y = 3 }, 2);
+    try screen.pset(.{ .x = 4, .y = 3 }, 3);
+
+    try screen.paintSolid(std.testing.allocator, .{ .x = 2, .y = 2 }, 1, null);
+
+    try std.testing.expectEqual(@as(i32, 1), try screen.point(.{ .x = 3, .y = 3 }));
+    try std.testing.expectEqual(@as(i32, 1), try screen.point(.{ .x = 4, .y = 3 }));
+    try std.testing.expectEqual(@as(i32, 0), try screen.point(.{ .x = 0, .y = 0 }));
+    try std.testing.expectEqual(@as(i32, 0), try screen.point(.{ .x = 9, .y = 9 }));
 }
 
 test "sparse graphics changes remain separate damage regions" {
@@ -426,13 +572,15 @@ test "VIEW WINDOW and PMAP use one reversible clipped transform" {
     try std.testing.expectEqual(@as(u8, 2), pixels[251 * 640 + 301]);
 
     try screen.setWindow(.{ .x = 0, .y = 0 }, .{ .x = 10, .y = 10 }, false);
-    try std.testing.expectApproxEqAbs(@as(f64, 200), try screen.mapCoordinate(5, 0), 0.000001);
-    try std.testing.expectApproxEqAbs(@as(f64, 150), try screen.mapCoordinate(5, 1), 0.000001);
-    try std.testing.expectApproxEqAbs(@as(f64, 5), try screen.mapCoordinate(200, 2), 0.000001);
-    try std.testing.expectApproxEqAbs(@as(f64, 5), try screen.mapCoordinate(150, 3), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 100), try screen.mapCoordinate(5, 0), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 100), try screen.mapCoordinate(5, 1), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), try screen.mapCoordinate(100, 2), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), try screen.mapCoordinate(100, 3), 0.000001);
     const middle = screen.resolvePoint(5, 5, false);
     try std.testing.expectEqual(core.graphics_screen.Point{ .x = 200, .y = 150 }, middle);
     try screen.pset(middle, 3);
+    try std.testing.expectApproxEqAbs(@as(f64, 100), try screen.currentCoordinate(0), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 100), try screen.currentCoordinate(1), 0.000001);
     try std.testing.expectApproxEqAbs(@as(f64, 5), try screen.currentCoordinate(2), 0.000001);
     try std.testing.expectApproxEqAbs(@as(f64, 5), try screen.currentCoordinate(3), 0.000001);
 
@@ -445,10 +593,17 @@ test "VIEW WINDOW and PMAP use one reversible clipped transform" {
     try std.testing.expectEqual(@as(i32, -1), try screen.point(.{ .x = 99, .y = 150 }));
 
     try screen.setWindow(.{ .x = 10, .y = 10 }, .{ .x = 0, .y = 0 }, true);
-    try std.testing.expectApproxEqAbs(@as(f64, 300), try screen.mapCoordinate(0, 0), 0.000001);
-    try std.testing.expectApproxEqAbs(@as(f64, 250), try screen.mapCoordinate(0, 1), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 200), try screen.mapCoordinate(0, 0), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 200), try screen.mapCoordinate(0, 1), 0.000001);
     try screen.setWindow(null, null, false);
     try std.testing.expectEqual(core.graphics_screen.Point{ .x = 100, .y = 50 }, screen.resolvePoint(0, 0, false));
+
+    try screen.setView(.{ .x = 100, .y = 50 }, .{ .x = 300, .y = 250 }, true, null, null);
+    try screen.pset(.{ .x = 200, .y = 150 }, 3);
+    try std.testing.expectApproxEqAbs(@as(f64, 200), try screen.currentCoordinate(0), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 150), try screen.currentCoordinate(1), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 100), try screen.mapCoordinate(200, 0), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 100), try screen.mapCoordinate(150, 1), 0.000001);
     try screen.setView(null, null, false, null, null);
     try std.testing.expectEqual(core.graphics_screen.Point{ .x = 0, .y = 0 }, screen.resolvePoint(0, 0, false));
 }
@@ -457,17 +612,34 @@ test "CLS graphics viewport and full-screen paths keep their exact bounds" {
     var screen: core.graphics_screen.Screen = .{};
     defer screen.deinit(std.testing.allocator);
     try screen.setMode(std.testing.allocator, 9);
+    try std.testing.expectApproxEqAbs(@as(f64, 320), try screen.currentCoordinate(0), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 175), try screen.currentCoordinate(1), 0.000001);
     try screen.pset(.{ .x = 10, .y = 10 }, 3);
     try screen.setView(.{ .x = 100, .y = 50 }, .{ .x = 300, .y = 250 }, false, null, null);
     try screen.pset(.{ .x = 150, .y = 100 }, 4);
     try screen.clear(0);
+    try std.testing.expectApproxEqAbs(@as(f64, 100), try screen.currentCoordinate(0), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 100), try screen.currentCoordinate(1), 0.000001);
     var pixels = screen.view().?.pixels;
     try std.testing.expectEqual(@as(u8, 3), pixels[10 * 640 + 10]);
     try std.testing.expectEqual(@as(u8, 0), pixels[100 * 640 + 150]);
 
     try screen.clearAll(0);
+    try std.testing.expectApproxEqAbs(@as(f64, 220), try screen.currentCoordinate(0), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 125), try screen.currentCoordinate(1), 0.000001);
     pixels = screen.view().?.pixels;
     try std.testing.expectEqual(@as(u8, 0), pixels[10 * 640 + 10]);
+}
+
+test "PAINT preserves the most recent graphics point" {
+    var screen: core.graphics_screen.Screen = .{};
+    defer screen.deinit(std.testing.allocator);
+    try screen.setMode(std.testing.allocator, 9);
+    try screen.line(.{ .x = 130, .y = 90 }, .{ .x = 170, .y = 130 }, 2, .box);
+    try screen.pset(.{ .x = 140, .y = 100 }, 4);
+    try screen.paintSolid(std.testing.allocator, .{ .x = 150, .y = 110 }, 5, 2);
+    try std.testing.expectApproxEqAbs(@as(f64, 140), try screen.currentCoordinate(0), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 100), try screen.currentCoordinate(1), 0.000001);
 }
 
 test "CGA COLOR selects a standard palette and replaces prior PALETTE overrides" {

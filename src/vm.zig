@@ -6,7 +6,7 @@ const graphics_screen = @import("graphics_screen.zig");
 const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "2.6.0";
+pub const contract_version = "2.7.0";
 pub const default_instruction_budget: u32 = 262_144;
 pub const timer_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
@@ -30,6 +30,13 @@ pub const maximum_environment_name_bytes: usize = 32;
 pub const maximum_environment_value_bytes: usize = 512;
 pub const maximum_environment_block_bytes: usize = 2048;
 pub const maximum_environment_entries: usize = 64;
+pub const maximum_draw_expansion_bytes: usize = values.maximum_string_bytes;
+pub const maximum_draw_commands: usize = 16_384;
+pub const maximum_draw_expansion_depth: usize = 16;
+pub const maximum_guest_linear_bytes: usize = 0x10FFF0;
+pub const memory_image_header_bytes: usize = 7;
+pub const maximum_memory_image_payload_bytes: usize = 65_535;
+pub const maximum_memory_image_file_bytes: usize = memory_image_header_bytes + maximum_memory_image_payload_bytes + 8;
 
 pub const MathOperation = enum(u8) {
     atn,
@@ -844,6 +851,25 @@ const PendingFileTransfer = struct {
     }
 };
 
+const PendingMemoryImage = struct {
+    instruction: u32,
+    write: bool,
+    flags: u32,
+    path: []u8,
+    stack_base: usize,
+    target_segment: u16,
+    target_offset: u16,
+    buffer: []u8 = &.{},
+    transferred: usize = 0,
+    file_size_known: bool = false,
+
+    fn deinit(self: *PendingMemoryImage, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        if (self.buffer.len != 0) allocator.free(self.buffer);
+        self.* = undefined;
+    }
+};
+
 const EnvironmentValue = struct {
     name: []u8,
     value: []u8,
@@ -869,6 +895,25 @@ const PendingDirectory = struct {
         allocator.free(self.pattern);
         self.* = undefined;
     }
+};
+
+const DrawOperation = union(enum) {
+    move: struct {
+        x: f64,
+        y: f64,
+        absolute: bool,
+        blank: bool,
+        restore: bool,
+    },
+    color: i32,
+    angle: f64,
+    scale: f64,
+    paint: struct { fill: i32, border: i32 },
+};
+
+const DrawParseBudget = struct {
+    expanded_bytes: usize = 0,
+    commands: usize = 0,
 };
 
 const module_frame = bytecode.invalid_index;
@@ -942,11 +987,16 @@ pub const Vm = struct {
     module_error_handler_ip: u32 = bytecode.invalid_index,
     module_error_handler_active: bool = false,
     data_pointer: usize = 0,
-    compatibility_segment_zero: bool = false,
+    compatibility_segment: u16 = 0,
+    compatibility_segment_explicit: bool = false,
     virtual_bios_byte: u8 = 0,
+    guest_memory: ?[]u8 = null,
     text: text_screen.Screen = .{},
     graphics: graphics_screen.Screen = .{},
     screen_mode: i32 = 0,
+    draw_angle_degrees: f64 = 0,
+    draw_scale: f64 = 1,
+    draw_color: ?i32 = null,
     host_display_requested: bool = false,
     keyboard: std.ArrayList(QueuedInput) = .empty,
     keyboard_head: usize = 0,
@@ -975,6 +1025,7 @@ pub const Vm = struct {
     pending_open_number: u8 = 0,
     next_file_generation: u64 = 1,
     pending_file_transfer: ?PendingFileTransfer = null,
+    pending_memory_image: ?PendingMemoryImage = null,
     initial_guest_directory: []u8 = &.{},
     drive_directories: [26]?[]u8 = .{null} ** 26,
     current_drive: u8 = 2,
@@ -1025,6 +1076,7 @@ pub const Vm = struct {
         self.host.file_quiesce(self.fileHostContext());
         self.host.platform_quiesce(self.platformHostContext());
         self.discardPendingFileTransfer();
+        self.discardPendingMemoryImage();
         self.discardStackFrom(0);
         self.stack.deinit(self.allocator);
         while (self.frames.pop()) |frame_value| {
@@ -1047,6 +1099,7 @@ pub const Vm = struct {
         self.deinitPlatformState();
         self.text.deinit(self.allocator);
         self.graphics.deinit(self.allocator);
+        if (self.guest_memory) |memory| self.allocator.free(memory);
         deinitGlobals(self.allocator, self.globals);
         self.* = undefined;
     }
@@ -1377,11 +1430,19 @@ pub const Vm = struct {
         self.module_error_handler_ip = bytecode.invalid_index;
         self.module_error_handler_active = false;
         self.data_pointer = 0;
-        self.compatibility_segment_zero = false;
+        self.compatibility_segment = 0;
+        self.compatibility_segment_explicit = false;
         self.virtual_bios_byte = 0;
+        if (self.guest_memory) |memory| {
+            self.allocator.free(memory);
+            self.guest_memory = null;
+        }
         self.text.resetAllocated(self.allocator);
         self.graphics.reset(self.allocator);
         self.screen_mode = 0;
+        self.draw_angle_degrees = 0;
+        self.draw_scale = 1;
+        self.draw_color = null;
         self.host_display_requested = false;
         self.keyboard.clearRetainingCapacity();
         self.keyboard_head = 0;
@@ -1404,6 +1465,7 @@ pub const Vm = struct {
         self.random_state = normalizeRandomSeed(self.host.initial_random_seed);
         self.random_last = randomValue(self.random_state);
         self.discardPendingFileTransfer();
+        self.discardPendingMemoryImage();
         self.discardFiles();
         self.discardPendingDirectory();
         if (self.transition) |*transition| transition.deinit(self.allocator);
@@ -1672,6 +1734,12 @@ pub const Vm = struct {
         return self.virtual_bios_byte;
     }
 
+    pub fn guestMemoryByte(self: *const Vm, segment: u16, offset: u16) ?u8 {
+        const memory = self.guest_memory orelse return 0;
+        const first = guestLinearRange(segment, offset, 1) catch return null;
+        return memory[first];
+    }
+
     fn globalCell(self: *const Vm, name: []const u8) ?*const Cell {
         for (self.program.globals, 0..) |variable, index| {
             if (!variable.hidden and std.ascii.eqlIgnoreCase(variable.name.bytes(self.program.source), name)) {
@@ -1838,6 +1906,7 @@ pub const Vm = struct {
             .graphics_line,
             .graphics_circle,
             .graphics_paint,
+            .graphics_draw,
             .graphics_get,
             .graphics_put,
             => .graphics,
@@ -1874,6 +1943,8 @@ pub const Vm = struct {
             .file_close,
             .file_get,
             .file_put,
+            .memory_image_load,
+            .memory_image_save,
             .file_field,
             .file_seek,
             .file_lock,
@@ -1931,7 +2002,10 @@ pub const Vm = struct {
             .resume_next => try self.resumeError(.next, 0),
             .resume_label => try self.resumeError(.label, instruction.a),
             .set_segment => try self.setSegment(),
-            .reset_segment => self.compatibility_segment_zero = false,
+            .reset_segment => {
+                self.compatibility_segment = 0;
+                self.compatibility_segment_explicit = false;
+            },
             .peek => try self.peek(),
             .poke => try self.poke(),
             .screen_mode_probe => try self.screenModeProbe(instruction.a, instruction.b),
@@ -1944,6 +2018,7 @@ pub const Vm = struct {
             .graphics_line => try self.graphicsLine(instruction.a),
             .graphics_circle => try self.graphicsCircle(instruction.a, instruction.b),
             .graphics_paint => try self.graphicsPaint(instruction.a, instruction.b),
+            .graphics_draw => try self.graphicsDraw(),
             .graphics_get => try self.graphicsGet(instruction.a),
             .graphics_put => try self.graphicsPut(instruction.a, instruction.b),
             .text_width => try self.textWidth(instruction.a, instruction.b),
@@ -1975,6 +2050,8 @@ pub const Vm = struct {
             .file_close => try self.closeFiles(instruction.a),
             .file_get => try self.fileTransfer(instruction_index, false, instruction.a),
             .file_put => try self.fileTransfer(instruction_index, true, instruction.a),
+            .memory_image_load => try self.memoryImageTransfer(instruction_index, false, instruction.a),
+            .memory_image_save => try self.memoryImageTransfer(instruction_index, true, instruction.a),
             .file_field => try self.bindFileFields(instruction.a),
             .file_seek => try self.seekFile(),
             .file_lock => try self.lockFile(false, instruction.a),
@@ -2485,6 +2562,12 @@ pub const Vm = struct {
         self.discardStackFrom(0);
         self.gosub_stack.clearRetainingCapacity();
         for (self.globals) |*global_cell| try self.clearCell(global_cell);
+        if (self.guest_memory) |memory| @memset(memory, 0);
+        self.compatibility_segment = 0;
+        self.compatibility_segment_explicit = false;
+        self.draw_angle_degrees = 0;
+        self.draw_scale = 1;
+        self.draw_color = null;
     }
 
     fn justifyString(self: *Vm, right: bool) ExecutionError!void {
@@ -2730,14 +2813,15 @@ pub const Vm = struct {
     fn setSegment(self: *Vm) ExecutionError!void {
         var segment = try self.popValue();
         defer segment.deinit(self.allocator);
-        if (try values.asLong(segment) != 0) return error.RestrictedMemory;
-        self.compatibility_segment_zero = true;
+        self.compatibility_segment = try unsignedWord(try values.asLong(segment));
+        self.compatibility_segment_explicit = true;
     }
 
     fn peek(self: *Vm) ExecutionError!void {
         var address = try self.popValue();
         defer address.deinit(self.allocator);
-        if (!self.compatibility_segment_zero or try values.asLong(address) != 1047) return error.RestrictedMemory;
+        if (!self.compatibility_segment_explicit or self.compatibility_segment != 0 or
+            try values.asLong(address) != 1047) return error.RestrictedMemory;
         try self.pushValue(.{ .integer = self.virtual_bios_byte });
     }
 
@@ -2747,7 +2831,9 @@ pub const Vm = struct {
         var address = try self.popValue();
         defer address.deinit(self.allocator);
         const byte = try values.asLong(byte_value);
-        if (!self.compatibility_segment_zero or try values.asLong(address) != 1047 or byte < 0 or byte > 255) {
+        if (!self.compatibility_segment_explicit or self.compatibility_segment != 0 or
+            try values.asLong(address) != 1047 or byte < 0 or byte > 255)
+        {
             return error.RestrictedMemory;
         }
         self.virtual_bios_byte = @intCast(byte);
@@ -2790,6 +2876,9 @@ pub const Vm = struct {
                 0,
             ) catch return error.IllegalFunctionCall;
             self.screen_mode = mode;
+            self.draw_angle_degrees = 0;
+            self.draw_scale = 1;
+            self.draw_color = null;
             self.syncTextToGraphics();
         } else {
             self.syncTextToGraphics();
@@ -2893,8 +2982,14 @@ pub const Vm = struct {
     }
 
     fn graphicsPset(self: *Vm, flags: u32) ExecutionError!void {
-        if ((flags & ~(bytecode.graphics_point_relative | bytecode.graphics_color_present)) != 0) return error.InvalidInstruction;
-        const color = if ((flags & bytecode.graphics_color_present) != 0) try self.popLong() else self.text.foreground;
+        const allowed = bytecode.graphics_point_relative | bytecode.graphics_color_present | bytecode.graphics_preset_default;
+        if ((flags & ~allowed) != 0) return error.InvalidInstruction;
+        const color = if ((flags & bytecode.graphics_color_present) != 0)
+            try self.popLong()
+        else if ((flags & bytecode.graphics_preset_default) != 0)
+            self.text.background
+        else
+            self.text.foreground;
         const raw = try self.popGraphicsPoint();
         self.syncTextToGraphics();
         const target = self.graphics.resolvePoint(raw.x, raw.y, (flags & bytecode.graphics_point_relative) != 0);
@@ -2903,20 +2998,32 @@ pub const Vm = struct {
 
     fn graphicsLine(self: *Vm, flags: u32) ExecutionError!void {
         const allowed = bytecode.graphics_point_relative | bytecode.graphics_second_point_relative |
-            bytecode.graphics_color_present | (@as(u32, 3) << bytecode.graphics_box_shift);
+            bytecode.graphics_color_present | bytecode.graphics_first_point_omitted |
+            bytecode.graphics_style_present | (@as(u32, 3) << bytecode.graphics_box_shift);
         if ((flags & ~allowed) != 0) return error.InvalidInstruction;
+        if ((flags & bytecode.graphics_first_point_omitted) != 0 and (flags & bytecode.graphics_point_relative) != 0) {
+            return error.InvalidInstruction;
+        }
         const encoded_box = (flags >> bytecode.graphics_box_shift) & 3;
         if (encoded_box > @intFromEnum(bytecode.GraphicsBoxMode.filled_box)) return error.InvalidInstruction;
+        const style: ?u16 = if ((flags & bytecode.graphics_style_present) != 0) blk: {
+            const raw = try self.popLong();
+            if (raw < std.math.minInt(i16) or raw > std.math.maxInt(u16)) return error.IllegalFunctionCall;
+            break :blk @truncate(@as(u32, @bitCast(raw)));
+        } else null;
         const color = if ((flags & bytecode.graphics_color_present) != 0) try self.popLong() else self.text.foreground;
         const raw_second = try self.popGraphicsPoint();
-        const raw_first = try self.popGraphicsPoint();
+        const raw_first = if ((flags & bytecode.graphics_first_point_omitted) == 0) try self.popGraphicsPoint() else null;
         self.syncTextToGraphics();
-        const first = self.graphics.resolvePoint(raw_first.x, raw_first.y, (flags & bytecode.graphics_point_relative) != 0);
+        const first = if (raw_first) |raw|
+            self.graphics.resolvePoint(raw.x, raw.y, (flags & bytecode.graphics_point_relative) != 0)
+        else
+            self.graphics.current;
         const second = if ((flags & bytecode.graphics_second_point_relative) != 0)
             self.graphics.resolveRelativeTo(first, raw_second.x, raw_second.y)
         else
             self.graphics.resolvePoint(raw_second.x, raw_second.y, false);
-        self.graphics.line(first, second, color, @enumFromInt(@as(u8, @intCast(encoded_box)))) catch return error.IllegalFunctionCall;
+        self.graphics.lineStyled(first, second, color, @enumFromInt(@as(u8, @intCast(encoded_box))), style) catch return error.IllegalFunctionCall;
     }
 
     fn graphicsCircle(self: *Vm, flags: u32, optional: u32) ExecutionError!void {
@@ -2943,26 +3050,301 @@ pub const Vm = struct {
     }
 
     fn graphicsPaint(self: *Vm, flags: u32, optional: u32) ExecutionError!void {
-        if ((flags & ~bytecode.graphics_point_relative) != 0) return error.InvalidInstruction;
-        const mask = optional & 0x03;
+        const allowed = bytecode.graphics_point_relative | bytecode.graphics_paint_string;
+        if ((flags & ~allowed) != 0) return error.InvalidInstruction;
+        const mask = optional & 0x07;
         const count = optional >> bytecode.graphics_optional_count_shift;
-        if (@popCount(mask) != count or count > 2) return error.InvalidInstruction;
+        if (@popCount(mask) != count or count > 3) return error.InvalidInstruction;
+        var background_value: ?values.Value = null;
+        defer if (background_value) |*value| value.deinit(self.allocator);
+        if ((mask & 4) != 0) background_value = try self.popValue();
         var border: ?i32 = null;
-        var fill: i32 = self.text.foreground;
         if ((mask & 2) != 0) border = try self.popLong();
-        if ((mask & 1) != 0) fill = try self.popLong();
+        var paint_value: ?values.Value = null;
+        defer if (paint_value) |*value| value.deinit(self.allocator);
+        if ((mask & 1) != 0) paint_value = try self.popValue();
         const raw = try self.popGraphicsPoint();
         self.syncTextToGraphics();
         const target = self.graphics.resolvePoint(raw.x, raw.y, (flags & bytecode.graphics_point_relative) != 0);
-        self.graphics.paint(self.allocator, target, fill, border orelse fill) catch |fault| return switch (fault) {
+        const background: ?[]const u8 = if (background_value) |value| switch (value) {
+            .string => |bytes| bytes,
+            else => return error.TypeMismatch,
+        } else null;
+        const string_paint = (flags & bytecode.graphics_paint_string) != 0;
+        if (string_paint != (paint_value != null and paint_value.? == .string)) return error.InvalidInstruction;
+        const result = if (string_paint)
+            self.graphics.paintTile(self.allocator, target, paint_value.?.string, border, background)
+        else blk: {
+            if (background != null) return error.IllegalFunctionCall;
+            const fill = if (paint_value) |value| try values.asLong(value) else self.text.foreground;
+            break :blk self.graphics.paintSolid(self.allocator, target, fill, border);
+        };
+        result catch |fault| return switch (fault) {
             error.OutOfMemory => error.OutOfMemory,
             error.IllegalFunctionCall => error.IllegalFunctionCall,
         };
     }
 
+    fn graphicsDraw(self: *Vm) ExecutionError!void {
+        var macro = try self.popValue();
+        defer macro.deinit(self.allocator);
+        if (macro != .string) return error.TypeMismatch;
+        try self.executeDrawMacro(macro.string);
+    }
+
+    fn executeDrawMacro(self: *Vm, macro: []const u8) ExecutionError!void {
+        var operations: std.ArrayList(DrawOperation) = .empty;
+        defer operations.deinit(self.allocator);
+        var budget: DrawParseBudget = .{};
+        try self.parseDrawMacroBytes(macro, 0, &budget, &operations);
+        if (operations.items.len == 0) return;
+
+        if (self.graphics.mode == 0 or self.graphics.pixels == null) return error.IllegalFunctionCall;
+        const maximum_attribute = self.graphics.maximumAttribute();
+        for (operations.items) |operation| switch (operation) {
+            .color => |color| if (color < 0 or color > maximum_attribute) return error.IllegalFunctionCall,
+            .paint => |paint| if (paint.fill < 0 or paint.fill > maximum_attribute or
+                paint.border < 0 or paint.border > maximum_attribute) return error.IllegalFunctionCall,
+            else => {},
+        };
+
+        self.syncTextToGraphics();
+        var current = self.graphics.drawOrigin();
+        var angle = self.draw_angle_degrees;
+        var scale = self.draw_scale;
+        var color = self.draw_color orelse self.text.foreground;
+        for (operations.items) |operation| switch (operation) {
+            .color => |next| color = next,
+            .angle => |next| angle = next,
+            .scale => |next| scale = next,
+            .paint => |paint| self.graphics.paintSolid(self.allocator, current, paint.fill, paint.border) catch |fault| return switch (fault) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.IllegalFunctionCall => error.IllegalFunctionCall,
+            },
+            .move => |movement| {
+                const origin = current;
+                const target = if (movement.absolute)
+                    self.graphics.resolvePoint(movement.x, movement.y, false)
+                else
+                    self.graphics.resolveDrawRelative(origin, movement.x, movement.y, angle, scale);
+                if (movement.blank) {
+                    self.graphics.moveCurrent(target);
+                } else {
+                    self.graphics.line(origin, target, color, .line) catch |fault| return switch (fault) {
+                        error.OutOfMemory => error.OutOfMemory,
+                        error.IllegalFunctionCall => error.IllegalFunctionCall,
+                    };
+                }
+                if (movement.restore) {
+                    self.graphics.moveCurrent(origin);
+                    current = origin;
+                } else {
+                    current = target;
+                }
+            },
+        };
+        self.draw_angle_degrees = angle;
+        self.draw_scale = scale;
+        self.draw_color = color;
+    }
+
+    fn parseDrawMacroBytes(
+        self: *Vm,
+        macro: []const u8,
+        depth: usize,
+        budget: *DrawParseBudget,
+        operations: *std.ArrayList(DrawOperation),
+    ) ExecutionError!void {
+        if (depth > maximum_draw_expansion_depth or
+            macro.len > maximum_draw_expansion_bytes -| budget.expanded_bytes)
+        {
+            return error.IllegalFunctionCall;
+        }
+        budget.expanded_bytes += macro.len;
+        var index: usize = 0;
+        while (true) {
+            skipDrawSeparators(macro, &index);
+            if (index == macro.len) return;
+
+            var blank = false;
+            var restore = false;
+            while (index < macro.len) {
+                const prefix = std.ascii.toUpper(macro[index]);
+                if (prefix == 'B') {
+                    if (blank) return error.IllegalFunctionCall;
+                    blank = true;
+                } else if (prefix == 'N') {
+                    if (restore) return error.IllegalFunctionCall;
+                    restore = true;
+                } else break;
+                index += 1;
+                skipDrawSpaces(macro, &index);
+            }
+            if (index == macro.len or !std.ascii.isAlphabetic(macro[index])) return error.IllegalFunctionCall;
+            const command = std.ascii.toUpper(macro[index]);
+            index += 1;
+
+            switch (command) {
+                'U', 'D', 'L', 'R', 'E', 'F', 'G', 'H' => {
+                    const amount = (try self.parseDrawNumber(macro, &index, false)) orelse 1;
+                    const vector = switch (command) {
+                        'U' => .{ @as(f64, 0), -amount },
+                        'D' => .{ @as(f64, 0), amount },
+                        'L' => .{ -amount, @as(f64, 0) },
+                        'R' => .{ amount, @as(f64, 0) },
+                        'E' => .{ amount, -amount },
+                        'F' => .{ amount, amount },
+                        'G' => .{ -amount, amount },
+                        'H' => .{ -amount, -amount },
+                        else => unreachable,
+                    };
+                    try self.appendDrawOperation(budget, operations, .{ .move = .{
+                        .x = vector[0],
+                        .y = vector[1],
+                        .absolute = false,
+                        .blank = blank,
+                        .restore = restore,
+                    } });
+                },
+                'M' => {
+                    skipDrawSpaces(macro, &index);
+                    const relative = index < macro.len and (macro[index] == '+' or macro[index] == '-');
+                    const x = (try self.parseDrawNumber(macro, &index, true)).?;
+                    skipDrawSpaces(macro, &index);
+                    if (index == macro.len or macro[index] != ',') return error.IllegalFunctionCall;
+                    index += 1;
+                    const y = (try self.parseDrawNumber(macro, &index, true)).?;
+                    try self.appendDrawOperation(budget, operations, .{ .move = .{
+                        .x = x,
+                        .y = y,
+                        .absolute = !relative,
+                        .blank = blank,
+                        .restore = restore,
+                    } });
+                },
+                else => {
+                    if (blank or restore) return error.IllegalFunctionCall;
+                    switch (command) {
+                        'A' => {
+                            const quadrant = try self.drawInteger((try self.parseDrawNumber(macro, &index, true)).?);
+                            if (quadrant < 0 or quadrant > 3) return error.IllegalFunctionCall;
+                            try self.appendDrawOperation(budget, operations, .{ .angle = @as(f64, @floatFromInt(quadrant)) * 90.0 });
+                        },
+                        'T' => {
+                            skipDrawSpaces(macro, &index);
+                            if (index == macro.len or std.ascii.toUpper(macro[index]) != 'A') return error.IllegalFunctionCall;
+                            index += 1;
+                            const angle = (try self.parseDrawNumber(macro, &index, true)).?;
+                            if (angle < -360 or angle > 360) return error.IllegalFunctionCall;
+                            try self.appendDrawOperation(budget, operations, .{ .angle = angle });
+                        },
+                        'C' => try self.appendDrawOperation(
+                            budget,
+                            operations,
+                            .{ .color = try self.drawInteger((try self.parseDrawNumber(macro, &index, true)).?) },
+                        ),
+                        'S' => {
+                            const scale = try self.drawInteger((try self.parseDrawNumber(macro, &index, true)).?);
+                            if (scale < 1 or scale > 255) return error.IllegalFunctionCall;
+                            try self.appendDrawOperation(budget, operations, .{
+                                .scale = @as(f64, @floatFromInt(scale)) / 4.0,
+                            });
+                        },
+                        'P' => {
+                            const fill = try self.drawInteger((try self.parseDrawNumber(macro, &index, true)).?);
+                            skipDrawSpaces(macro, &index);
+                            if (index == macro.len or macro[index] != ',') return error.IllegalFunctionCall;
+                            index += 1;
+                            const border = try self.drawInteger((try self.parseDrawNumber(macro, &index, true)).?);
+                            try self.appendDrawOperation(budget, operations, .{ .paint = .{ .fill = fill, .border = border } });
+                        },
+                        'X' => {
+                            const name = try parseDrawVariableName(macro, &index, true);
+                            const value = try self.drawVariableValue(name);
+                            const substring = switch (value.*) {
+                                .string => |bytes| bytes,
+                                else => return error.TypeMismatch,
+                            };
+                            try self.parseDrawMacroBytes(substring, depth + 1, budget, operations);
+                        },
+                        else => return error.IllegalFunctionCall,
+                    }
+                },
+            }
+        }
+    }
+
+    fn appendDrawOperation(
+        self: *Vm,
+        budget: *DrawParseBudget,
+        operations: *std.ArrayList(DrawOperation),
+        operation: DrawOperation,
+    ) ExecutionError!void {
+        if (budget.commands >= maximum_draw_commands) return error.IllegalFunctionCall;
+        try operations.append(self.allocator, operation);
+        budget.commands += 1;
+    }
+
+    fn parseDrawNumber(self: *Vm, macro: []const u8, index: *usize, required: bool) ExecutionError!?f64 {
+        skipDrawSpaces(macro, index);
+        const start = index.*;
+        var sign: f64 = 1;
+        if (index.* < macro.len and (macro[index.*] == '+' or macro[index.*] == '-')) {
+            if (macro[index.*] == '-') sign = -1;
+            index.* += 1;
+            skipDrawSpaces(macro, index);
+        }
+        if (index.* < macro.len and macro[index.*] == '=') {
+            index.* += 1;
+            const name = try parseDrawVariableName(macro, index, false);
+            const value = try self.drawVariableValue(name);
+            const number = try values.asDouble(value.*);
+            if (!std.math.isFinite(number)) return error.IllegalFunctionCall;
+            return sign * number;
+        }
+        const digits_start = index.*;
+        while (index.* < macro.len and std.ascii.isDigit(macro[index.*])) index.* += 1;
+        if (index.* == digits_start) {
+            index.* = start;
+            if (required) return error.IllegalFunctionCall;
+            return null;
+        }
+        const magnitude = std.fmt.parseInt(u64, macro[digits_start..index.*], 10) catch return error.IllegalFunctionCall;
+        if (magnitude > 9_007_199_254_740_992) return error.IllegalFunctionCall;
+        return sign * @as(f64, @floatFromInt(magnitude));
+    }
+
+    fn drawInteger(_: *Vm, number: f64) ExecutionError!i32 {
+        if (!std.math.isFinite(number)) return error.IllegalFunctionCall;
+        return values.asLong(.{ .double = number }) catch return error.IllegalFunctionCall;
+    }
+
+    fn drawVariableValue(self: *Vm, name: []const u8) ExecutionError!*const values.Value {
+        if (self.frames.items.len != 0) {
+            const frame_index = self.frames.items.len - 1;
+            const procedure = self.program.procedures[self.frames.items[frame_index].procedure_id];
+            for (procedure.locals, 0..) |variable, local_index| {
+                if (variable.hidden or !std.ascii.eqlIgnoreCase(variable.name.bytes(self.program.source), name)) continue;
+                const cell = if (variable.backing_global_index != bytecode.invalid_index)
+                    &self.globals[variable.backing_global_index]
+                else
+                    try self.frameLocalCell(frame_index, @intCast(local_index));
+                return scalarAt(cell);
+            }
+        }
+        for (self.program.globals, 0..) |variable, global_index| {
+            if (variable.hidden or !std.ascii.eqlIgnoreCase(variable.name.bytes(self.program.source), name)) continue;
+            return scalarAt(&self.globals[global_index]);
+        }
+        return error.IllegalFunctionCall;
+    }
+
     fn graphicsGet(self: *Vm, flags: u32) ExecutionError!void {
-        if ((flags & ~(bytecode.graphics_point_relative | bytecode.graphics_second_point_relative)) != 0) return error.InvalidInstruction;
-        const array = try self.popArrayReference();
+        const allowed = bytecode.graphics_point_relative | bytecode.graphics_second_point_relative |
+            bytecode.graphics_array_indices_mask;
+        if ((flags & ~allowed) != 0) return error.InvalidInstruction;
+        const indices = (flags & bytecode.graphics_array_indices_mask) >> bytecode.graphics_array_indices_shift;
+        const slice = try self.popGraphicsArraySlice(indices);
         const raw_second = try self.popGraphicsPoint();
         const raw_first = try self.popGraphicsPoint();
         self.syncTextToGraphics();
@@ -2971,7 +3353,7 @@ pub const Vm = struct {
             self.graphics.resolveRelativeTo(first, raw_second.x, raw_second.y)
         else
             self.graphics.resolvePoint(raw_second.x, raw_second.y, false);
-        const bytes = try arrayRawBytes(array);
+        const bytes = (try arrayRawBytes(slice.array))[slice.first_byte..];
         _ = self.graphics.captureInto(first, second, bytes) catch |fault| return switch (fault) {
             error.OutOfMemory => error.OutOfMemory,
             error.IllegalFunctionCall => error.IllegalFunctionCall,
@@ -2979,14 +3361,16 @@ pub const Vm = struct {
     }
 
     fn graphicsPut(self: *Vm, flags: u32, encoded_action: u32) ExecutionError!void {
-        if ((flags & ~bytecode.graphics_point_relative) != 0 or encoded_action > @intFromEnum(bytecode.GraphicsPutAction.xor)) {
+        const allowed = bytecode.graphics_point_relative | bytecode.graphics_array_indices_mask;
+        if ((flags & ~allowed) != 0 or encoded_action > @intFromEnum(bytecode.GraphicsPutAction.xor)) {
             return error.InvalidInstruction;
         }
-        const array = try self.popArrayReference();
+        const indices = (flags & bytecode.graphics_array_indices_mask) >> bytecode.graphics_array_indices_shift;
+        const slice = try self.popGraphicsArraySlice(indices);
         const raw = try self.popGraphicsPoint();
         self.syncTextToGraphics();
         const target = self.graphics.resolvePoint(raw.x, raw.y, (flags & bytecode.graphics_point_relative) != 0);
-        const bytes = try arrayRawBytesConst(array);
+        const bytes = (try arrayRawBytesConst(slice.array))[slice.first_byte..];
         self.graphics.put(target, bytes, @enumFromInt(@as(u8, @intCast(encoded_action)))) catch return error.IllegalFunctionCall;
     }
 
@@ -3002,6 +3386,40 @@ pub const Vm = struct {
             .array => |*array| if (array.record_type == bytecode.invalid_index and array.value_type.isNumeric()) array else error.TypeMismatch,
             else => error.TypeMismatch,
         };
+    }
+
+    const GraphicsArraySlice = struct {
+        array: *ArrayValue,
+        first_byte: usize,
+    };
+
+    fn popGraphicsArraySlice(self: *Vm, index_count: u32) ExecutionError!GraphicsArraySlice {
+        if (index_count > 60) return error.InvalidInstruction;
+        var indices: [60]i32 = undefined;
+        var remaining: usize = @intCast(index_count);
+        while (remaining != 0) {
+            remaining -= 1;
+            indices[remaining] = try self.popLong();
+        }
+        const array = try self.popArrayReference();
+        const element_offset: usize = if (index_count == 0)
+            0
+        else blk: {
+            if (array.dimensions.len != index_count) return error.SubscriptOutOfRange;
+            var offset: usize = 0;
+            for (array.dimensions, indices[0..index_count]) |dimension, index| {
+                if (index < dimension.lower or index > dimension.upper) return error.SubscriptOutOfRange;
+                offset += @as(usize, @intCast(index - dimension.lower)) * dimension.stride;
+            }
+            break :blk offset;
+        };
+        const element_bytes: usize = switch (array.value_type) {
+            .integer => @sizeOf(i16),
+            .long, .single => @sizeOf(i32),
+            .double => @sizeOf(f64),
+            .string => return error.TypeMismatch,
+        };
+        return .{ .array = array, .first_byte = element_offset * element_bytes };
     }
 
     fn syncTextToGraphics(self: *Vm) void {
@@ -4256,6 +4674,213 @@ pub const Vm = struct {
         self.discardStackFrom(completed_base);
     }
 
+    fn memoryImageTransfer(self: *Vm, instruction_index: u32, write: bool, flags: u32) ExecutionError!void {
+        if ((flags & ~bytecode.memory_image_offset_present) != 0 or
+            (write and flags != 0)) return error.InvalidInstruction;
+        const argument_count: usize = if (write) 3 else 1 + @as(usize, @intFromBool((flags & bytecode.memory_image_offset_present) != 0));
+        if (self.stack.items.len < argument_count) return error.StackUnderflow;
+        const stack_base = self.stack.items.len - argument_count;
+
+        if (self.pending_memory_image == null) {
+            const raw_path_value = try self.stackValueAt(stack_base);
+            const raw_path = switch (raw_path_value) {
+                .string => |bytes| bytes,
+                else => return error.TypeMismatch,
+            };
+            const path = try self.resolveGuestPath(raw_path);
+            var pending = PendingMemoryImage{
+                .instruction = instruction_index,
+                .write = write,
+                .flags = flags,
+                .path = path,
+                .stack_base = stack_base,
+                .target_segment = self.compatibility_segment,
+                .target_offset = 0,
+            };
+            errdefer pending.deinit(self.allocator);
+            if (write) {
+                pending.target_offset = try unsignedWord(try values.asLong(try self.stackValueAt(stack_base + 1)));
+                const raw_length = try values.asLong(try self.stackValueAt(stack_base + 2));
+                if (raw_length < 0 or raw_length > maximum_memory_image_payload_bytes) return error.IllegalFunctionCall;
+                const payload_length: usize = @intCast(raw_length);
+                pending.buffer = try self.allocator.alloc(u8, memory_image_header_bytes + payload_length);
+                pending.file_size_known = true;
+                pending.buffer[0] = 0xFD;
+                std.mem.writeInt(u16, pending.buffer[1..3], pending.target_segment, .little);
+                std.mem.writeInt(u16, pending.buffer[3..5], pending.target_offset, .little);
+                std.mem.writeInt(u16, pending.buffer[5..7], @intCast(payload_length), .little);
+                try self.readGuestMemoryRange(
+                    pending.target_segment,
+                    pending.target_offset,
+                    pending.buffer[memory_image_header_bytes..],
+                );
+            } else if ((flags & bytecode.memory_image_offset_present) != 0) {
+                pending.target_offset = try unsignedWord(try values.asLong(try self.stackValueAt(stack_base + 1)));
+            }
+            self.pending_memory_image = pending;
+        } else {
+            const pending = self.pending_memory_image.?;
+            if (pending.instruction != instruction_index or pending.write != write or pending.flags != flags) {
+                return error.InvalidInstruction;
+            }
+            self.pending_memory_image.?.stack_base = stack_base;
+        }
+
+        var pending = &self.pending_memory_image.?;
+        if (!write and !pending.file_size_known) {
+            switch (self.host.file_info(self.fileHostContext(), pending.path)) {
+                .info => |info| {
+                    if (info.size < memory_image_header_bytes or info.size > maximum_memory_image_file_bytes) {
+                        self.discardPendingMemoryImage();
+                        return error.PathFileAccess;
+                    }
+                    pending.buffer = self.allocator.alloc(u8, info.size) catch {
+                        self.discardPendingMemoryImage();
+                        return error.OutOfMemory;
+                    };
+                    pending.file_size_known = true;
+                },
+                .missing => {
+                    self.discardPendingMemoryImage();
+                    return error.FileNotFound;
+                },
+                .pending => {
+                    self.file_io_waits +%= 1;
+                    self.scheduleFilePoll();
+                    return error.WouldBlock;
+                },
+                .failure => |failure| {
+                    self.discardPendingMemoryImage();
+                    return fileHostFault(failure);
+                },
+            }
+            pending = &self.pending_memory_image.?;
+        }
+
+        if (pending.transferred < pending.buffer.len) {
+            const first = pending.transferred;
+            const request = @min(sequential_file_transfer_bytes, pending.buffer.len - first);
+            if (write) {
+                switch (self.host.file_write(
+                    self.fileHostContext(),
+                    pending.path,
+                    pending.buffer[first .. first + request],
+                    first != 0,
+                )) {
+                    .bytes => |raw_count| {
+                        const count: usize = @intCast(raw_count);
+                        if (count == 0 or count > request) {
+                            self.discardPendingMemoryImage();
+                            return error.PathFileAccess;
+                        }
+                        pending.transferred += count;
+                    },
+                    .pending => {
+                        self.file_io_waits +%= 1;
+                        self.scheduleFilePoll();
+                        return error.WouldBlock;
+                    },
+                    .failure => |failure| {
+                        self.discardPendingMemoryImage();
+                        return fileHostFault(failure);
+                    },
+                }
+            } else switch (self.host.file_read(
+                self.fileHostContext(),
+                pending.path,
+                @intCast(first),
+                pending.buffer[first .. first + request],
+            )) {
+                .bytes => |raw_count| {
+                    const count: usize = @intCast(raw_count);
+                    if (count == 0 or count > request) {
+                        self.discardPendingMemoryImage();
+                        return error.PathFileAccess;
+                    }
+                    pending.transferred += count;
+                },
+                .end => {
+                    self.discardPendingMemoryImage();
+                    return error.PathFileAccess;
+                },
+                .pending => {
+                    self.file_io_waits +%= 1;
+                    self.scheduleFilePoll();
+                    return error.WouldBlock;
+                },
+                .failure => |failure| {
+                    self.discardPendingMemoryImage();
+                    return fileHostFault(failure);
+                },
+            }
+            if (pending.transferred != pending.buffer.len) {
+                self.scheduleFilePoll();
+                return error.WouldBlock;
+            }
+        }
+
+        if (!write) {
+            const buffer = pending.buffer;
+            if (buffer[0] != 0xFD) {
+                self.discardPendingMemoryImage();
+                return error.PathFileAccess;
+            }
+            const saved_segment = std.mem.readInt(u16, buffer[1..3], .little);
+            const saved_offset = std.mem.readInt(u16, buffer[3..5], .little);
+            const payload_length: usize = std.mem.readInt(u16, buffer[5..7], .little);
+            const expected = memory_image_header_bytes + payload_length;
+            if (!validMemoryImageLength(buffer, expected)) {
+                self.discardPendingMemoryImage();
+                return error.PathFileAccess;
+            }
+            const target_segment = if ((flags & bytecode.memory_image_offset_present) != 0)
+                pending.target_segment
+            else
+                saved_segment;
+            const target_offset = if ((flags & bytecode.memory_image_offset_present) != 0)
+                pending.target_offset
+            else
+                saved_offset;
+            self.writeGuestMemoryRange(target_segment, target_offset, buffer[memory_image_header_bytes..expected]) catch |fault| {
+                self.discardPendingMemoryImage();
+                return fault;
+            };
+        }
+        const completed_base = pending.stack_base;
+        self.discardPendingMemoryImage();
+        self.discardStackFrom(completed_base);
+    }
+
+    fn readGuestMemoryRange(self: *Vm, segment: u16, offset: u16, out: []u8) ExecutionError!void {
+        if (self.graphics.videoSegment()) |video_segment| if (segment == video_segment) {
+            self.syncTextToGraphics();
+            self.graphics.readPackedRange(offset, out) catch return error.IllegalFunctionCall;
+            return;
+        };
+        const first = try guestLinearRange(segment, offset, out.len);
+        const memory = try self.ensureGuestMemory();
+        @memcpy(out, memory[first .. first + out.len]);
+    }
+
+    fn writeGuestMemoryRange(self: *Vm, segment: u16, offset: u16, bytes: []const u8) ExecutionError!void {
+        if (self.graphics.videoSegment()) |video_segment| if (segment == video_segment) {
+            self.graphics.writePackedRange(offset, bytes) catch return error.IllegalFunctionCall;
+            return;
+        };
+        const first = try guestLinearRange(segment, offset, bytes.len);
+        const memory = try self.ensureGuestMemory();
+        @memcpy(memory[first .. first + bytes.len], bytes);
+    }
+
+    fn ensureGuestMemory(self: *Vm) ExecutionError![]u8 {
+        if (self.guest_memory == null) {
+            const memory = try self.allocator.alloc(u8, maximum_guest_linear_bytes);
+            @memset(memory, 0);
+            self.guest_memory = memory;
+        }
+        return self.guest_memory.?;
+    }
+
     fn bindFileFields(self: *Vm, count: u32) ExecutionError!void {
         if (count == 0) return error.InvalidInstruction;
         const argument_count = 1 + @as(usize, count) * 2;
@@ -4405,6 +5030,11 @@ pub const Vm = struct {
     fn discardPendingFileTransfer(self: *Vm) void {
         if (self.pending_file_transfer) |*pending| pending.deinit(self.allocator);
         self.pending_file_transfer = null;
+    }
+
+    fn discardPendingMemoryImage(self: *Vm) void {
+        if (self.pending_memory_image) |*pending| pending.deinit(self.allocator);
+        self.pending_memory_image = null;
     }
 
     fn hasFieldBindings(self: *const Vm, generation: u64) bool {
@@ -6242,6 +6872,66 @@ pub const Vm = struct {
         };
     }
 };
+
+fn skipDrawSpaces(macro: []const u8, index: *usize) void {
+    while (index.* < macro.len and (macro[index.*] == ' ' or macro[index.*] == '\t' or
+        macro[index.*] == '\r' or macro[index.*] == '\n'))
+    {
+        index.* += 1;
+    }
+}
+
+fn unsignedWord(value: i32) ExecutionError!u16 {
+    if (value >= 0 and value <= std.math.maxInt(u16)) return @intCast(value);
+    if (value >= std.math.minInt(i16) and value < 0) return @bitCast(@as(i16, @intCast(value)));
+    return error.IllegalFunctionCall;
+}
+
+fn guestLinearRange(segment: u16, offset: u16, length: usize) ExecutionError!usize {
+    const first = @as(usize, segment) * 16 + @as(usize, offset);
+    if (first > maximum_guest_linear_bytes or length > maximum_guest_linear_bytes - first) {
+        return error.IllegalFunctionCall;
+    }
+    return first;
+}
+
+fn validMemoryImageLength(buffer: []const u8, expected: usize) bool {
+    if (expected > buffer.len) return false;
+    const trailing = buffer.len - expected;
+    if (trailing == 0) return true;
+    if (trailing == 1) return buffer[expected] == 0x1A;
+    return trailing == 8 and
+        std.mem.eql(u8, buffer[0..memory_image_header_bytes], buffer[expected .. expected + memory_image_header_bytes]) and
+        buffer[buffer.len - 1] == 0x1A;
+}
+
+fn skipDrawSeparators(macro: []const u8, index: *usize) void {
+    while (true) {
+        skipDrawSpaces(macro, index);
+        if (index.* == macro.len or macro[index.*] != ';') return;
+        index.* += 1;
+    }
+}
+
+fn parseDrawVariableName(macro: []const u8, index: *usize, _: bool) ExecutionError![]const u8 {
+    skipDrawSpaces(macro, index);
+    if (index.* < macro.len and macro[index.*] == '=') {
+        index.* += 1;
+        skipDrawSpaces(macro, index);
+    }
+    const start = index.*;
+    if (start == macro.len or !std.ascii.isAlphabetic(macro[start])) return error.IllegalFunctionCall;
+    index.* += 1;
+    while (index.* < macro.len and std.ascii.isAlphanumeric(macro[index.*])) index.* += 1;
+    if (index.* < macro.len and (macro[index.*] == '$' or macro[index.*] == '%' or
+        macro[index.*] == '&' or macro[index.*] == '!' or macro[index.*] == '#'))
+    {
+        index.* += 1;
+    }
+    const name = macro[start..index.*];
+    if (name.len > frontend.maximum_identifier_bytes + 1) return error.IllegalFunctionCall;
+    return name;
+}
 
 const UsingFieldKind = enum {
     first_character,

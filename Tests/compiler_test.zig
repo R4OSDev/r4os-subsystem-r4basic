@@ -1890,6 +1890,122 @@ test "QBasic graphics execute on isolated indexed guest screens" {
     try std.testing.expectEqualSlices(u8, first_view.pixels, second_view.pixels);
 }
 
+test "DRAW executes the complete bounded macro language and rejects invalid macros atomically" {
+    const source =
+        \\DEFINT A-Z
+        \\SCREEN 13
+        \\Distance = 5
+        \\Part$ = "C7L=Distance"
+        \\DRAW "C3R5"
+        \\First = POINT(165,100)
+        \\DRAW "BR5"
+        \\Blank = POINT(170,100)
+        \\DRAW "NU5"
+        \\Vertical = POINT(170,95)
+        \\DRAW "D5"
+        \\Returned = POINT(170,105)
+        \\DRAW "XPart$"
+        \\Expanded = POINT(165,105)
+        \\DRAW "A1NR3"
+        \\Rotated = POINT(165,103)
+        \\DRAW "A0S8R2"
+        \\Scaled = POINT(169,105)
+        \\DRAW "R"
+        \\PersistentScale = POINT(171,105)
+        \\DRAW "S4R2"
+        \\UnitScale = POINT(173,105)
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "draw-complete.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(1024, 64));
+    try expectInteger(&machine, "First", 3);
+    try expectInteger(&machine, "Blank", 0);
+    try expectInteger(&machine, "Vertical", 3);
+    try expectInteger(&machine, "Returned", 3);
+    try expectInteger(&machine, "Expanded", 7);
+    try expectInteger(&machine, "Rotated", 7);
+    try expectInteger(&machine, "Scaled", 7);
+    try expectInteger(&machine, "PersistentScale", 7);
+    try expectInteger(&machine, "UnitScale", 7);
+
+    const invalid_sources = [_][]const u8{
+        "SCREEN 13\nDRAW \"R5Q\"\nEND\n",
+        "SCREEN 13\nA$ = \"XA$\"\nDRAW \"XA$\"\nEND\n",
+    };
+    for (invalid_sources) |invalid_source| {
+        var invalid_program = try core.compiler.compile(std.testing.allocator, "draw-invalid.bas", invalid_source);
+        defer invalid_program.deinit();
+        try expectProgramOk(&invalid_program);
+        var invalid = try core.vm.Vm.init(std.testing.allocator, &invalid_program, .{});
+        defer invalid.deinit();
+        try std.testing.expectEqual(core.vm.Status.runtime_error, invalid.runToCompletion(1024, 64));
+        try std.testing.expectEqual(core.vm.RuntimeCode.illegal_function_call, invalid.runtime_diagnostic.?.code);
+        try std.testing.expectEqual(@as(?i32, 0), invalid.graphicsPoint(165, 100));
+    }
+}
+
+test "graphics GET and PUT address every numeric array representation beyond 64 KiB" {
+    const source =
+        \\DEFINT A-Z
+        \\DIM ImageI%(0 TO 4)
+        \\DIM ImageL&(0 TO 2)
+        \\DIM ImageS!(0 TO 2)
+        \\DIM ImageD#(0 TO 1)
+        \\DIM FarImage%(0 TO 200,0 TO 200)
+        \\SCREEN 13
+        \\PSET (0,0),7
+        \\PSET (1,0),8
+        \\GET (0,0)-(1,0), ImageI%(2)
+        \\GET (0,0)-(1,0), ImageL&(1)
+        \\GET (0,0)-(1,0), ImageS!(1)
+        \\GET (0,0)-(1,0), ImageD#(1)
+        \\GET (0,0)-(1,0), FarImage%(199,199)
+        \\PSET (5,5),9
+        \\PRESET (5,5)
+        \\PresetDefault = POINT(5,5)
+        \\PSET (5,6),9
+        \\PRESET STEP (1,0),4
+        \\PresetStep = POINT(6,6)
+        \\PSET (60,10),1
+        \\LINE -STEP (3,0),2,,&HA000
+        \\StyleOn = POINT(62,10)
+        \\StyleOff = POINT(63,10)
+        \\LINE -STEP (1,1),3
+        \\OmittedStep = POINT(64,11)
+        \\PUT (10,0), ImageI%(2), PSET
+        \\PUT (20,0), ImageL&(1), PSET
+        \\PUT (30,0), ImageS!(1), PSET
+        \\PUT (40,0), ImageD#(1), PSET
+        \\PUT (50,0), FarImage%(199,199), PSET
+        \\IntegerPixel = POINT(11,0)
+        \\LongPixel = POINT(21,0)
+        \\SinglePixel = POINT(31,0)
+        \\DoublePixel = POINT(41,0)
+        \\FarPixel = POINT(51,0)
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "graphics-array-types.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(1024, 64));
+    try expectInteger(&machine, "IntegerPixel", 8);
+    try expectInteger(&machine, "LongPixel", 8);
+    try expectInteger(&machine, "SinglePixel", 8);
+    try expectInteger(&machine, "DoublePixel", 8);
+    try expectInteger(&machine, "FarPixel", 8);
+    try expectInteger(&machine, "PresetDefault", 0);
+    try expectInteger(&machine, "PresetStep", 4);
+    try expectInteger(&machine, "StyleOn", 2);
+    try expectInteger(&machine, "StyleOff", 0);
+    try expectInteger(&machine, "OmittedStep", 3);
+}
+
 test "SCREEN pages VIEW WINDOW PMAP and PALETTE USING share one coherent raster" {
     const source =
         \\DEFINT A-Z
@@ -1936,10 +2052,10 @@ test "SCREEN pages VIEW WINDOW PMAP and PALETTE USING share one coherent raster"
     try expectInteger(&machine, "Shown", 4);
     try expectInteger(&machine, "Copied", 4);
     try expectInteger(&machine, "Mapped", 3);
-    try expectSingle(&machine, "MapX!", 60);
-    try expectSingle(&machine, "MapY!", 60);
-    try expectSingle(&machine, "PhysX!", 60);
-    try expectSingle(&machine, "PhysY!", 60);
+    try expectSingle(&machine, "MapX!", 50);
+    try expectSingle(&machine, "MapY!", 50);
+    try expectSingle(&machine, "PhysX!", 50);
+    try expectSingle(&machine, "PhysY!", 50);
     try expectSingle(&machine, "LogicX!", 5);
     try expectSingle(&machine, "LogicY!", 5);
     try expectInteger(&machine, "LastRow", 43);
@@ -2037,7 +2153,6 @@ test "DEF SEG PEEK and POKE expose only the private NumLock byte" {
     const invalid_sources = [_][]const u8{
         "DEFINT A-Z\nDEF SEG = 0\nValue = PEEK(1046)\nEND\n",
         "DEFINT A-Z\nValue = PEEK(1047)\nEND\n",
-        "DEFINT A-Z\nDEF SEG = 1\nEND\n",
     };
     for (invalid_sources) |source| {
         var invalid_program = try core.compiler.compile(std.testing.allocator, "restricted-memory.bas", source);
@@ -2049,6 +2164,17 @@ test "DEF SEG PEEK and POKE expose only the private NumLock byte" {
         try std.testing.expectEqual(core.vm.RuntimeCode.restricted_memory, invalid.runtime_diagnostic.?.code);
         try std.testing.expectEqual(@as(i32, 5), invalid.exit_code);
     }
+
+    var segment_program = try core.compiler.compile(
+        std.testing.allocator,
+        "private-segment.bas",
+        "DEF SEG = 1\nDEF SEG\nEND\n",
+    );
+    defer segment_program.deinit();
+    try expectProgramOk(&segment_program);
+    var segment_machine = try core.vm.Vm.init(std.testing.allocator, &segment_program, .{});
+    defer segment_machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, segment_machine.runToCompletion(16, 8));
 }
 
 test "instruction slices cancellation and two instances remain independent" {
@@ -3356,6 +3482,71 @@ const RandomFiles = struct {
     }
 };
 
+const MemoryImageFiles = struct {
+    const count = 7;
+    paths: [count][]const u8 = .{
+        "C:\\GAMES\\seed.bsv",
+        "C:\\GAMES\\copy.bsv",
+        "C:\\GAMES\\copy2.bsv",
+        "C:\\GAMES\\gfx.bsv",
+        "C:\\GAMES\\basica.bsv",
+        "C:\\GAMES\\gwbasic.bsv",
+        "C:\\GAMES\\malformed.bsv",
+    },
+    data: [count]std.ArrayList(u8) = .{ .empty, .empty, .empty, .empty, .empty, .empty, .empty },
+    exists: [count]bool = .{ false, false, false, false, false, false, false },
+    ready: bool = false,
+    maximum_transfer: usize = 1,
+
+    fn deinit(self: *@This()) void {
+        for (&self.data) |*bytes| bytes.deinit(std.testing.allocator);
+    }
+
+    fn findIndex(self: *const @This(), path: []const u8) ?usize {
+        for (self.paths, 0..) |candidate, file_index| if (std.ascii.eqlIgnoreCase(candidate, path)) return file_index;
+        return null;
+    }
+
+    fn waitOnce(self: *@This()) bool {
+        if (!self.ready) {
+            self.ready = true;
+            return true;
+        }
+        self.ready = false;
+        return false;
+    }
+
+    fn info(context: ?*anyopaque, path: []const u8) core.vm.FileInfoResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        const index = self.findIndex(path) orelse return .{ .failure = .path_not_found };
+        if (self.waitOnce()) return .pending;
+        if (!self.exists[index]) return .missing;
+        return .{ .info = .{ .size = @intCast(self.data[index].items.len) } };
+    }
+
+    fn read(context: ?*anyopaque, path: []const u8, offset: u32, out: []u8) core.vm.FileReadResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        const index = self.findIndex(path) orelse return .{ .failure = .path_not_found };
+        if (!self.exists[index]) return .{ .failure = .not_found };
+        if (self.waitOnce()) return .pending;
+        if (offset >= self.data[index].items.len) return .end;
+        const amount = @min(out.len, self.maximum_transfer, self.data[index].items.len - offset);
+        @memcpy(out[0..amount], self.data[index].items[offset..][0..amount]);
+        return .{ .bytes = @intCast(amount) };
+    }
+
+    fn write(context: ?*anyopaque, path: []const u8, bytes: []const u8, append: bool) core.vm.FileWriteResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        const index = self.findIndex(path) orelse return .{ .failure = .path_not_found };
+        if (self.waitOnce()) return .pending;
+        if (!append) self.data[index].clearRetainingCapacity();
+        self.exists[index] = true;
+        const amount = @min(bytes.len, self.maximum_transfer);
+        self.data[index].appendSlice(std.testing.allocator, bytes[0..amount]) catch return .{ .failure = .disk_full };
+        return .{ .bytes = @intCast(amount) };
+    }
+};
+
 const PlatformHost = struct {
     const Entry = struct {
         path: []const u8,
@@ -3863,6 +4054,76 @@ test "RANDOM BINARY FIELD GET PUT SEEK metadata and locks preserve partial trans
     try expectString(&machine, "LoadedName$", "OK  ");
     try std.testing.expect(files.lock_calls >= 2);
     try std.testing.expectEqual(@as(usize, 0), machine.openFileCount());
+}
+
+test "BLOAD and BSAVE asynchronously round trip private segments and packed video buffers" {
+    const source =
+        \\DEFINT A-Z
+        \\BLOAD "seed.bsv"
+        \\BLOAD "basica.bsv"
+        \\BLOAD "gwbasic.bsv"
+        \\ON ERROR GOTO BadImage
+        \\BLOAD "malformed.bsv"
+        \\AfterBadImage:
+        \\ON ERROR GOTO 0
+        \\DEF SEG = &H1234
+        \\BSAVE "copy.bsv",16,6
+        \\BLOAD "copy.bsv",32
+        \\BSAVE "copy2.bsv",32,6
+        \\SCREEN 13
+        \\PSET (0,0),7
+        \\PSET (1,0),8
+        \\DEF SEG = &HA000
+        \\BSAVE "gfx.bsv",0,2
+        \\PSET (0,0),0
+        \\PSET (1,0),0
+        \\BLOAD "gfx.bsv",0
+        \\LoadedFirst = POINT(0,0)
+        \\LoadedSecond = POINT(1,0)
+        \\DEF SEG
+        \\END
+        \\BadImage:
+        \\BadImageError = ERR
+        \\RESUME NEXT
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\MEMORY.BAS", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+
+    var files: MemoryImageFiles = .{};
+    defer files.deinit();
+    const seed = [_]u8{ 0xFD, 0x34, 0x12, 16, 0, 4, 0, 1, 2, 0xFD, 0xFE };
+    try files.data[0].appendSlice(std.testing.allocator, seed[0..]);
+    files.exists[0] = true;
+    const basica = [_]u8{ 0xFD, 0x34, 0x12, 20, 0, 1, 0, 0xA1, 0x1A };
+    try files.data[4].appendSlice(std.testing.allocator, basica[0..]);
+    files.exists[4] = true;
+    const gwbasic = [_]u8{ 0xFD, 0x34, 0x12, 21, 0, 1, 0, 0xB2, 0xFD, 0x34, 0x12, 21, 0, 1, 0, 0x1A };
+    try files.data[5].appendSlice(std.testing.allocator, gwbasic[0..]);
+    files.exists[5] = true;
+    const malformed = [_]u8{ 0xFD, 0x34, 0x12, 16, 0, 4, 0, 0x99 };
+    try files.data[6].appendSlice(std.testing.allocator, malformed[0..]);
+    files.exists[6] = true;
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{
+        .file_context = &files,
+        .file_read = MemoryImageFiles.read,
+        .file_write = MemoryImageFiles.write,
+        .file_info = MemoryImageFiles.info,
+    });
+    defer machine.deinit();
+    try std.testing.expect((try runFileIoCooperatively(&machine, 4096)) > 0);
+    try expectInteger(&machine, "LoadedFirst", 7);
+    try expectInteger(&machine, "LoadedSecond", 8);
+    try expectInteger(&machine, "BadImageError", 75);
+    try std.testing.expectEqual(@as(?u8, 1), machine.guestMemoryByte(0x1234, 16));
+    try std.testing.expectEqual(@as(?u8, 0xA1), machine.guestMemoryByte(0x1234, 20));
+    try std.testing.expectEqual(@as(?u8, 0xB2), machine.guestMemoryByte(0x1234, 21));
+    try std.testing.expectEqual(@as(?u8, 0xB2), machine.guestMemoryByte(0x1234, 37));
+
+    const expected_private = [_]u8{ 0xFD, 0x34, 0x12, 16, 0, 6, 0, 1, 2, 0xFD, 0xFE, 0xA1, 0xB2 };
+    try std.testing.expectEqualSlices(u8, expected_private[0..], files.data[1].items);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 0xFD, 0xFE, 0xA1, 0xB2 }, files.data[2].items[7..]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xFD, 0x00, 0xA0, 0, 0, 2, 0, 7, 8 }, files.data[3].items);
 }
 
 test "BINARY whole-array transfers cross the exact 64 KiB boundary resumably" {

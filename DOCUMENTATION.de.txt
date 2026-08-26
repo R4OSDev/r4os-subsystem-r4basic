@@ -6,7 +6,7 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.70.10
+Stand 0.70.11
 ------------
 
 Diese Ausbaustufe ergaenzt das Vertragsfundament des produktiven R4BASIC-v2-
@@ -39,6 +39,12 @@ Seitengroessen, Standardpaletten und Seitenlimits. APAGE/VPAGE, PCOPY,
 PALETTE USING, alle POINT-Formen sowie VIEW/WINDOW/PMAP teilen sich
 seitenlokalen Zustand, einen reversiblen Koordinatenvertrag und die bestehende
 begrenzte Indexed8-/Damage-Praesentation.
+0.70.11 vervollstaendigt darauf alle Grafikprimitive und Bilddatenpfade:
+PSET/PRESET, gestylte Linien und Boxen, Kreise/Ellipsen/Arcs, Solid- und
+Tile-PAINT, die begrenzte DRAW-Makrosprache sowie GET/PUT in jedem Modus,
+jedem numerischen Arraytyp und allen fuenf Aktionsarten. BLOAD/BSAVE arbeitet
+asynchron auf privaten Gastsegmenten und dem modusgerecht gepackten aktiven
+Videosegment; kein Gastzeiger erreicht Host- oder R4OS-Speicher.
 Explorer uebergibt eine absolute BAS-Datei ueber `R4SUBSYS1`; das R4X liest
 sie und relative `$INCLUDE`-Quellen durch die Storage-Fassade jeweils exakt
 einmal, baut daraus einen begrenzten Quellgraphen und fuehrt eine getrennte VM in
@@ -299,11 +305,25 @@ dadurch echt. BEEP und PLAY sind dagegen echte Bytecodeoperationen. Eine
 ungueltige MML-Sequenz erzeugt BASIC-Fehler 5, ohne Warteschlange oder
 persistente Musikparameter teilweise zu veraendern.
 
-DEF SEG = 0 schaltet ausschliesslich ein privates Byte an Offset 1047 frei.
-PEEK und POKE koennen damit das von GORILLA.BAS verwendete NumLock-Bit lesen
-und setzen. DEF SEG ohne Wert schliesst den Zugriff. Jeder andere Offset oder
-jedes andere Segment ist ein BASIC-Laufzeitfehler; R4OS- und Hostspeicher
-sind strukturell unerreichbar.
+DEF SEG waehlt jedes unsigned 16-Bit-Real-Mode-Gastsegment; ohne Wert wird
+wieder Segment 0 gewaehlt. BLOAD und BSAVE adressieren damit einen erst bei
+Bedarf angelegten, nullinitialisierten und pro VM getrennten Gastadressraum.
+Die aktiven Videosegmente A000 beziehungsweise B800 bilden ausschliesslich
+die aktuelle, nach QuickBASIC-Regeln gepackte Grafikseite ab. Ein
+Segment:Offset-Wert kann niemals zum R4OS- oder Hostzeiger werden.
+
+PEEK und POKE bleiben bis zur privaten Fremdcode-Gastmaschine in 0.70.13
+bewusst enger: Nur Segment 0 und Offset 1047 geben das von GORILLA.BAS
+verwendete private NumLock-Bit frei. Jeder andere Zugriff liefert den
+begrenzten Speicherfehler.
+
+BSAVE schreibt 0xFD, Segment, Offset und Laenge als sieben Byte grossen
+Little-Endian-Header sowie exakt den angeforderten Bereich. BLOAD akzeptiert
+diese QuickBASIC-Form, einen BASICA-CTRL-Z-Trailer und den GW-BASIC-Trailer
+aus wiederholtem Header plus CTRL-Z. Erst nach vollstaendiger Datei-, Header-,
+Trailer- und Bereichspruefung wird atomar geschrieben. Teiltransfers warten
+kooperativ ueber die Storage-Fassade; Erfolg, ON-ERROR-Fehler, Reset,
+Cancellation und Abbau geben denselben instanzlokalen Zustand frei.
 
 Textbildschirm und Tastatur
 ---------------------------
@@ -385,20 +405,41 @@ VIEW setzt einen inklusiven physischen Clipbereich, fuellt ihn optional und
 zeichnet den Rahmen ausserhalb, soweit Bildschirmplatz vorhanden ist.
 WINDOW und WINDOW SCREEN legen beliebig gerichtete logische Achsen darueber.
 PMAP, POINT(0 bis 3), POINT(x,y), STEP und alle Grafikprimitive verwenden
-dieselbe Rundung und reversible Transformation. Ein Moduswechsel setzt
-Palette, Seiten, Grafikpunkt, VIEW/WINDOW, Textgeometrie und Damagezustand
-gemeinsam zurueck.
+dieselbe Rundung und reversible Transformation. Physische PMAP-Werte sind
+immer relativ zum aktuellen Viewport. POINT(0/1) ist bei VIEW ebenfalls
+viewportrelativ, bei VIEW SCREEN dagegen bildschirmabsolut. VIEW/WINDOW
+erhalten den physischen Grafikpunkt und berechnen nur seine logische Sicht
+neu. Ein Moduswechsel setzt Palette, Seiten, VIEW/WINDOW, Textgeometrie und
+Damagezustand gemeinsam zurueck; Moduswechsel und grafisches CLS setzen den
+Grafikpunkt auf die Mitte des betroffenen Bildschirms beziehungsweise
+Viewports.
 
-PSET, POINT, LINE mit B und BF, CIRCLE mit Winkelbereich und Aspect sowie
-PAINT arbeiten ausschliesslich im Gastpuffer. BASIC-Zahlen werden vor dem
-Clipping nach der festgelegten QBasic-Regel gerundet. Der aktuelle Grafikpunkt
-traegt STEP-Koordinaten; POINT liefert ausserhalb der Flaeche -1. PAINT nutzt
-einen begrenzten Flood-Fill und veraendert weder Host- noch Fremdinstanzdaten.
+PSET und PRESET verwenden bei ausgelassener Farbe Vorder- beziehungsweise
+Hintergrundattribut. Absolute und STEP-Koordinaten aktualisieren den aktuellen
+Grafikpunkt auch bei Clipping; unsichtbare oder unveraenderte Pixel erzeugen
+keine Revision. LINE unterstuetzt einen ausgelassenen Startpunkt, unabhaengige
+STEP-Endpunkte, B, BF und eine von links nach rechts laufende 16-Bit-Stilmaske,
+deren Phase auch ueber Clipping und Boxseiten erhalten bleibt.
+
+CIRCLE bildet Kreis, Ellipse, Arc, ausgelassene Start-/Endwinkel, negative
+Radiuslinien sowie modusspezifischen oder expliziten Aspect ab. Unsichtbare
+Grossformen bleiben begrenzt. PAINT nutzt eine begrenzte Scanline-Queue fuer
+Solid-Fills und bis zu 64-zeilige gepackte beziehungsweise planare Tiles mit
+validierter Hintergrundslice. Ohne explizite Randfarbe stoppt Solid-PAINT an
+der Fuellfarbe statt an jeder vom Startpixel abweichenden Farbe; PAINT
+veraendert den letzten Grafikpunkt nicht. DRAW validiert das gesamte Makro vor
+der ersten Mutation; Bewegung, B/N, M, A/TA, C, S, P und rekursive X-Variablen
+besitzen feste Byte-, Befehls- und Rekursionsgrenzen. Ungueltige Makros
+hinterlassen weder Pixel noch persistenten Winkel-, Farb- oder
+Skalierungszustand. S n verwendet den QuickBASIC-Faktor n/4; der Anfangszustand
+S4 veraendert Entfernungen daher nicht.
 
 GET schreibt den vier Byte grossen QuickBASIC-Header und die gepackten
-Bilddaten direkt in die Rohbytes eines numerischen Arrays. SCREEN 1 verwendet
-zwei Bit je Pixel, SCREEN 9 vier getrennte Ein-Bit-Ebenen je Scanline. PUT
-liest dasselbe Format mit PSET oder attributweisem XOR. Dadurch bleiben auch
+Bilddaten direkt ab einem beliebigen Element eines INTEGER-, LONG-, SINGLE-
+oder DOUBLE-Arrays. Auch Elemente jenseits der 64-KiB-Datengrenze werden ohne
+Ganzarraypuffer erreicht. Modi 1/2 packen zwei beziehungsweise ein Bit pro
+Pixel, 7 bis 12 arbeiten planar und Modus 13 byteweise. PUT liest dasselbe
+Format mit PSET, PRESET, AND, OR oder standardmaessig XOR. Dadurch bleiben
 negative LONG-Werte aus DATA bitgenau und eine per XOR bewegte Banane kann
 ohne Sonderfallcode gezeichnet und wieder entfernt werden.
 
@@ -672,7 +713,15 @@ zusaetzlich die komplette Modusmatrix, Textgeometrien und Seitenlimits,
 verdeckte Seitenwrites und PCOPY, generationstreue VPAGE-Wechsel,
 Palette/COLOR-Grenzen, VIEW-Fill und Aussenrahmen, reversible
 WINDOW-/PMAP-/POINT-Werte, STEP/Clipping sowie die exakten CLS-Bereiche. Der
-Grafikhosttest behaelt pixelidentische Integer- und Fractionalbilder,
+0.70.11-Grafiktest friert fuer jeden Grafikmodus einen kombinierten
+Primitiv-/Pattern-Rasterhash ein. Er prueft PRESET, ausgelassene und relative
+Linienenden, Stilphasen, Kreis/Arc/Ellipse, Solid-/Tile-PAINT, die vollstaendige
+begrenzte DRAW-Sprache samt Rollback, alle GET/PUT-Layouts und Aktionen sowie
+alle numerischen Arraytypen und ein Element jenseits 64 KiB. Die
+Memory-Image-Vektoren erzwingen Ein-Byte-Teiltransfers, alle drei gueltigen
+Trailerformen, atomare Ablehnung defekter Bilder, private Segmentisolation und
+den gepackten Videoroundtrip.
+Der Grafikhosttest behaelt pixelidentische Integer- und Fractionalbilder,
 Indexed8-ABI- und XRGB-Fallbackpfad, bounded 128x128-Tiles, getrennte sparse
 Damage-Regionen, Unterdrueckung unveraenderter Frames, mindestens 20 Bilder
 pro Sekunde sowie Resize und Letterboxing bei.

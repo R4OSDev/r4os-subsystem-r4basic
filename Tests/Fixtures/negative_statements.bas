@@ -1,4 +1,4 @@
-BLOAD "legacy.bin"
+BLOAD "legacy.bin",
 OPEN "data.bin" FOR RANDOM AS #1
 PALETTE 1
 PUT (0, 0), Pixels, OR

@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 execution foundation
 
-Contract version: `2.6.0`
+Contract version: `2.7.0`
 
 This document freezes the executable R4BASIC foundation and its non-regression
 invariants while the complete v2 target in `COMPATIBILITY.md` and
@@ -224,7 +224,8 @@ The VM executes:
   NEXT`, and `RESUME` to a numeric or named label; `ERROR` raises an exact
   number from 1 through 255 through the same handler path;
 - cooperative `STOP` plus `TRON` and `TROFF`;
-- the restricted `DEF SEG`, `PEEK`, and `POKE` compatibility device;
+- every 16-bit `DEF SEG` value for private memory-image transfers plus the
+  restricted segment-zero `PEEK` and `POKE` compatibility byte;
 - `SCREEN 0`, `1`, `2`, and `7` through `13`, independent active/visible
   pages, `PCOPY`, every mode-valid screen `WIDTH`, `COLOR`, `CLS`, `LOCATE`,
   and `VIEW PRINT` on the private text pages;
@@ -233,9 +234,12 @@ The VM executes:
   console/file `INPUT$` use the same bounded output/input machinery;
 - in-place `MID$` assignment to variable or fixed strings without changing
   their length;
-- `PALETTE`, `PALETTE USING`, `VIEW`, `WINDOW`, `PMAP`, `PSET`, every
-  coordinate/state `POINT` form, `LINE` including `B` and `BF`, `CIRCLE`,
-  `PAINT`, and packed `GET`/`PUT` with `PSET` and `XOR`;
+- `PALETTE`, `PALETTE USING`, `VIEW`, `WINDOW`, `PMAP`, `PSET`, `PRESET`,
+  every coordinate/state `POINT` form, styled `LINE` including `B` and `BF`,
+  complete `CIRCLE`, tiled `PAINT`, bounded `DRAW`, and packed `GET`/`PUT`
+  with every reference action;
+- asynchronous `BLOAD` and `BSAVE` over private guest segments and the
+  active packed video segment;
 - `BEEP` and `PLAY` with the bounded Music Macro Language described below;
 - `RANDOMIZE`, `SLEEP`, and sequential `OPEN`/`CLOSE`;
 - `END`.
@@ -308,10 +312,27 @@ sequential file I/O are
 injected separately. A missing or failing required host result becomes a
 deterministic VM error; tests do not depend on hidden process-global hooks.
 
-`DEF SEG = 0` selects a private compatibility byte at offset 1047. `PEEK` and
-`POKE` can read or replace that byte, including its NumLock bit. Omitting the
-segment resets access. Every other segment or offset is a runtime error; no
-guest address can become an R4OS or host pointer.
+`DEF SEG` selects an unsigned 16-bit real-mode guest segment and omitting its
+value resets the selection to zero. `BLOAD` and `BSAVE` are the only general
+memory consumers in this contract version. They operate on a lazily allocated,
+zero-initialized, per-VM address space covering the largest segment:offset
+linear address. The active mode's `A000` or `B800` video segment maps only to
+that page's QuickBASIC-packed raster. No guest address can become an R4OS or
+host pointer.
+
+`PEEK` and `POKE` deliberately remain narrower until the 0.70.13 guest machine:
+they can read or replace only the private segment-zero byte at offset 1047,
+including its NumLock bit. Any other segment or offset raises the restricted
+memory error without exposing the memory-image address space.
+
+`BSAVE` emits byte `FD`, little-endian segment, offset, and payload length,
+then exactly the requested bytes. `BLOAD` accepts that seven-byte QuickBASIC
+form, the BASICA trailing `CTRL+Z`, and the GW-BASIC repeated-header plus
+`CTRL+Z` form. It validates the complete bounded file, header, trailer, target
+range, and payload before changing guest or video bytes. Both directions keep
+partial host transfers in one instance-owned pending record, resume through
+the asynchronous Storage facade, and discard it on success, caught error,
+reset, cancellation, or teardown.
 
 ## Text screen and interactive input
 
@@ -400,23 +421,53 @@ guest address can become an R4OS or host pointer.
   cleared; a different size is allocated atomically before the previous one
   is released. An injected unavailable mode raises catchable BASIC error 5
   without replacing the previous surface, preserving the normal mode-9 to
-  mode-1 `ON ERROR` fallback.
+  mode-1 `ON ERROR` fallback. A graphics mode change and a graphics `CLS`
+  establish the current point at the center of the affected screen or
+  viewport.
 - `VIEW` defines one inclusive physical clipping rectangle, optionally fills
   it and draws an outside border where screen space exists. `WINDOW` and
   `WINDOW SCREEN` define the reversible logical coordinate axes over that
   viewport. `PMAP`, `POINT(0..3)`, coordinate `POINT`, absolute/`STEP`
   resolution, and every primitive use the same rounding and transform.
+  `PMAP` physical results and inputs are always relative to the viewport;
+  physical `POINT(0..1)` follows viewport-relative `VIEW` coordinates but
+  remains screen-absolute under `VIEW SCREEN`. Changing either transform
+  preserves the physical current point and recomputes its logical view.
   Reversed axes are valid; out-of-viewport pixels clip silently and query as
   `-1`.
+- `PSET` and `PRESET` use the foreground and background attributes
+  respectively when their color is omitted. Absolute and `STEP` coordinates
+  update the current point even when clipping makes the pixel invisible; an
+  unchanged or clipped operation creates neither damage nor a revision.
+  `LINE` accepts an omitted first endpoint, independent absolute/`STEP`
+  endpoints, `B`, `BF`, and one left-to-right 16-bit style mask whose phase
+  advances across clipping and all four box sides. Filled boxes ignore style.
+- `CIRCLE` validates and rounds circles, ellipses, arcs, omitted endpoints,
+  negative radial endpoints, and mode-derived or explicit aspect ratios.
+  Provably invisible full ellipses skip their bounded polygon work. `PAINT`
+  uses bounded scanline queues for solid fills and up to 64-row packed or
+  planar tiles, validating the optional one-/two-byte background slice before
+  mutation. A solid fill without an explicit border uses its paint color as
+  the stopping color, so differently colored interior pixels do not form an
+  implicit boundary. `PAINT` preserves the prior current point. Every
+  primitive commits changed spans through the same bounded damage ledger.
+- `DRAW` parses the entire macro before mutation. Movement, `B`, `N`, absolute
+  and relative `M`, `A`, `TA`, `C`, `S`, `P`, and recursively expanded `X`
+  variables share bounded byte, command, and recursion budgets. Invalid
+  syntax or persistent color/scale/angle state is rejected atomically; valid
+  state remains private to one VM. `S n` accepts 1 through 255 and applies the
+  QuickBASIC scale factor `n / 4`; the initial `S4` therefore leaves distances
+  unchanged.
 - `GET` writes the four-byte QuickBASIC header followed by mode-appropriate
-  packed data into the raw bytes of any numeric array. Mode 1 packs two bits
-  per pixel; mode 9 stores four one-bit planes per scan line. `PUT` decodes
-  the same representation with exact `PSET` or attribute-wise `XOR` and
-  rejects an image extending outside the guest surface. LONG DATA therefore
-  remains bit-exact and needs no program-specific conversion. On the x86_64
-  target the compact numeric storage is already the required little-endian
-  raw view: `GET` writes only the image prefix and `PUT` reads only the bytes
-  named by its header, without serializing an oversized array.
+  packed data into the raw bytes of INTEGER, LONG, SINGLE, or DOUBLE arrays.
+  An optional complete index tuple selects the first byte and may address data
+  beyond 64 KiB. Modes 1/2 use packed two-/one-bit pixels, 7 through 12 use
+  the declared one-bit planes, and mode 13 stores one byte per pixel. `PUT`
+  decodes the same representation with exact `PSET`, complemented `PRESET`,
+  attribute-wise `AND`, `OR`, or default `XOR`, and rejects an image extending
+  outside the guest surface. The compact numeric storage is already the
+  required little-endian raw view: only the image prefix is touched and no
+  whole-array conversion buffer exists.
 - Pixel changes, palette changes, and text-cell rasterization accumulate in
   at most eight sparse damage rectangles. Touching rectangles merge; only an
   overflow is folded into the region with the least area growth. Text rows,
@@ -731,11 +782,18 @@ The permanent general fixtures below are part of this contract:
   BINARY sparse scalar/string/UDT/whole-array transfer, one-byte progress,
   the exact 64-KiB boundary, positional sequential overwrite, metadata,
   locking, catchable errors, CLOSE/RESET, and BINARY `INPUT$`.
+- Inline memory-image vectors cover one-byte asynchronous progress, exact
+  QuickBASIC/BASICA/GW-BASIC headers and trailers, malformed-file atomicity,
+  private segment isolation, explicit BLOAD offsets, and packed video
+  roundtrips without a host-memory shortcut.
 - `vm_graphics.bas` plus inline vectors: all logical mode dimensions,
   attributes, page counts and text geometries; APAGE/VPAGE/PCOPY;
   PALETTE/USING and mode-specific COLOR; VIEW/WINDOW/PMAP/POINT; clipping,
-  STEP, circle, flood fill, GET/PUT, XOR reversibility, and two-instance
-  pixel/palette isolation.
+  `PSET`/`PRESET`, omitted and STEP line endpoints, styles, circle/arc/ellipse,
+  bounded solid/tiled paint, complete DRAW with rollback, all-type/far-element
+  GET/PUT, all five PUT actions, XOR reversibility, and two-instance
+  pixel/palette isolation. One full-raster hash per graphics mode freezes the
+  combined primitive and pattern result.
 - `vm_packed_images.bas`: original synthetic LONG arrays in the mode 1 and
   mode 9 packed formats, including reversible PUT XOR.
 - `vm_audio.bas`: stateful MML commands, MB continuation, transport-fenced MF
@@ -748,7 +806,8 @@ positions, QBasic error numbers, string overflow, host failure, and
 two-instance keyboard isolation, interactive RANDOMIZE retry, paused time,
 host polling while asleep, storage-facade error classification, unsupported
 file modes and device names, and atomic text-state errors.
-`Tests/graphics_host_test.zig` fixes every logical mode matrix, hidden-page
+`Tests/graphics_host_test.zig` fixes every logical mode matrix, per-mode
+primitive/pattern goldens, hidden-page
 writes and copies, generation-safe visible-page switches, reversible world
 coordinates, VIEW fill/outside-border clipping, exact CLS bounds, palette
 recoloring without index mutation, 128 by 128 raster bounds, sparse and

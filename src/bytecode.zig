@@ -1,7 +1,7 @@
 const std = @import("std");
 const frontend = @import("frontend.zig");
 
-pub const contract_version = "2.6.0";
+pub const contract_version = "2.7.0";
 pub const invalid_index: u32 = std.math.maxInt(u32);
 pub const unknown_dimensions: u8 = std.math.maxInt(u8);
 
@@ -151,6 +151,7 @@ pub const file_open_access_shift: u5 = 4;
 pub const file_open_lock_shift: u5 = 8;
 pub const file_argument_position: u32 = 1 << 0;
 pub const file_argument_variable: u32 = 1 << 1;
+pub const memory_image_offset_present: u32 = 1 << 0;
 pub const file_range_first: u32 = 1 << 0;
 pub const file_range_last: u32 = 1 << 1;
 pub const program_run_path: u32 = 1 << 0;
@@ -165,6 +166,9 @@ pub const GraphicsBoxMode = enum(u8) {
 
 pub const GraphicsPutAction = enum(u8) {
     pset,
+    preset,
+    and_,
+    or_,
     xor,
 };
 
@@ -184,8 +188,14 @@ pub const graphics_palette_using_index: u32 = 1 << 0;
 pub const graphics_point_relative: u32 = 1 << 0;
 pub const graphics_second_point_relative: u32 = 1 << 1;
 pub const graphics_color_present: u32 = 1 << 2;
+pub const graphics_first_point_omitted: u32 = 1 << 3;
+pub const graphics_style_present: u32 = 1 << 4;
+pub const graphics_preset_default: u32 = 1 << 5;
+pub const graphics_paint_string: u32 = 1 << 6;
 pub const graphics_box_shift: u5 = 8;
 pub const graphics_optional_count_shift: u5 = 8;
+pub const graphics_array_indices_shift: u5 = 16;
+pub const graphics_array_indices_mask: u32 = 0xff << graphics_array_indices_shift;
 
 pub const Procedure = struct {
     name: frontend.Span,
@@ -248,6 +258,7 @@ pub const OpCode = enum(u8) {
     graphics_line,
     graphics_circle,
     graphics_paint,
+    graphics_draw,
     graphics_get,
     graphics_put,
     text_width,
@@ -279,6 +290,8 @@ pub const OpCode = enum(u8) {
     file_close,
     file_get,
     file_put,
+    memory_image_load,
+    memory_image_save,
     file_field,
     file_seek,
     file_lock,
