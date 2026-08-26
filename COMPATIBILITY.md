@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 QuickBASIC 4.5 target contract
 
-Contract version: `2.8.0`
+Contract version: `2.9.0`
 
 R4BASIC v2 targets the complete Microsoft QuickBASIC 4.5 interpreter language
 and runtime. The target is not limited by GORILLA.BAS or by the historical v1
@@ -131,7 +131,9 @@ the same grammar family. All fixture paths are below `Tests/Fixtures/`.
 | AUDIO-01 | `BEEP`, 18.2-Hz `SOUND`, complete stateful `PLAY` MML with bounded variables, MF/MB fences, the 32-note queue function, and PLAY events | yes | `positive_io_graphics.bas`, `vm_audio.bas`, plus inline PCM, queue, variable, fence, and degraded-transport vectors | `negative_statements.bas` plus inline command and numeric boundaries |
 | FILE-01 | Old/new `OPEN` for `INPUT`, `OUTPUT`, `APPEND`, `RANDOM`, or `BINARY`; access/lock/LEN, `CLOSE`/`RESET`, sequential formatting/input, FIELD/LSET/RSET, typed GET/PUT, BINARY `INPUT$`, SEEK/LOC/LOF/EOF/FILEATTR/FREEFILE, and exact LOCK/UNLOCK | yes | `vm_sequential_files.bas` plus inline one-byte, sparse, record/UDT, exact-64-KiB, positioned-output, metadata, lock and catchable-error vectors | inline bad-mode, bad-record, FIELD, path/storage and device-name vectors |
 | MEM-01 | Asynchronous `BLOAD`/`BSAVE` with the seven-byte memory-image header, QuickBASIC/BASICA/GW-BASIC input variants, private real-mode guest segments, and packed active video segments | yes | `positive_io_graphics.bas` plus inline partial-transfer, malformed-input and byte-roundtrip vectors | `negative_statements.bas` plus inline bounds and storage-failure vectors |
-| HW-01 | `DEF SEG` selects every 16-bit segment for memory images; `PEEK` and `POKE` remain restricted to the private compatibility byte until the 0.70.13 guest machine | yes | `positive_io_graphics.bas` plus inline segment-isolation vectors | `negative_expressions.bas` |
+| HW-01 | Exact 1-MiB private 20-bit memory, `DEF SEG`, `PEEK`/`POKE`, stable scalar/array/string pointers, heap queries, bounded x86 execution, virtual ports and virtual interrupts | yes | `positive_io_graphics.bas` plus inline 0.70.13 wrapping, pointer, CALL, port and interrupt vectors | `negative_expressions.bas` plus inline unknown-port/symbol/interrupt vectors |
+| DEVICE-01 | `OPEN COM`, COM events, `IOCTL`/`IOCTL$`, partial bounded RX/TX, `LPRINT`/`LPRINT USING`, `LPOS`, and screen/file/device/printer `WIDTH` | no | inline 0.70.13 serial, partial-input, event, spool, formatting and ERDEV vectors | inline timeout, unavailable, overflow, invalid-option and out-of-paper vectors |
+| ERROR-01 | All 43 Appendix-B error numbers preserve exact `ERR`/`ERL` identity and are resumable through the central handler model | no | inline all-number round-trip vector plus natural language, file and device faults | inline nested-handler and invalid-resume vectors |
 
 The optional `Tests/gorilla_acceptance.zig` step additionally verifies the
 local file size and SHA-256 before passing the unchanged bytes through the
@@ -151,7 +153,8 @@ source does not select a separate production path.
   `HEX$`, `INT`, `LCASE$`, `LEN`, `LOC`, `LOF`, `LOG`, `LTRIM$`, `MKD$`, `MKDMBF$`,
   `MKI$`, `MKL$`, `MKS$`, `MKSMBF$`, `OCT$`, `PEEK`, `POS`, `RTRIM$`,
   `SEEK`, `SGN`, `SIN`, `SPACE$`, `SQR`, `STR$`, `TAN`, `UCASE$`, `VAL`,
-  `PEN`, `PLAY`, `STICK`, and `STRIG`.
+  `PEN`, `PLAY`, `STICK`, `STRIG`, `FRE`, `INP`, `IOCTL$`, `LPOS`, `SADD`,
+  `SETMEM`, `VARPTR`, `VARPTR$`, and `VARSEG`.
 - One or two arguments: `LBOUND` and `UBOUND` accept an array and an optional
   one-based dimension number.
 - Two arguments: `FILEATTR`, `LEFT$`, `RIGHT$`, `STRING$`, coordinate `POINT`.
@@ -161,7 +164,8 @@ source does not select a separate production path.
   file number.
 - Bare and without parentheses: `FREEFILE` also accepts empty parentheses.
 - Zero or one argument: `RND`; the bare form is accepted.
-- Bare and without parentheses: `CSRLIN`, `INKEY$`, `TIMER`.
+- Bare and without parentheses: `CSRLIN`, `ERDEV`, `ERDEV$`, `INKEY$`,
+  `TIMER`.
 
 `SPC` and `TAB` are PRINT-only positioning forms rather than ordinary
 expression built-ins. `MID$` additionally has the reference in-place
@@ -197,11 +201,13 @@ the typed-program phase.
   debugger, and source editor remain separate products.
 - `CHAIN`, `RUN`, `SHELL`, `SYSTEM`, printer/COM/device I/O,
   random/binary file records, directory mutation, and unrestricted hardware
-  access.
+  access were not v1 promises. Contract 2.9.0 implements them through typed
+  R4OS facades or private virtual devices; unrestricted hardware access stays
+  intentionally impossible.
 - `DRAW`, `PCOPY`, `BLOAD`, `BSAVE`, `SOUND`, complete `PLAY`, keyboard and
-  event trapping, and private pointer/joystick input were v1 exclusions and
-  are implemented by contract 2.8.0. General memory, serial data, printer,
-  and port access remains staged.
+  event trapping, private pointer/joystick input, private 20-bit memory,
+  serial data, printer and virtual ports were v1 exclusions and are
+  implemented by contract 2.9.0.
 - Runtime correctness merely from parse or bind success. Only the subset in
   `VM-CONTRACT.md` has executable semantics.
 

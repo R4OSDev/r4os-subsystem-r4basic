@@ -6,7 +6,7 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.70.12
+Stand 0.70.13
 ------------
 
 Diese Ausbaustufe ergaenzt das Vertragsfundament des produktiven R4BASIC-v2-
@@ -54,6 +54,19 @@ VM-lokal. PLAY umfasst die vollstaendige Makrosprache, Variablenexpansion,
 Hintergrundqueue und Ereignisfences; SOUND und BEEP teilen dieselben
 transportbestaetigten MF-/MB-Regeln. TIMER-Ereignisse und SLEEP verwenden
 monotone Gastfristen, waehrend die TIMER-Funktion getrennt die Wanduhr liest.
+0.70.13 schliesst die Legacy- und Binaerinterop-Schicht. Jede VM besitzt einen
+exakt 1 MiB grossen privaten 20-Bit-Adressraum mit Segment-Wrapping, stabilen
+Wert-, Array- und Stringdeskriptoren, begrenztem Heap und eigenem Stack.
+DEF SEG, PEEK/POKE, SADD, VARPTR/VARSEG/VARPTR$, FRE, SETMEM und CLEAR greifen
+nur darauf zu. CALL ABSOLUTE fuehrt 16-Bit-x86-Code unter Instruktionsbudget
+und Cancellation aus; CALL/CALLS sowie INT86-/INTERRUPT-Varianten erreichen
+nur registrierte private Symbole und virtuelle BIOS-/DOS-Dienste.
+Ein sparse virtueller Portbus traegt INP, OUT und kooperatives WAIT. OPEN COM,
+COM-Ereignisse und IOCTL/IOCTL$ arbeiten mit begrenzten Partial-RX/TX-Puffern.
+LPRINT, LPRINT USING, LPOS und WIDTH verwenden die gemeinsame Formatengine
+auf privatem Spool beziehungsweise virtuellem Kanal. ERDEV/ERDEV$ klassifizieren
+den letzten Geraetefehler; alle 43 Appendix-B-Nummern durchlaufen dasselbe
+ERR-/ERL-/ON-ERROR-/RESUME-Modell.
 Explorer uebergibt eine absolute BAS-Datei ueber `R4SUBSYS1`; das R4X liest
 sie und relative `$INCLUDE`-Quellen durch die Storage-Fassade jeweils exakt
 einmal, baut daraus einen begrenzten Quellgraphen und fuehrt eine getrennte VM in
@@ -321,10 +334,12 @@ Die aktiven Videosegmente A000 beziehungsweise B800 bilden ausschliesslich
 die aktuelle, nach QuickBASIC-Regeln gepackte Grafikseite ab. Ein
 Segment:Offset-Wert kann niemals zum R4OS- oder Hostzeiger werden.
 
-PEEK und POKE bleiben bis zur privaten Fremdcode-Gastmaschine in 0.70.13
-bewusst enger: Nur Segment 0 und Offset 1047 geben das von GORILLA.BAS
-verwendete private NumLock-Bit frei. Jeder andere Zugriff liefert den
-begrenzten Speicherfehler.
+PEEK und POKE adressieren jedes DEF-SEG:Offset-Paar innerhalb des privaten
+20-Bit-Raums; die lineare Adresse wird bei 1 MiB gewrappt. Der von GORILLA.BAS
+verwendete NumLock-Zustand bei Segment 0/Offset 1047 bleibt darin kompatibel.
+SADD, VARPTR, VARSEG und VARPTR$ liefern ausschliesslich private Deskriptoren,
+die vor und nach Gastcode typgerecht synchronisiert und am Ende ihrer
+BASIC-Lebenszeit verworfen werden. Kein Zahlenwert kann als Hostpointer gelten.
 
 BSAVE schreibt 0xFD, Segment, Offset und Laenge als sieben Byte grossen
 Little-Endian-Header sowie exakt den angeforderten Bereich. BLOAD akzeptiert
@@ -565,9 +580,11 @@ Fehlende oder bereits vorhandene Dateien, falsche Modi, doppelte Slots,
 FIELD-Zustand und -Ueberlauf, ungueltige Recordlaenge oder -nummer, Disk Full,
 zu viele Dateien, Sperrkonflikte, EOF-Ueberlauf sowie Namens-, Pfad- und
 Zugriffsfehler behalten getrennte, fangbare QBasic-Fehlernummern. Loeschen
-und Verzeichnisveraenderungen sind implementiert; Drucker- und serielle
-Datenkanaele folgen in 0.70.13. COM(1/2)-Ereignisse besitzen bereits den
-getrennten VM-lokalen Signaleingang, aber noch keinen seriellen Bytekanal.
+und Verzeichnisveraenderungen sind implementiert. COM1/COM2 besitzen nun
+validierte QuickBASIC-Parameter, begrenzte RX-/TX-Puffer, Partial-INPUT$,
+IOCTL-Status und den vorhandenen VM-lokalen Ereigniseingang. Druckausgabe
+landet in einem auf 1 MiB begrenzten privaten LPT1-Spool. Es wird weder ein
+Host-Serialhandle noch ein Hostdrucker direkt geoeffnet.
 Die Dateinummern 0 bis 255 werden ueber einen festen 256-Byte-Index in O(1)
 aufgeloest; nur wirklich offene Dateien besitzen einen dynamischen Slot samt
 Puffer. Dadurch entfallen 256 eingebettete optionale Dateizustaende pro VM.

@@ -438,6 +438,9 @@ const ProcedureBuilder = struct {
     return_local: u32 = bytecode.invalid_index,
     return_type: bytecode.ValueType = .single,
     is_static: bool = false,
+    is_external: bool = false,
+    cdecl: bool = false,
+    external_alias: ?frontend.Span = null,
     declared: bool = false,
     declaration_has_signature: bool = false,
     defined: bool = false,
@@ -768,8 +771,9 @@ const Builder = struct {
         try self.resolveDataFixups(fixup_total);
         try self.resolveOnBranchFixups(fixup_total);
         if (!self.reportProgress(.resolution, fixup_total, fixup_total)) return error.Cancelled;
-        for (self.procedures.items) |procedure| {
-            if (procedure.called and !procedure.defined) try self.addDiagnostic(.unknown_procedure, procedure.name);
+        for (self.procedures.items) |*procedure| {
+            if (procedure.declared and !procedure.defined) procedure.is_external = true;
+            if (procedure.called and !procedure.defined and !procedure.declared) try self.addDiagnostic(.unknown_procedure, procedure.name);
         }
     }
 
@@ -828,6 +832,7 @@ const Builder = struct {
             .function => self.parseProcedureDefinition(.function),
             .let => self.parseLet(),
             .call => self.parseCallStatement(),
+            .calls => self.parseCallsStatement(),
             .if_ => self.parseIf(inline_statement),
             .elseif => self.parseElseIf(),
             .else_ => self.parseElse(),
@@ -856,6 +861,7 @@ const Builder = struct {
             .view => if (self.peek(1).kind == .keyword and self.peek(1).keyword == .print) self.parseTextView() else self.parseGraphicsView(),
             .window => self.parseGraphicsWindow(),
             .print => self.parsePrintStatement(),
+            .lprint => self.parseLprintStatement(),
             .write => self.parseWriteStatement(),
             .input => self.parseInputStatement(false),
             .line => self.parseLineStatement(),
@@ -874,6 +880,9 @@ const Builder = struct {
             .randomize => self.parseRandomize(),
             .sleep => self.parseSleep(),
             .open => self.parseOpen(),
+            .out => self.parsePortOutput(),
+            .wait => self.parsePortWait(),
+            .ioctl => self.parseDeviceIoctl(),
             .close => self.parseClose(),
             .field => self.parseField(),
             .seek => self.parseFileSeek(),
@@ -2344,6 +2353,42 @@ const Builder = struct {
 
     fn parseTextWidth(self: *Builder) !bool {
         const statement = self.advance();
+        if (self.consumeKeyword(.lprint)) {
+            const value_type = (try self.parseExpression()) orelse return false;
+            if (!value_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            _ = try self.emit(.printer_width, 0, 0, statement.span);
+            return true;
+        }
+        if (self.consume(.hash)) {
+            const file_type = (try self.parseExpression()) orelse return false;
+            if (!file_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            if (!try self.expect(.comma)) return false;
+            const width_type = (try self.parseExpression()) orelse return false;
+            if (!width_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            _ = try self.emit(.file_width, 0, 0, statement.span);
+            return true;
+        }
+        if (!self.at(.comma) and !self.atBoundary() and !self.atKeyword(.else_)) {
+            const first_type = (try self.parseExpression()) orelse return false;
+            if (first_type == .string) {
+                if (!try self.expect(.comma)) return false;
+                const width_type = (try self.parseExpression()) orelse return false;
+                if (!width_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+                _ = try self.emit(.device_width, 0, 0, statement.span);
+                return true;
+            }
+            if (!first_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            var mask: u32 = 1;
+            var count: u32 = 1;
+            if (self.consume(.comma) and !self.atBoundary() and !self.atKeyword(.else_)) {
+                const rows_type = (try self.parseExpression()) orelse return false;
+                if (!rows_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+                mask |= 2;
+                count += 1;
+            }
+            _ = try self.emit(.text_width, mask, count, statement.span);
+            return true;
+        }
         var mask: u32 = 0;
         var count: u32 = 0;
         var position: u32 = 0;
@@ -2471,8 +2516,18 @@ const Builder = struct {
     }
 
     fn parsePrintStatement(self: *Builder) !bool {
+        return self.parsePrintTarget(false);
+    }
+
+    fn parseLprintStatement(self: *Builder) !bool {
+        return self.parsePrintTarget(true);
+    }
+
+    fn parsePrintTarget(self: *Builder, printer: bool) !bool {
         const statement = self.advance();
-        if (self.consume(.hash)) {
+        if (printer) {
+            _ = try self.emit(.print_begin_printer, 0, 0, statement.span);
+        } else if (self.consume(.hash)) {
             const file_type = (try self.parseExpression()) orelse return false;
             if (!file_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
             if (!try self.expect(.comma)) return false;
@@ -3001,19 +3056,20 @@ const Builder = struct {
             return true;
         }
 
-        if (!try self.expectKeyword(.for_)) return false;
-        const mode: bytecode.FileMode = if (self.consumeKeyword(.input))
-            .input
-        else if (self.consumeKeyword(.output))
-            .output
-        else if (self.consumeKeyword(.append))
-            .append
-        else if (self.consumeKeyword(.random))
-            .random
-        else if (self.consumeKeyword(.binary))
-            .binary
-        else
-            return self.fail(.expected_token);
+        const mode: bytecode.FileMode = if (self.consumeKeyword(.for_)) blk: {
+            break :blk if (self.consumeKeyword(.input))
+                .input
+            else if (self.consumeKeyword(.output))
+                .output
+            else if (self.consumeKeyword(.append))
+                .append
+            else if (self.consumeKeyword(.random))
+                .random
+            else if (self.consumeKeyword(.binary))
+                .binary
+            else
+                return self.fail(.expected_token);
+        } else .random;
 
         var access: bytecode.FileAccess = .default;
         if (self.consumeKeyword(.access)) {
@@ -3035,7 +3091,7 @@ const Builder = struct {
             } else return self.fail(.expected_token);
         }
         if (!try self.expectKeyword(.as)) return false;
-        if (!try self.expect(.hash)) return false;
+        _ = self.consume(.hash);
         const file_type = (try self.parseExpression()) orelse return false;
         if (!file_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
         var flags = (@as(u32, @intFromEnum(access)) << bytecode.file_open_access_shift) |
@@ -3047,6 +3103,46 @@ const Builder = struct {
             flags |= bytecode.file_open_has_length;
         }
         _ = try self.emit(.file_open, @intFromEnum(mode), flags, statement.span);
+        return true;
+    }
+
+    fn parsePortOutput(self: *Builder) !bool {
+        const statement = self.advance();
+        const port_type = (try self.parseExpression()) orelse return false;
+        if (!port_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        if (!try self.expect(.comma)) return false;
+        const value_type = (try self.parseExpression()) orelse return false;
+        if (!value_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        _ = try self.emit(.port_output, 0, 0, statement.span);
+        return true;
+    }
+
+    fn parsePortWait(self: *Builder) !bool {
+        const statement = self.advance();
+        const port_type = (try self.parseExpression()) orelse return false;
+        if (!port_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        if (!try self.expect(.comma)) return false;
+        const and_type = (try self.parseExpression()) orelse return false;
+        if (!and_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        var has_xor = false;
+        if (self.consume(.comma)) {
+            const xor_type = (try self.parseExpression()) orelse return false;
+            if (!xor_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            has_xor = true;
+        }
+        _ = try self.emit(.port_wait, @intFromBool(has_xor), 0, statement.span);
+        return true;
+    }
+
+    fn parseDeviceIoctl(self: *Builder) !bool {
+        const statement = self.advance();
+        _ = self.consume(.hash);
+        const file_type = (try self.parseExpression()) orelse return false;
+        if (!file_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        if (!try self.expect(.comma)) return false;
+        const command_type = (try self.parseExpression()) orelse return false;
+        if (command_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+        _ = try self.emit(.device_ioctl, 0, 0, statement.span);
         return true;
     }
 
@@ -3389,9 +3485,15 @@ const Builder = struct {
         var procedure = &self.procedures.items[procedure_id];
         procedure.declared = true;
         if (procedure.kind != kind) try self.addDiagnostic(.symbol_kind_conflict, name.span);
+        procedure.cdecl = self.consumeKeyword(.cdecl);
+        if (self.consumeKeyword(.alias)) {
+            if (!self.at(.string)) return self.fail(.expected_token);
+            procedure.external_alias = self.advance().span;
+            procedure.is_external = true;
+        }
         if (self.at(.left_paren)) {
             procedure.declaration_has_signature = true;
-            if (!try self.parseParameters(procedure_id, false, true)) return false;
+            if (!try self.parseParameters(procedure_id, false, true, true)) return false;
         }
         return true;
     }
@@ -3424,7 +3526,7 @@ const Builder = struct {
                 .value_type = procedure.return_type,
             });
         }
-        if (self.at(.left_paren) and !try self.parseParameters(procedure_id, false, false)) return false;
+        if (self.at(.left_paren) and !try self.parseParameters(procedure_id, false, false, false)) return false;
         procedure.is_static = self.consumeKeyword(.static);
         try self.validateDeclaredSignature(name.span, declaration_has_signature, declared_types, procedure.parameters.items);
 
@@ -3464,7 +3566,7 @@ const Builder = struct {
             .name = name.span,
             .value_type = procedure.return_type,
         });
-        if (self.at(.left_paren) and !try self.parseParameters(procedure_id, true, false)) return false;
+        if (self.at(.left_paren) and !try self.parseParameters(procedure_id, true, false, false)) return false;
         procedure.is_static = self.consumeKeyword(.static);
         for (procedure.parameters.items) |parameter| {
             if (parameter.is_array or parameter.record_type != bytecode.invalid_index) {
@@ -3494,12 +3596,15 @@ const Builder = struct {
         return true;
     }
 
-    fn parseParameters(self: *Builder, procedure_id: u32, force_by_value: bool, allow_dimension_count: bool) !bool {
+    fn parseParameters(self: *Builder, procedure_id: u32, force_by_value: bool, allow_dimension_count: bool, external: bool) !bool {
         if (!try self.expect(.left_paren)) return false;
         if (self.consume(.right_paren)) return true;
         while (true) {
             var mode: bytecode.PassingMode = if (force_by_value) .by_value else .by_ref;
-            if (self.consumeKeyword(.byval)) mode = .by_value else if (self.consumeKeyword(.byref)) mode = .by_ref;
+            if (self.consumeKeyword(.byval)) mode = .by_value else if (self.consumeKeyword(.byref)) mode = .by_ref else if (external and self.consumeKeyword(.seg)) {
+                mode = .by_segment;
+                self.procedures.items[procedure_id].is_external = true;
+            }
             const name = (try self.expectIdentifier()) orelse return false;
             var is_array = false;
             var dimensions: u8 = 0;
@@ -3524,7 +3629,7 @@ const Builder = struct {
                 try self.addDiagnostic(.type_mismatch, name.span);
                 return false;
             }
-            if (bound_type.accepts_any and (!is_array or mode == .by_value)) {
+            if (bound_type.accepts_any and (!external and !is_array or mode == .by_value)) {
                 try self.addDiagnostic(.type_mismatch, name.span);
             }
             if (is_array and mode == .by_value) try self.addDiagnostic(.invalid_array_argument, name.span);
@@ -3713,6 +3818,9 @@ const Builder = struct {
     fn parseCallStatement(self: *Builder) !bool {
         const statement = self.advance();
         const name = (try self.expectIdentifier()) orelse return false;
+        const text = self.tokenText(name);
+        if (std.ascii.eqlIgnoreCase(text, "ABSOLUTE")) return self.parseCallAbsolute(statement.span);
+        if (interruptCallKind(text)) |kind| return self.parseInterruptCall(statement.span, kind);
         const procedure_id = self.findProcedure(name.span) orelse {
             try self.addDiagnostic(.unknown_procedure, name.span);
             return false;
@@ -3722,6 +3830,96 @@ const Builder = struct {
             return false;
         }
         if (!try self.emitProcedureCall(procedure_id, self.at(.left_paren), statement.span, false)) return false;
+        return true;
+    }
+
+    fn parseCallsStatement(self: *Builder) !bool {
+        const statement = self.advance();
+        const name = (try self.expectIdentifier()) orelse return false;
+        const procedure_id = self.findProcedure(name.span) orelse {
+            try self.addDiagnostic(.unknown_procedure, name.span);
+            return false;
+        };
+        const procedure = &self.procedures.items[procedure_id];
+        if (procedure.kind != .sub or !procedure.declared) {
+            try self.addDiagnostic(.symbol_kind_conflict, name.span);
+            return false;
+        }
+        if (!try self.emitExternalCall(procedure_id, self.at(.left_paren), statement.span, true)) return false;
+        return true;
+    }
+
+    fn parseCallAbsolute(self: *Builder, span: frontend.Span) !bool {
+        if (!try self.expect(.left_paren)) return false;
+        var count: u32 = 0;
+        if (!self.consume(.right_paren)) {
+            while (true) {
+                const argument = (try self.expectIdentifier()) orelse return false;
+                const target = (try self.parseLvalueReference(argument, true)) orelse return false;
+                if (target.is_whole_array and count != 0) try self.addDiagnostic(.invalid_array_argument, argument.span);
+                count += 1;
+                if (!self.consume(.comma)) break;
+            }
+            if (!try self.expect(.right_paren)) return false;
+        }
+        if (count == 0) {
+            try self.addDiagnostic(.wrong_argument_count, span);
+            return false;
+        }
+        _ = try self.emit(.call_absolute, count, 0, span);
+        return true;
+    }
+
+    fn parseInterruptCall(self: *Builder, span: frontend.Span, kind: bytecode.InterruptCallKind) !bool {
+        if (!try self.expect(.left_paren)) return false;
+        const interrupt_type = (try self.parseExpression()) orelse return false;
+        if (!interrupt_type.isNumeric()) try self.addDiagnostic(.type_mismatch, span);
+        if (!try self.expect(.comma)) return false;
+        const input_name = (try self.expectIdentifier()) orelse return false;
+        const input = (try self.parseLvalueReference(input_name, true)) orelse return false;
+        if (!try self.expect(.comma)) return false;
+        const output_name = (try self.expectIdentifier()) orelse return false;
+        const output = (try self.parseLvalueReference(output_name, true)) orelse return false;
+        if ((kind == .int86old or kind == .int86xold) and (!input.is_whole_array or !output.is_whole_array)) {
+            try self.addDiagnostic(.invalid_array_argument, span);
+        }
+        if ((kind == .interrupt or kind == .interruptx) and
+            (input.record_type == bytecode.invalid_index or output.record_type == bytecode.invalid_index))
+        {
+            try self.addDiagnostic(.type_mismatch, span);
+        }
+        if (!try self.expect(.right_paren)) return false;
+        _ = try self.emit(.call_interrupt, @intFromEnum(kind), 0, span);
+        return true;
+    }
+
+    fn emitExternalCall(self: *Builder, procedure_id: u32, parenthesized: bool, span: frontend.Span, all_far: bool) !bool {
+        const procedure = &self.procedures.items[procedure_id];
+        if (parenthesized) _ = self.advance();
+        var count: u32 = 0;
+        const empty = parenthesized and self.consume(.right_paren);
+        if (!empty and !(self.atBoundary() or self.atKeyword(.else_))) {
+            while (true) {
+                const parameter_mode = if (count < procedure.parameters.items.len)
+                    procedure.parameters.items[count].passing_mode
+                else
+                    bytecode.PassingMode.by_ref;
+                const by_value = !all_far and (self.consumeKeyword(.byval) or parameter_mode == .by_value);
+                _ = if (!all_far) self.consumeKeyword(.seg) else false;
+                if (by_value) {
+                    _ = (try self.parseExpression()) orelse return false;
+                } else {
+                    const argument = (try self.expectIdentifier()) orelse return false;
+                    _ = (try self.parseLvalueReference(argument, true)) orelse return false;
+                }
+                count += 1;
+                if (!self.consume(.comma)) break;
+            }
+        }
+        if (parenthesized and !empty and !try self.expect(.right_paren)) return false;
+        if (procedure.declaration_has_signature and count != procedure.parameters.items.len) try self.addDiagnostic(.wrong_argument_count, span);
+        const flags = count | if (all_far) bytecode.external_call_all_far else 0;
+        _ = try self.emit(.call_external, procedure_id, flags, span);
         return true;
     }
 
@@ -3755,7 +3953,7 @@ const Builder = struct {
         const empty = parenthesized and self.consume(.right_paren);
         if (!empty and !(self.atBoundary() or self.atKeyword(.else_))) {
             while (true) {
-                if (argument_count < procedure.parameters.items.len and procedure.parameters.items[argument_count].passing_mode == .by_ref) {
+                if (argument_count < procedure.parameters.items.len and procedure.parameters.items[argument_count].passing_mode != .by_value) {
                     const parameter = procedure.parameters.items[argument_count];
                     if (parameter.is_array) {
                         if (!self.at(.identifier)) {
@@ -3815,7 +4013,7 @@ const Builder = struct {
         if (argument_count != procedure.parameters.items.len) {
             try self.addDiagnostic(.wrong_argument_count, span);
         }
-        _ = try self.emit(.call, procedure_id, @intCast(argument_count), span);
+        _ = try self.emit(.call, procedure_id, @as(u32, @intCast(argument_count)), span);
         return true;
     }
 
@@ -4111,6 +4309,7 @@ const Builder = struct {
             if (self.atKeyword(.lbound)) return self.parseArrayBoundFunction(false);
             if (self.atKeyword(.ubound)) return self.parseArrayBoundFunction(true);
             if (self.atKeyword(.len) and self.lenStartsVariableForm()) return self.parseLenVariable();
+            if (guestPointerKindForKeyword(self.current().keyword)) |kind| return self.parseGuestPointer(kind);
             if (builtinForKeyword(self.current().keyword)) |builtin| return self.parseBuiltin(builtin);
         }
         if (self.consume(.left_paren)) {
@@ -4120,6 +4319,26 @@ const Builder = struct {
         }
         _ = try self.fail(.expected_expression);
         return null;
+    }
+
+    fn parseGuestPointer(self: *Builder, kind: bytecode.GuestPointerKind) !?bytecode.ValueType {
+        const function_token = self.advance();
+        if (!try self.expect(.left_paren)) return null;
+        const name = (try self.expectIdentifier()) orelse return null;
+        const target = (try self.parseLvalueReference(name, true)) orelse return null;
+        if (target.is_whole_array and kind == .sadd) {
+            try self.addDiagnostic(.invalid_array_argument, name.span);
+            return null;
+        }
+        if (kind == .sadd and (target.value_type != .string or target.fixed_string_length != 0)) {
+            try self.addDiagnostic(.type_mismatch, name.span);
+        }
+        if (kind == .varptr_string and target.is_whole_array) {
+            try self.addDiagnostic(.invalid_array_argument, name.span);
+        }
+        if (!try self.expect(.right_paren)) return null;
+        _ = try self.emit(.guest_pointer, @intFromEnum(kind), 0, function_token.span);
+        return if (kind == .varptr_string) .string else .integer;
     }
 
     fn parseInputStringFunction(self: *Builder) !?bytecode.ValueType {
@@ -4258,9 +4477,10 @@ const Builder = struct {
         const function_token = self.advance();
         var argument_types: [3]bytecode.ValueType = undefined;
         var argument_count: usize = 0;
-        const allows_bare = builtin == .inkey_string or builtin == .timer or builtin == .rnd or builtin == .err or builtin == .erl or builtin == .csrlin or builtin == .freefile or
+        const allows_bare = builtin == .inkey_string or builtin == .timer or builtin == .rnd or builtin == .err or builtin == .erdev or builtin == .erdev_string or builtin == .erl or builtin == .csrlin or builtin == .freefile or
             builtin == .command_string or builtin == .date_string or builtin == .time_string;
         if (self.consume(.left_paren)) {
+            if (builtin == .ioctl_string) _ = self.consume(.hash);
             if (!self.consume(.right_paren)) {
                 while (true) {
                     if (argument_count >= argument_types.len) {
@@ -4296,7 +4516,7 @@ const Builder = struct {
             .left_string, .right_string, .string_string, .screen => 2,
             .point => 1,
             .pmap, .fileattr => 2,
-            .rnd, .inkey_string, .timer, .err, .erl, .csrlin, .freefile, .command_string, .date_string, .time_string => 0,
+            .rnd, .inkey_string, .timer, .err, .erdev, .erdev_string, .erl, .csrlin, .freefile, .command_string, .date_string, .time_string => 0,
             else => 1,
         };
         const expected_max: usize = switch (builtin) {
@@ -4337,6 +4557,8 @@ const Builder = struct {
             .str_string,
             .string_string,
             .ucase_string,
+            .ioctl_string,
+            .erdev_string,
             => .string,
             .inkey_string => .string,
             .command_string, .date_string, .environ_string, .time_string => .string,
@@ -4345,11 +4567,14 @@ const Builder = struct {
             .cvi,
             .csrlin,
             .err,
+            .erdev,
             .instr,
             .len,
             .eof,
             .fileattr,
             .freefile,
+            .inp,
+            .lpos,
             .peek,
             .pos,
             .screen,
@@ -4359,7 +4584,7 @@ const Builder = struct {
             .stick,
             .strig,
             => .integer,
-            .erl, .loc, .lof, .seek => .long,
+            .erl, .loc, .lof, .seek, .fre, .setmem => .long,
             .fix, .int => arguments[0],
             .val => .double,
             .point, .pmap, .rnd, .timer => .single,
@@ -4383,6 +4608,9 @@ const Builder = struct {
             .loc,
             .lof,
             .seek,
+            .inp,
+            .lpos,
+            .setmem,
             .atn,
             .cos,
             .exp,
@@ -4403,6 +4631,8 @@ const Builder = struct {
             .mksmbf_string,
             => if (!arguments[0].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
             .asc, .cvd, .cvdmbf, .cvi, .cvl, .cvs, .cvsmbf, .lcase_string, .ltrim_string, .len, .rtrim_string, .ucase_string, .val => if (arguments[0] != .string) try self.addDiagnostic(.type_mismatch, span),
+            .fre => {},
+            .ioctl_string => if (!arguments[0].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
             .left_string, .right_string => if (arguments[0] != .string or !arguments[1].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
             .instr => {
                 const offset: usize = if (arguments.len == 3) 1 else 0;
@@ -4433,7 +4663,7 @@ const Builder = struct {
             },
             .rnd => if (arguments.len == 1 and !arguments[0].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
             .environ_string => if (arguments[0] != .string and !arguments[0].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
-            .inkey_string, .timer, .err, .erl, .csrlin, .freefile, .command_string, .date_string, .time_string => {},
+            .inkey_string, .timer, .err, .erdev, .erdev_string, .erl, .csrlin, .freefile, .command_string, .date_string, .time_string => {},
         }
         return result;
     }
@@ -4988,6 +5218,9 @@ const Builder = struct {
                 .return_local = procedure.return_local,
                 .return_type = procedure.return_type,
                 .is_static = procedure.is_static,
+                .is_external = procedure.is_external or (procedure.declared and !procedure.defined),
+                .cdecl = procedure.cdecl,
+                .external_alias = procedure.external_alias,
                 .locals = locals,
                 .parameters = parameters,
             });
@@ -5538,10 +5771,16 @@ fn builtinForKeyword(keyword: frontend.Keyword) ?bytecode.Builtin {
         .eof => .eof,
         .fileattr => .fileattr,
         .freefile => .freefile,
+        .fre => .fre,
+        .inp => .inp,
+        .ioctl_string => .ioctl_string,
+        .lpos => .lpos,
         .loc => .loc,
         .lof => .lof,
         .seek => .seek,
         .err => .err,
+        .erdev => .erdev,
+        .erdev_string => .erdev_string,
         .erl => .erl,
         .inkey_string => .inkey_string,
         .play => .play,
@@ -5559,8 +5798,27 @@ fn builtinForKeyword(keyword: frontend.Keyword) ?bytecode.Builtin {
         .time_string => .time_string,
         .sqr => .sqr,
         .tan => .tan,
+        .setmem => .setmem,
         else => null,
     };
+}
+
+fn guestPointerKindForKeyword(keyword: frontend.Keyword) ?bytecode.GuestPointerKind {
+    return switch (keyword) {
+        .varptr => .varptr,
+        .varseg => .varseg,
+        .sadd => .sadd,
+        .varptr_string => .varptr_string,
+        else => null,
+    };
+}
+
+fn interruptCallKind(name: []const u8) ?bytecode.InterruptCallKind {
+    if (std.ascii.eqlIgnoreCase(name, "INT86OLD")) return .int86old;
+    if (std.ascii.eqlIgnoreCase(name, "INT86XOLD")) return .int86xold;
+    if (std.ascii.eqlIgnoreCase(name, "INTERRUPT")) return .interrupt;
+    if (std.ascii.eqlIgnoreCase(name, "INTERRUPTX")) return .interruptx;
+    return null;
 }
 
 fn parseNumericConstant(text: []u8) !bytecode.Constant {

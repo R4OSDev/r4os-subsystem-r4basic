@@ -1,7 +1,7 @@
 const std = @import("std");
 const frontend = @import("frontend.zig");
 
-pub const contract_version = "2.8.0";
+pub const contract_version = "2.9.0";
 pub const invalid_index: u32 = std.math.maxInt(u32);
 pub const unknown_dimensions: u8 = std.math.maxInt(u8);
 
@@ -72,6 +72,7 @@ pub const Variable = struct {
 pub const PassingMode = enum(u8) {
     by_ref,
     by_value,
+    by_segment,
 };
 
 pub const Parameter = struct {
@@ -179,6 +180,8 @@ pub const file_range_last: u32 = 1 << 1;
 pub const program_run_path: u32 = 1 << 0;
 pub const program_chain_all: u32 = 1 << 0;
 pub const program_chain_delete: u32 = 1 << 1;
+pub const external_call_all_far: u32 = 1 << 31;
+pub const external_call_argument_mask: u32 = ~external_call_all_far;
 
 pub const GraphicsBoxMode = enum(u8) {
     line,
@@ -227,6 +230,9 @@ pub const Procedure = struct {
     return_local: u32 = invalid_index,
     return_type: ValueType = .single,
     is_static: bool = false,
+    is_external: bool = false,
+    cdecl: bool = false,
+    external_alias: ?frontend.Span = null,
     locals: []Variable = &.{},
     parameters: []Parameter = &.{},
 
@@ -270,6 +276,13 @@ pub const OpCode = enum(u8) {
     reset_segment,
     peek,
     poke,
+    guest_pointer,
+    port_output,
+    port_wait,
+    device_ioctl,
+    call_absolute,
+    call_interrupt,
+    call_external,
     screen_mode_probe,
     graphics_palette,
     graphics_palette_using,
@@ -284,6 +297,9 @@ pub const OpCode = enum(u8) {
     graphics_get,
     graphics_put,
     text_width,
+    printer_width,
+    file_width,
+    device_width,
     text_color,
     text_cls,
     text_locate,
@@ -291,6 +307,7 @@ pub const OpCode = enum(u8) {
     mid_string_assign,
     print_begin_screen,
     print_begin_file,
+    print_begin_printer,
     print_value,
     print_using_begin,
     print_using_value,
@@ -427,10 +444,16 @@ pub const Builtin = enum(u8) {
     eof,
     fileattr,
     freefile,
+    fre,
+    inp,
+    ioctl_string,
+    lpos,
     loc,
     lof,
     seek,
     err,
+    erdev,
+    erdev_string,
     erl,
     inkey_string,
     play,
@@ -448,6 +471,21 @@ pub const Builtin = enum(u8) {
     time_string,
     sqr,
     tan,
+    setmem,
+};
+
+pub const GuestPointerKind = enum(u8) {
+    varptr,
+    varseg,
+    sadd,
+    varptr_string,
+};
+
+pub const InterruptCallKind = enum(u8) {
+    int86old,
+    int86xold,
+    interrupt,
+    interruptx,
 };
 
 pub const Instruction = struct {

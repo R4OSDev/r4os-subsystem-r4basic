@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 execution foundation
 
-Contract version: `2.8.0`
+Contract version: `2.9.0`
 
 This document freezes the executable R4BASIC foundation and its non-regression
 invariants while the complete v2 target in `COMPATIBILITY.md` and
@@ -224,8 +224,12 @@ The VM executes:
   NEXT`, and `RESUME` to a numeric or named label; `ERROR` raises an exact
   number from 1 through 255 through the same handler path;
 - cooperative `STOP` plus `TRON` and `TROFF`;
-- every 16-bit `DEF SEG` value for private memory-image transfers plus the
-  restricted segment-zero `PEEK` and `POKE` compatibility byte;
+- every 16-bit `DEF SEG` value; `PEEK`/`POKE`, `SADD`, `VARPTR`/`VARSEG`/
+  `VARPTR$`, `FRE`, `SETMEM`, and `CLEAR` memory parameters on one exact
+  private 1-MiB real-mode address space;
+- `INP`, `OUT`, cooperative `WAIT`, instruction-budgeted `CALL ABSOLUTE`,
+  private `CALL`/`CALLS`, and INT86/INTERRUPT register calls without direct
+  host memory, port, interrupt, or kernel access;
 - `SCREEN 0`, `1`, `2`, and `7` through `13`, independent active/visible
   pages, `PCOPY`, every mode-valid screen `WIDTH`, `COLOR`, `CLS`, `LOCATE`,
   and `VIEW PRINT` on the private text pages;
@@ -245,7 +249,8 @@ The VM executes:
 - `ON ... GOSUB` and `ON`/`OFF`/`STOP` for `KEY`, `TIMER`, `PLAY`, `COM`,
   `PEN`, `STRIG`, and `UEVENT`, plus soft-key `KEY`/`KEY LIST` and the ignored
   BASICA `STRIG ON`/`OFF` compatibility forms;
-- `RANDOMIZE`, `SLEEP`, and sequential `OPEN`/`CLOSE`;
+- `RANDOMIZE`, `SLEEP`, sequential and COM `OPEN`/`CLOSE`, `IOCTL`/
+  `IOCTL$`, `LPRINT`/`LPRINT USING`, `LPOS`, and every `WIDTH` target form;
 - `END`.
 
 Audio statements bind directly to instance-local bytecode operations. An
@@ -256,6 +261,10 @@ partially changing the queue or persistent music settings.
 
 - `DECLARE SUB`, `DECLARE FUNCTION`, `SUB`, `FUNCTION`, explicit `CALL`, and
   implicit SUB calls use validated signatures.
+- A declaration without a matching BASIC body becomes an explicit private
+  external declaration. `CDECL`, `ALIAS`, `BYVAL`/`BYREF`, `SEG`, and
+  `CALLS` bind only to registered R4Basic symbols; unknown names raise error
+  73. No process symbol table or native address is searched.
 - Parameters default to ByRef. An exact-type scalar lvalue aliases its
   storage; an expression uses a converted temporary as QuickBASIC does.
   `BYVAL` always copies and converts a scalar value.
@@ -287,12 +296,14 @@ partially changing the queue or persistent music settings.
 
 The executable built-ins include `ABS`, `ASC`, `ATN`, `CDBL`, `CHR$`,
 `CINT`, `CLNG`, `COS`, `CSNG`, `CSRLIN`, all IEEE/MBF `CV*` and `MK*`
-conversions, `EOF`, `ERR`, `ERL`, `EXP`, `FIX`, `HEX$`, `INKEY$`, `INPUT$`,
+conversions, `EOF`, `ERR`, `ERL`, `ERDEV`, `ERDEV$`, `EXP`, `FIX`, `FRE`,
+`HEX$`, `INKEY$`, `INP`, `INPUT$`, `IOCTL$`,
 `INSTR`, `INT`, `LCASE$`, `LEFT$`, `LEN`, `LOG`, `LTRIM$`, `MID$`,
-`OCT$`, `PEN`, `PLAY`, coordinate `POINT`, `POS`, `RIGHT$`, `RND`, `RTRIM$`,
+`OCT$`, `PEN`, `PLAY`, coordinate `POINT`, `POS`, `LPOS`, `RIGHT$`, `RND`, `RTRIM$`,
 text-query `SCREEN`, `SGN`, `SIN`, `SPACE$`, `SQR`, `STICK`, `STR$`, `STRIG`,
-`STRING$`, `TAN`, `TIMER`, `UCASE$`, and `VAL` with the arities and type
-categories defined by the source contract.
+`STRING$`, `SADD`, `SETMEM`, `TAN`, `TIMER`, `UCASE$`, `VAL`, `VARPTR`,
+`VARPTR$`, and `VARSEG` with the arities and type categories defined by the
+source contract.
 
 `ERR` returns the exact trapped QuickBASIC number. `ERL` returns the latest numbered line preceding the trapped instruction, or
 zero when no numbered line precedes it. Its identity comes from immutable
@@ -317,17 +328,34 @@ injected separately. A missing or failing required host result becomes a
 deterministic VM error; tests do not depend on hidden process-global hooks.
 
 `DEF SEG` selects an unsigned 16-bit real-mode guest segment and omitting its
-value resets the selection to zero. `BLOAD` and `BSAVE` are the only general
-memory consumers in this contract version. They operate on a lazily allocated,
-zero-initialized, per-VM address space covering the largest segment:offset
-linear address. The active mode's `A000` or `B800` video segment maps only to
-that page's QuickBASIC-packed raster. No guest address can become an R4OS or
-host pointer.
+value resets the selection. Every VM owns one lazily allocated, zero-filled,
+exactly 1-MiB address space. Physical addresses are computed as
+`(segment * 16 + offset) AND 0xFFFFF`; ranges wrap at the 20-bit boundary.
+`PEEK`/`POKE`, memory images, guest pointers, interrupts, external calls, and
+x86 instructions all use this one checked path. The active mode's `A000` or
+`B800` video segment maps only to that page's QuickBASIC-packed raster. A
+guest address is never cast to an R4OS, kernel, or host pointer.
 
-`PEEK` and `POKE` deliberately remain narrower until the 0.70.13 guest machine:
-they can read or replace only the private segment-zero byte at offset 1047,
-including its NumLock bit. Any other segment or offset raises the restricted
-memory error without exposing the memory-image address space.
+Scalar and packed numeric-array references receive stable private guest
+bindings. String bindings expose a length plus content offset, and
+`VARPTR$` emits the four-byte offset/segment descriptor used by foreign calls
+and compiled DRAW/PLAY macro expansion. Bindings synchronize before and
+after guest execution and are invalidated when their BASIC lifetime ends.
+The near allocator, far heap selected by `SETMEM`, configured stack selected
+by `CLEAR`, and every `FRE` query remain within the fixed address space.
+
+`CALL ABSOLUTE` starts at a guest code offset with a private sentinel stack
+and near pointers for reference arguments. The 16-bit interpreter supports
+the documented register/stack call shape, checks cancellation, and stops at
+an instruction budget. Its memory, port, and interrupt instructions call the
+same private adapters. INT86OLD/INT86XOLD and INTERRUPT/INTERRUPTX marshal
+exact register layouts into a bounded virtual BIOS/DOS table; unknown
+services and unknown external symbols raise error 73.
+
+The sparse 16-bit virtual port bus is VM-local. Only explicitly registered
+ports can be read or written. `WAIT` yields cooperatively while its masked
+condition is false; an unknown port raises error 68. No opcode can issue a
+native x86 IN, OUT, or interrupt instruction.
 
 `BSAVE` emits byte `FD`, little-endian segment, offset, and payload length,
 then exactly the requested bytes. `BLOAD` accepts that seven-byte QuickBASIC
@@ -580,9 +608,12 @@ reset, cancellation, or teardown.
   snapshot; an absent axis is neutral at 100. Even `STRIG` selectors read and
   clear a press latch, odd selectors read current state, and an event destroys
   its latch before entering the handler.
-- `UEVENT` and `COM(1|2)` expose instance-local signal entry points for a
-  future or optional R4OS producer. No host pointer, serial buffer, or device
-  handle enters the VM; an absent producer is simply inactive.
+- `UEVENT` remains an instance-local signal entry point. `OPEN COM` connects
+  COM1/COM2 to bounded private RX/TX buffers and signals the existing COM
+  source when input arrives. Partial `INPUT$` yields until the exact count or
+  a classified timeout; output overflow is error 69. `IOCTL`/`IOCTL$`
+  expose only the registered virtual status/control vocabulary. No host
+  pointer or device handle enters the VM.
 
 ## Guest time, pacing, and random state
 
@@ -627,6 +658,10 @@ reset, cancellation, or teardown.
   `INPUT`, `OUTPUT`, `APPEND`, `RANDOM`, and `BINARY` plus `ACCESS`,
   `SHARED`/`LOCK`, and `LEN`; the original mode-string form is equivalent.
   `CLOSE` accepts selected numbers or all slots, and `RESET` closes all.
+- `OPEN "COM1:..."` and `OPEN "COM2:..."` parse baud, parity, data/stop bits,
+  ASCII/BINARY, LF, receive/transmit bounds and timeouts into a virtual slot.
+  It never opens a storage path or native serial handle. `WIDTH #`, deferred
+  `WIDTH "COMn:"`, and formatted output share the slot's bounded line state.
 - A relative path is resolved against the explicit guest directory or,
   when absent, the directory of the absolute BAS file name. An absolute
   drive path remains absolute. Empty paths, invalid path bytes, drive-relative
@@ -673,8 +708,12 @@ reset, cancellation, or teardown.
 - Bad numbers, missing/existing files, wrong modes, duplicate slots, FIELD
   overflow/active state, bad record length/number, disk full, too many files,
   lock denial, input past end, bad names, path-not-found, and path/I/O failure
-  remain catchable distinct VM codes. Devices, printer and COM I/O, file
-  deletion, and directory mutation remain later platform work.
+  remain catchable distinct VM codes. Device timeout/fault/I/O/unavailable,
+  communication overflow and out-of-paper are distinct catchable codes.
+  `LPRINT`/`LPRINT USING` reuse the bounded formatter on a private spool of at
+  most 1 MiB; `LPOS`, `WIDTH LPRINT`, CR/LF normalization and unavailable
+  printer state operate without a blocking host channel. Device faults also
+  update `ERDEV` and `ERDEV$`.
 
 ## Error flow
 
@@ -752,7 +791,8 @@ reset, cancellation, or teardown.
 An immutable compiled program may be shared by multiple VMs. Each VM owns
 its globals, static-local backing cells, COMMON values, strings, array bounds
 and elements, record fields, aliases, DATA
-cursor, error handlers, compatibility byte, text cells and cursor, graphics
+cursor, error handlers, the exact 1-MiB guest machine, bindings, heaps,
+virtual ports, serial buffers and printer spool, text cells and cursor, graphics
 mode, current point, palette, pixels and damage, keyboard
 and pending input, guest time and sleep deadline, random generator, music
 settings, audio events and oscillator state, open files, evaluation stack,
@@ -767,35 +807,58 @@ change another instance.
 The failing instruction supplies the unchanged file name and exact byte,
 line, and column span. The stable v1 mappings are:
 
-| Runtime code | QBasic-compatible exit/error number |
+| Appendix-B identity | Number |
 | --- | ---: |
-| illegal function call | 5 |
-| overflow | 6 |
-| out of memory | 7 |
-| division by zero | 11 |
-| type mismatch | 13 |
-| out of DATA | 4 |
-| restricted compatibility memory | 5 |
-| subscript out of range | 9 |
-| array already dimensioned | 10 |
+| Syntax error | 2 |
+| RETURN without GOSUB | 3 |
+| Out of DATA | 4 |
+| Illegal function call | 5 |
+| Overflow | 6 |
+| Out of memory | 7 |
+| Subscript out of range | 9 |
+| Duplicate definition | 10 |
+| Division by zero | 11 |
+| Type mismatch | 13 |
+| Out of string space | 14 |
+| String formula too complex | 16 |
+| No RESUME | 19 |
 | RESUME without error | 20 |
+| Device timeout | 24 |
+| Device fault | 25 |
+| Out of paper | 27 |
+| CASE ELSE expected | 39 |
+| Variable required | 40 |
 | FIELD overflow | 50 |
-| bad file number | 52 |
-| file not found | 53 |
-| bad file mode | 54 |
-| file already open | 55 |
+| Internal error | 51 |
+| Bad file name or number | 52 |
+| File not found | 53 |
+| Bad file mode | 54 |
+| File already open | 55 |
 | FIELD statement active | 56 |
-| file already exists | 58 |
-| bad record length | 59 |
-| disk full | 61 |
-| input past end of file | 62 |
-| bad record number | 63 |
-| bad file name | 64 |
-| too many files | 67 |
-| permission denied | 70 |
-| path/file access failure | 75 |
-| path not found | 76 |
-| VM stack, frame, instruction, GOSUB, or host failure | 70 |
+| Device I/O error | 57 |
+| File already exists | 58 |
+| Bad record length | 59 |
+| Disk full | 61 |
+| Input past end of file | 62 |
+| Bad record number | 63 |
+| Bad file name | 64 |
+| Too many files | 67 |
+| Device unavailable | 68 |
+| Communication-buffer overflow | 69 |
+| Permission denied | 70 |
+| Disk not ready | 71 |
+| Disk-media error | 72 |
+| Advanced feature unavailable | 73 |
+| Rename across disks | 74 |
+| Path/File access error | 75 |
+| Path not found | 76 |
+
+`ERROR n` admits every number from 1 through 255 and therefore makes all 43
+Appendix-B identities directly testable through the same `ERR`, `ERL`,
+`ON ERROR`, and `RESUME` path. Natural language, file, memory, serial,
+printer, port, interrupt, and foreign-call paths use their specific entries;
+unexpected VM-internal invariant failures remain terminal and are not used as
+a substitute for a language error.
 
 Normal completion exits with `0`; cooperative cancellation exits with `130`.
 The first terminal state is sticky and subsequent slices execute no guest

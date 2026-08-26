@@ -4,10 +4,11 @@ const bytecode = @import("bytecode.zig");
 const event_dispatcher = @import("event_dispatcher.zig");
 const frontend = @import("frontend.zig");
 const graphics_screen = @import("graphics_screen.zig");
+const guest_machine = @import("guest_machine.zig");
 const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "2.8.0";
+pub const contract_version = "2.9.0";
 pub const default_instruction_budget: u32 = 262_144;
 pub const timer_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
@@ -22,6 +23,8 @@ pub const maximum_sequential_file_bytes: usize = 4 * 1024 * 1024;
 pub const sequential_file_transfer_bytes: usize = 64 * 1024;
 pub const file_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_file_number: usize = 255;
+pub const maximum_printer_spool_bytes: usize = 1024 * 1024;
+const printer_file_number: u8 = 0;
 pub const random_mask: u32 = 0x00FF_FFFF;
 pub const default_random_seed: u32 = 0x0005_0000;
 pub const numeric_format_buffer_bytes: usize = 128;
@@ -36,7 +39,7 @@ pub const maximum_draw_commands: usize = 16_384;
 pub const maximum_draw_expansion_depth: usize = 16;
 pub const maximum_play_expansion_bytes: usize = values.maximum_string_bytes;
 pub const maximum_play_expansion_depth: usize = 16;
-pub const maximum_guest_linear_bytes: usize = 0x10FFF0;
+pub const maximum_guest_linear_bytes: usize = guest_machine.memory_bytes;
 pub const memory_image_header_bytes: usize = 7;
 pub const maximum_memory_image_payload_bytes: usize = 65_535;
 pub const maximum_memory_image_file_bytes: usize = memory_image_header_bytes + maximum_memory_image_payload_bytes + 8;
@@ -219,6 +222,13 @@ pub const RuntimeCode = enum(u8) {
     permission_denied,
     path_not_found,
     path_file_access,
+    device_timeout,
+    device_fault,
+    out_of_paper,
+    device_io,
+    device_unavailable,
+    communication_overflow,
+    advanced_unavailable,
 };
 
 pub const RuntimeDiagnostic = struct {
@@ -258,6 +268,13 @@ pub const RuntimeDiagnostic = struct {
             .permission_denied => 70,
             .path_not_found => 76,
             .path_file_access => 75,
+            .device_timeout => 24,
+            .device_fault => 25,
+            .out_of_paper => 27,
+            .device_io => 57,
+            .device_unavailable => 68,
+            .communication_overflow => 69,
+            .advanced_unavailable => 73,
             .raised_error => 5,
             .stack_overflow, .stack_underflow, .call_depth_exceeded, .invalid_instruction, .host_failure => 70,
         };
@@ -449,6 +466,7 @@ const ExecutionError = values.Fault || error{
     RestrictedMemory,
     Rethrow,
     WouldBlock,
+    Cancelled,
     BadFileNumber,
     FileNotFound,
     BadFileMode,
@@ -465,6 +483,13 @@ const ExecutionError = values.Fault || error{
     PermissionDenied,
     PathNotFound,
     PathFileAccess,
+    DeviceTimeout,
+    DeviceFault,
+    OutOfPaper,
+    DeviceIo,
+    DeviceUnavailable,
+    CommunicationOverflow,
+    AdvancedUnavailable,
 };
 
 pub const Dimension = struct {
@@ -825,6 +850,18 @@ const FileRange = struct {
     last: u32,
 };
 
+const FileDevice = enum { storage, serial };
+
+const SerialSpec = struct {
+    port: u8,
+    baud: u16 = 300,
+    receive_capacity: u16 = 512,
+    transmit_capacity: u16 = 512,
+    lf: bool = false,
+    ascii: bool = false,
+    timeout_ms: u16 = 0,
+};
+
 const SequentialFile = struct {
     mode: bytecode.FileMode,
     access: bytecode.FileAccess = .default,
@@ -847,11 +884,22 @@ const SequentialFile = struct {
     output_head: usize = 0,
     output_total_bytes: usize = 0,
     print_column: usize = 0,
+    line_width: u8 = 0,
+    device: FileDevice = .storage,
+    serial_port: u8 = 0,
+    serial_baud: u16 = 300,
+    serial_receive_capacity: u16 = 512,
+    serial_transmit_capacity: u16 = 512,
+    serial_lf: bool = false,
+    serial_ascii: bool = false,
+    serial_overflow: bool = false,
+    ioctl_response: std.ArrayList(u8) = .empty,
 
     fn deinit(self: *SequentialFile, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
         self.input.deinit(allocator);
         self.output.deinit(allocator);
+        self.ioctl_response.deinit(allocator);
         if (self.record_buffer.len != 0) allocator.free(self.record_buffer);
         self.locks.deinit(allocator);
         self.* = undefined;
@@ -945,6 +993,14 @@ const DrawParseBudget = struct {
     commands: usize = 0,
 };
 
+const GuestBinding = struct {
+    reference: Reference,
+    address: guest_machine.Address,
+    data_address: ?guest_machine.Address = null,
+    byte_length: u32,
+    string_descriptor: bool = false,
+};
+
 const module_frame = bytecode.invalid_index;
 
 pub const Vm = struct {
@@ -1016,10 +1072,13 @@ pub const Vm = struct {
     module_error_handler_ip: u32 = bytecode.invalid_index,
     module_error_handler_active: bool = false,
     data_pointer: usize = 0,
-    compatibility_segment: u16 = 0,
+    compatibility_segment: u16 = guest_machine.default_data_segment,
     compatibility_segment_explicit: bool = false,
-    virtual_bios_byte: u8 = 0,
-    guest_memory: ?[]u8 = null,
+    guest: guest_machine.Machine,
+    guest_bindings: std.ArrayList(GuestBinding) = .empty,
+    guest_near_next: u32 = 0x0100,
+    guest_far_next: u32 = 0x40000,
+    configured_stack_bytes: u32 = 2048,
     text: text_screen.Screen = .{},
     graphics: graphics_screen.Screen = .{},
     screen_mode: i32 = 0,
@@ -1055,6 +1114,9 @@ pub const Vm = struct {
     random_state: u32 = default_random_seed,
     random_last: f32 = 0,
     open_files: std.ArrayList(FileSlot) = .empty,
+    serial_output: [2]std.ArrayList(u8) = .{ .empty, .empty },
+    serial_signals_ready: [2]bool = .{ true, true },
+    serial_line_width: [2]u8 = .{ 0, 0 },
     file_slot_indices: [maximum_file_number + 1]u8 = .{0} ** (maximum_file_number + 1),
     pending_open_file: ?SequentialFile = null,
     pending_open_number: u8 = 0,
@@ -1070,12 +1132,19 @@ pub const Vm = struct {
     pending_directory: ?PendingDirectory = null,
     transition: ?ProgramTransition = null,
     active_print_file: ?u8 = null,
+    printer_spool: std.ArrayList(u8) = .empty,
+    printer_column: usize = 0,
+    printer_width: usize = 80,
+    printer_available: bool = true,
     print_using_cursor: usize = 0,
     write_item_count: usize = 0,
     statement_stack_base: usize = 0,
     current_statement_start: u32 = bytecode.invalid_index,
     current_statement_next: u32 = bytecode.invalid_index,
     raised_error_number: u8 = 0,
+    last_device_error: i16 = 0,
+    last_device_name: [8]u8 = .{0} ** 8,
+    last_device_name_length: u8 = 0,
     stopped: bool = false,
     trace_enabled: bool = false,
     trace_entries: [maximum_trace_entries]TraceEntry = [_]TraceEntry{.{}} ** maximum_trace_entries,
@@ -1101,6 +1170,7 @@ pub const Vm = struct {
             .random_state = random_state,
             .random_last = randomValue(random_state),
             .audio_engine = audio.Engine.init(allocator),
+            .guest = guest_machine.Machine.init(allocator),
         };
         errdefer machine.deinit();
         try machine.initializePlatformState();
@@ -1130,12 +1200,15 @@ pub const Vm = struct {
         self.audio_engine.deinit();
         self.discardFiles();
         self.open_files.deinit(self.allocator);
+        for (&self.serial_output) |*output| output.deinit(self.allocator);
         self.discardPendingDirectory();
         if (self.transition) |*transition| transition.deinit(self.allocator);
         self.deinitPlatformState();
         self.text.deinit(self.allocator);
         self.graphics.deinit(self.allocator);
-        if (self.guest_memory) |memory| self.allocator.free(memory);
+        self.printer_spool.deinit(self.allocator);
+        self.guest_bindings.deinit(self.allocator);
+        self.guest.deinit();
         deinitGlobals(self.allocator, self.globals);
         self.* = undefined;
     }
@@ -1263,6 +1336,66 @@ pub const Vm = struct {
 
     pub fn setInputFocused(self: *Vm, focused: bool) void {
         self.input_focused = focused;
+    }
+
+    pub fn defineVirtualPort(self: *Vm, port: u16, initial: u8) std.mem.Allocator.Error!void {
+        self.guest.definePort(port, initial) catch return error.OutOfMemory;
+    }
+
+    pub fn setVirtualPort(self: *Vm, port: u16, value: u8) bool {
+        self.guest.writePort(port, value) catch return false;
+        return true;
+    }
+
+    pub fn virtualPort(self: *const Vm, port: u16) ?u8 {
+        return self.guest.readPort(port) catch null;
+    }
+
+    pub fn setPrinterAvailable(self: *Vm, available: bool) void {
+        self.printer_available = available;
+    }
+
+    pub fn printerSpool(self: *const Vm) []const u8 {
+        return self.printer_spool.items;
+    }
+
+    pub fn setSerialSignalsReady(self: *Vm, port: u8, ready: bool) bool {
+        if (port < 1 or port > 2) return false;
+        self.serial_signals_ready[port - 1] = ready;
+        return true;
+    }
+
+    pub fn feedSerial(self: *Vm, port: u8, bytes: []const u8) bool {
+        if (port < 1 or port > 2) return false;
+        for (self.open_files.items) |*slot| {
+            var file = &slot.file;
+            if (file.device != .serial or file.serial_port != port) continue;
+            const available = file.input.items.len - file.input_head;
+            if (bytes.len > file.serial_receive_capacity -| available) {
+                file.serial_overflow = true;
+                _ = self.events.signal(.com, port) catch false;
+                return false;
+            }
+            file.input.appendSlice(self.allocator, bytes) catch {
+                file.serial_overflow = true;
+                return false;
+            };
+            file.input_eof = false;
+            _ = self.events.signal(.com, port) catch false;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn serialOutput(self: *const Vm, port: u8) ?[]const u8 {
+        if (port < 1 or port > 2) return null;
+        return self.serial_output[port - 1].items;
+    }
+
+    pub fn clearSerialOutput(self: *Vm, port: u8) bool {
+        if (port < 1 or port > 2) return false;
+        self.serial_output[port - 1].clearRetainingCapacity();
+        return true;
     }
 
     pub fn noteInputControl(self: *Vm, stamp: InputStamp) void {
@@ -1593,13 +1726,13 @@ pub const Vm = struct {
         self.module_error_handler_ip = bytecode.invalid_index;
         self.module_error_handler_active = false;
         self.data_pointer = 0;
-        self.compatibility_segment = 0;
+        self.compatibility_segment = guest_machine.default_data_segment;
         self.compatibility_segment_explicit = false;
-        self.virtual_bios_byte = 0;
-        if (self.guest_memory) |memory| {
-            self.allocator.free(memory);
-            self.guest_memory = null;
-        }
+        self.guest.reset();
+        self.guest_bindings.clearRetainingCapacity();
+        self.guest_near_next = 0x0100;
+        self.guest_far_next = 0x40000;
+        self.configured_stack_bytes = 2048;
         self.text.resetAllocated(self.allocator);
         self.graphics.reset(self.allocator);
         self.screen_mode = 0;
@@ -1636,17 +1769,27 @@ pub const Vm = struct {
         self.discardPendingFileTransfer();
         self.discardPendingMemoryImage();
         self.discardFiles();
+        for (&self.serial_output) |*output| output.clearRetainingCapacity();
+        self.serial_signals_ready = .{ true, true };
+        self.serial_line_width = .{ 0, 0 };
         self.discardPendingDirectory();
         if (self.transition) |*transition| transition.deinit(self.allocator);
         self.transition = null;
         try self.resetPlatformState();
         self.active_print_file = null;
+        self.printer_spool.clearRetainingCapacity();
+        self.printer_column = 0;
+        self.printer_width = 80;
+        self.printer_available = true;
         self.print_using_cursor = 0;
         self.write_item_count = 0;
         self.statement_stack_base = 0;
         self.current_statement_start = bytecode.invalid_index;
         self.current_statement_next = bytecode.invalid_index;
         self.raised_error_number = 0;
+        self.last_device_error = 0;
+        self.last_device_name = .{0} ** 8;
+        self.last_device_name_length = 0;
         self.stopped = false;
         self.trace_enabled = false;
         self.trace_entries = [_]TraceEntry{.{}} ** maximum_trace_entries;
@@ -1707,6 +1850,11 @@ pub const Vm = struct {
             self.enterInstructionStatement(instruction_index);
             self.instruction_pointer += 1;
             self.execute(instruction_index, instruction) catch |fault| {
+                if (fault == error.Cancelled) {
+                    self.status = .cancelled;
+                    self.exit_code = 130;
+                    return .{ .status = .cancelled, .instructions = executed };
+                }
                 if (fault == error.WouldBlock) {
                     self.instruction_pointer = instruction_index;
                     self.status = .waiting;
@@ -1725,6 +1873,7 @@ pub const Vm = struct {
                         instruction_index,
                         if (fault == error.RaisedError) self.raised_error_number else 0,
                     );
+                self.noteDeviceDiagnostic(diagnostic.code);
                 self.raised_error_number = 0;
                 if (fault != error.Rethrow and self.trapError(diagnostic, instruction_index)) {
                     const group = self.recordOperation(instruction.op);
@@ -1942,13 +2091,11 @@ pub const Vm = struct {
     }
 
     pub fn virtualNumLockByte(self: *const Vm) u8 {
-        return self.virtual_bios_byte;
+        return self.guest.readExistingByte(.{ .segment = 0, .offset = 1047 });
     }
 
     pub fn guestMemoryByte(self: *const Vm, segment: u16, offset: u16) ?u8 {
-        const memory = self.guest_memory orelse return 0;
-        const first = guestLinearRange(segment, offset, 1) catch return null;
-        return memory[first];
+        return self.guest.readExistingByte(.{ .segment = segment, .offset = offset });
     }
 
     fn globalCell(self: *const Vm, name: []const u8) ?*const Cell {
@@ -2122,6 +2269,9 @@ pub const Vm = struct {
             .graphics_put,
             => .graphics,
             .text_width,
+            .printer_width,
+            .file_width,
+            .device_width,
             .text_color,
             .text_cls,
             .text_locate,
@@ -2145,7 +2295,15 @@ pub const Vm = struct {
             .reset_segment,
             .peek,
             .poke,
+            .guest_pointer,
+            .port_output,
+            .port_wait,
+            .device_ioctl,
+            .call_absolute,
+            .call_interrupt,
+            .call_external,
             .print_begin_file,
+            .print_begin_printer,
             .input_file,
             .input_string,
             .randomize,
@@ -2220,11 +2378,18 @@ pub const Vm = struct {
             .resume_label => try self.resumeError(.label, instruction.a),
             .set_segment => try self.setSegment(),
             .reset_segment => {
-                self.compatibility_segment = 0;
+                self.compatibility_segment = guest_machine.default_data_segment;
                 self.compatibility_segment_explicit = false;
             },
             .peek => try self.peek(),
             .poke => try self.poke(),
+            .guest_pointer => try self.guestPointer(@enumFromInt(@as(u8, @intCast(instruction.a)))),
+            .port_output => try self.portOutput(),
+            .port_wait => try self.portWait(instruction_index, instruction.a != 0),
+            .device_ioctl => try self.deviceIoctl(),
+            .call_absolute => try self.callAbsolute(instruction.a),
+            .call_interrupt => try self.callInterrupt(@enumFromInt(@as(u8, @intCast(instruction.a)))),
+            .call_external => try self.callExternal(instruction.a, instruction.b),
             .screen_mode_probe => try self.screenModeProbe(instruction.a, instruction.b),
             .graphics_palette => try self.graphicsPalette(instruction.a),
             .graphics_palette_using => try self.graphicsPaletteUsing(instruction.a),
@@ -2239,6 +2404,9 @@ pub const Vm = struct {
             .graphics_get => try self.graphicsGet(instruction.a),
             .graphics_put => try self.graphicsPut(instruction.a, instruction.b),
             .text_width => try self.textWidth(instruction.a, instruction.b),
+            .printer_width => try self.printerWidth(),
+            .file_width => try self.fileWidth(),
+            .device_width => try self.deviceWidth(),
             .text_color => try self.textColor(instruction.a, instruction.b),
             .text_cls => try self.textCls(instruction.a),
             .text_locate => try self.textLocate(instruction.a, instruction.b),
@@ -2246,6 +2414,7 @@ pub const Vm = struct {
             .mid_string_assign => try self.midStringAssign(instruction.a != 0),
             .print_begin_screen => self.active_print_file = null,
             .print_begin_file => try self.printBeginFile(),
+            .print_begin_printer => self.active_print_file = printer_file_number,
             .print_value => try self.printValue(),
             .print_using_begin => try self.printUsingBegin(),
             .print_using_value => try self.printUsingValue(),
@@ -2449,6 +2618,7 @@ pub const Vm = struct {
     }
 
     fn dimensionArray(self: *Vm, dimension_count: u32, redimension: bool, preserve_or_once: bool) ExecutionError!void {
+        self.guest_bindings.clearRetainingCapacity();
         if (dimension_count == 0 or dimension_count > 60) return error.InvalidInstruction;
         const root = try (try self.popReference()).aggregateCell();
         const array = switch (root.owned) {
@@ -2692,6 +2862,7 @@ pub const Vm = struct {
     }
 
     fn eraseArray(self: *Vm) ExecutionError!void {
+        self.guest_bindings.clearRetainingCapacity();
         const root = try (try self.popReference()).aggregateCell();
         const array = switch (root.owned) {
             .array => |*value| value,
@@ -2780,13 +2951,17 @@ pub const Vm = struct {
             var stack_value = try self.popValue();
             defer stack_value.deinit(self.allocator);
             const requested = try values.asLong(stack_value);
-            if (requested < 0) return error.IllegalFunctionCall;
+            if (requested < 0 or requested > 65_535 - 2048) return error.IllegalFunctionCall;
+            self.configured_stack_bytes = 2048 + @as(u32, @intCast(requested));
         }
         self.discardStackFrom(0);
         self.gosub_stack.clearRetainingCapacity();
         for (self.globals) |*global_cell| try self.clearCell(global_cell);
-        if (self.guest_memory) |memory| @memset(memory, 0);
-        self.compatibility_segment = 0;
+        self.guest.reset();
+        self.guest_bindings.clearRetainingCapacity();
+        self.guest_near_next = 0x0100;
+        self.guest_far_next = 0x40000;
+        self.compatibility_segment = guest_machine.default_data_segment;
         self.compatibility_segment_explicit = false;
         self.draw_angle_degrees = 0;
         self.draw_scale = 1;
@@ -3043,9 +3218,10 @@ pub const Vm = struct {
     fn peek(self: *Vm) ExecutionError!void {
         var address = try self.popValue();
         defer address.deinit(self.allocator);
-        if (!self.compatibility_segment_explicit or self.compatibility_segment != 0 or
-            try values.asLong(address) != 1047) return error.RestrictedMemory;
-        try self.pushValue(.{ .integer = self.virtual_bios_byte });
+        const offset = try unsignedWord(try values.asLong(address));
+        try self.syncGuestBindingsToMemory();
+        const byte = self.guest.readByte(.{ .segment = self.compatibility_segment, .offset = offset }) catch return error.OutOfMemory;
+        try self.pushValue(.{ .integer = byte });
     }
 
     fn poke(self: *Vm) ExecutionError!void {
@@ -3053,13 +3229,203 @@ pub const Vm = struct {
         defer byte_value.deinit(self.allocator);
         var address = try self.popValue();
         defer address.deinit(self.allocator);
+        const offset = try unsignedWord(try values.asLong(address));
         const byte = try values.asLong(byte_value);
-        if (!self.compatibility_segment_explicit or self.compatibility_segment != 0 or
-            try values.asLong(address) != 1047 or byte < 0 or byte > 255)
-        {
-            return error.RestrictedMemory;
+        if (byte < 0 or byte > 255) return error.IllegalFunctionCall;
+        try self.syncGuestBindingsToMemory();
+        self.guest.writeByte(.{ .segment = self.compatibility_segment, .offset = offset }, @intCast(byte)) catch return error.OutOfMemory;
+        try self.syncGuestBindingsFromMemory();
+    }
+
+    fn guestPointer(self: *Vm, kind: bytecode.GuestPointerKind) ExecutionError!void {
+        const reference = try self.popReference();
+        const binding = try self.createGuestBinding(reference, kind == .sadd);
+        switch (kind) {
+            .varptr => try self.pushValue(.{ .integer = @bitCast(binding.address.offset) }),
+            .varseg => try self.pushValue(.{ .integer = @bitCast(binding.address.segment) }),
+            .sadd => {
+                const data_address = binding.data_address orelse return error.IllegalFunctionCall;
+                if (data_address.segment != guest_machine.default_data_segment) return error.OutOfMemory;
+                try self.pushValue(.{ .integer = @bitCast(data_address.offset) });
+            },
+            .varptr_string => {
+                const bytes = try self.allocator.alloc(u8, 4);
+                std.mem.writeInt(u16, bytes[0..2], binding.address.offset, .little);
+                std.mem.writeInt(u16, bytes[2..4], binding.address.segment, .little);
+                try self.pushValue(.{ .string = bytes });
+            },
         }
-        self.virtual_bios_byte = @intCast(byte);
+    }
+
+    fn createGuestBinding(self: *Vm, reference: Reference, require_string_data: bool) ExecutionError!GuestBinding {
+        const dynamic_string = switch (reference) {
+            .cell => |cell| switch ((resolveCell(cell) orelse return error.InvalidInstruction).owned) {
+                .scalar => |value| value == .string,
+                .field_string => true,
+                else => false,
+            },
+            else => false,
+        };
+        if (require_string_data and !dynamic_string) return error.IllegalFunctionCall;
+        for (self.guest_bindings.items) |*existing| {
+            if (!referencesEqual(existing.reference, reference)) continue;
+            if (require_string_data and existing.data_address == null) return error.IllegalFunctionCall;
+            try self.writeGuestBinding(existing);
+            return existing.*;
+        }
+
+        var binding: GuestBinding = undefined;
+        if (dynamic_string) {
+            const value = try reference.value();
+            const bytes = switch (value) {
+                .string => |payload| payload,
+                else => return error.TypeMismatch,
+            };
+            if (bytes.len > values.maximum_string_bytes) return error.OutOfMemory;
+            const descriptor = try self.allocateGuestNear(4, 2);
+            const data = try self.allocateGuestNear(@max(@as(usize, 1), bytes.len), 1);
+            binding = .{
+                .reference = reference,
+                .address = descriptor,
+                .data_address = data,
+                .byte_length = @intCast(bytes.len),
+                .string_descriptor = true,
+            };
+        } else {
+            const length = try referenceByteLength(self.program, reference);
+            if (length == 0 or length > guest_machine.memory_bytes) return error.OutOfMemory;
+            const reservation = @max(length, self.guestReferenceExtent(reference) orelse length);
+            const address = self.allocateGuestNear(reservation, @min(length, 2)) catch try self.allocateGuestFar(reservation, @min(length, 2));
+            binding = .{ .reference = reference, .address = address, .byte_length = @intCast(length) };
+        }
+        try self.guest_bindings.append(self.allocator, binding);
+        try self.writeGuestBinding(&self.guest_bindings.items[self.guest_bindings.items.len - 1]);
+        return binding;
+    }
+
+    fn guestReferenceExtent(self: *Vm, reference: Reference) ?usize {
+        for (self.globals) |*cell| if (cellReferenceExtent(cell, reference)) |extent| return extent;
+        for (self.frames.items) |frame| {
+            const storage = &self.frame_local_storage.items[frame.local_pool_index];
+            var current = frame.initialized_local_head;
+            while (current != bytecode.invalid_index) {
+                const slot = &storage.slots.items[current];
+                if (slot.generation == frame.local_generation) if (cellReferenceExtent(&slot.cell, reference)) |extent| return extent;
+                current = slot.next_initialized;
+            }
+        }
+        return null;
+    }
+
+    fn allocateGuestNear(self: *Vm, length: usize, alignment: usize) ExecutionError!guest_machine.Address {
+        const aligned = std.mem.alignForward(usize, self.guest_near_next, @max(@as(usize, 1), alignment));
+        if (length > 65_536 or aligned > 65_536 - length) return error.OutOfMemory;
+        self.guest_near_next = @intCast(aligned + length);
+        return .{ .segment = guest_machine.default_data_segment, .offset = @intCast(aligned) };
+    }
+
+    fn allocateGuestFar(self: *Vm, length: usize, alignment: usize) ExecutionError!guest_machine.Address {
+        const aligned = std.mem.alignForward(usize, self.guest_far_next, @max(@as(usize, 1), alignment));
+        if (length > guest_machine.memory_bytes or aligned > 0xE0000 - length) return error.OutOfMemory;
+        self.guest_far_next = @intCast(aligned + length);
+        return .{ .segment = @intCast(aligned >> 4), .offset = @intCast(aligned & 0xF) };
+    }
+
+    fn writeGuestBinding(self: *Vm, binding: *const GuestBinding) ExecutionError!void {
+        if (binding.string_descriptor) {
+            const data_address = binding.data_address orelse return error.InvalidInstruction;
+            const value = try binding.reference.value();
+            const bytes = switch (value) {
+                .string => |payload| payload,
+                else => return error.TypeMismatch,
+            };
+            if (bytes.len > values.maximum_string_bytes) return error.OutOfMemory;
+            self.guest.writeRange(data_address, bytes) catch |fault| return switch (fault) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.InvalidRange => error.InvalidInstruction,
+            };
+            var descriptor: [4]u8 = undefined;
+            std.mem.writeInt(u16, descriptor[0..2], @intCast(bytes.len), .little);
+            std.mem.writeInt(u16, descriptor[2..4], data_address.offset, .little);
+            self.guest.writeRange(binding.address, &descriptor) catch |fault| return switch (fault) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.InvalidRange => error.InvalidInstruction,
+            };
+            return;
+        }
+        const length: usize = @intCast(binding.byte_length);
+        const buffer = try self.allocator.alloc(u8, length);
+        defer self.allocator.free(buffer);
+        try encodeReference(self.program, binding.reference, buffer);
+        self.guest.writeRange(binding.address, buffer) catch |fault| return switch (fault) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidRange => error.InvalidInstruction,
+        };
+    }
+
+    fn readGuestBinding(self: *Vm, binding: *const GuestBinding) ExecutionError!void {
+        if (binding.string_descriptor) {
+            var descriptor: [4]u8 = undefined;
+            self.guest.readRange(binding.address, &descriptor) catch |fault| return switch (fault) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.InvalidRange => error.InvalidInstruction,
+            };
+            const length = std.mem.readInt(u16, descriptor[0..2], .little);
+            const offset = std.mem.readInt(u16, descriptor[2..4], .little);
+            if (length > values.maximum_string_bytes) return error.OutOfMemory;
+            const bytes = try self.allocator.alloc(u8, length);
+            errdefer self.allocator.free(bytes);
+            self.guest.readRange(.{ .segment = guest_machine.default_data_segment, .offset = offset }, bytes) catch |fault| return switch (fault) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.InvalidRange => error.InvalidInstruction,
+            };
+            try binding.reference.replace(self.allocator, .{ .string = bytes });
+            return;
+        }
+        const length: usize = @intCast(binding.byte_length);
+        const buffer = try self.allocator.alloc(u8, length);
+        defer self.allocator.free(buffer);
+        self.guest.readRange(binding.address, buffer) catch |fault| return switch (fault) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidRange => error.InvalidInstruction,
+        };
+        try decodeReference(self.program, binding.reference, buffer);
+    }
+
+    fn syncGuestBindingsToMemory(self: *Vm) ExecutionError!void {
+        for (self.guest_bindings.items) |*binding| try self.writeGuestBinding(binding);
+    }
+
+    fn syncGuestBindingsFromMemory(self: *Vm) ExecutionError!void {
+        for (self.guest_bindings.items) |*binding| try self.readGuestBinding(binding);
+    }
+
+    fn portOutput(self: *Vm) ExecutionError!void {
+        var value = try self.popValue();
+        defer value.deinit(self.allocator);
+        var port_value = try self.popValue();
+        defer port_value.deinit(self.allocator);
+        const port = try unsignedWord(try values.asLong(port_value));
+        const byte = try values.asLong(value);
+        if (byte < 0 or byte > 255) return error.IllegalFunctionCall;
+        self.guest.writePort(port, @intCast(byte)) catch return error.DeviceUnavailable;
+    }
+
+    fn portWait(self: *Vm, _: u32, has_xor: bool) ExecutionError!void {
+        const count: usize = if (has_xor) 3 else 2;
+        if (self.stack.items.len < count) return error.StackUnderflow;
+        const base = self.stack.items.len - count;
+        const port = try unsignedWord(try values.asLong(try self.stackValueAt(base)));
+        const and_mask_raw = try values.asLong(try self.stackValueAt(base + 1));
+        const xor_mask_raw = if (has_xor) try values.asLong(try self.stackValueAt(base + 2)) else 0;
+        if (and_mask_raw < 0 or and_mask_raw > 255 or xor_mask_raw < 0 or xor_mask_raw > 255) {
+            return error.IllegalFunctionCall;
+        }
+        const input = self.guest.readPort(port) catch return error.DeviceUnavailable;
+        if (((input ^ @as(u8, @intCast(xor_mask_raw))) & @as(u8, @intCast(and_mask_raw))) == 0) {
+            return error.WouldBlock;
+        }
+        self.discardStackFrom(base);
     }
 
     fn screenModeProbe(self: *Vm, mask: u32, argument_count: u32) ExecutionError!void {
@@ -3482,6 +3848,12 @@ pub const Vm = struct {
                             try self.appendDrawOperation(budget, operations, .{ .paint = .{ .fill = fill, .border = border } });
                         },
                         'X' => {
+                            if (self.referenceFromPointerString(macro, &index)) |reference| {
+                                const value = try reference.value();
+                                const substring = switch (value) { .string => |bytes| bytes, else => return error.TypeMismatch };
+                                try self.parseDrawMacroBytes(substring, depth + 1, budget, operations);
+                                continue;
+                            }
                             const name = try parseDrawVariableName(macro, &index, true);
                             const value = try self.drawVariableValue(name);
                             const substring = switch (value.*) {
@@ -3519,6 +3891,11 @@ pub const Vm = struct {
         }
         if (index.* < macro.len and macro[index.*] == '=') {
             index.* += 1;
+            if (self.referenceFromPointerString(macro, index)) |reference| {
+                const number = try values.asDouble(try reference.value());
+                if (!std.math.isFinite(number)) return error.IllegalFunctionCall;
+                return sign * number;
+            }
             const name = try parseDrawVariableName(macro, index, false);
             const value = try self.drawVariableValue(name);
             const number = try values.asDouble(value.*);
@@ -3677,6 +4054,10 @@ pub const Vm = struct {
         if (arguments[0] == null and arguments[1] == null) return;
         const columns_value = arguments[0] orelse @as(i32, @intCast(self.text.active_columns));
         const rows_value = arguments[1] orelse @as(i32, @intCast(self.text.active_rows));
+        try self.setTextGeometry(columns_value, rows_value);
+    }
+
+    fn setTextGeometry(self: *Vm, columns_value: i32, rows_value: i32) ExecutionError!void {
         if (!validTextGeometry(self.screen_mode, columns_value, rows_value)) return error.IllegalFunctionCall;
         self.graphics.setModePages(
             self.allocator,
@@ -3699,6 +4080,51 @@ pub const Vm = struct {
             error.IllegalFunctionCall => error.IllegalFunctionCall,
         };
         self.syncTextToGraphics();
+    }
+
+    fn printerWidth(self: *Vm) ExecutionError!void {
+        const width = try self.popLong();
+        if (width < 0 or width > 255) return error.IllegalFunctionCall;
+        self.printer_width = @intCast(width);
+        if (self.printer_width != 0) self.printer_column = @min(self.printer_column, self.printer_width - 1);
+    }
+
+    fn fileWidth(self: *Vm) ExecutionError!void {
+        if (self.stack.items.len < 2) return error.StackUnderflow;
+        const base = self.stack.items.len - 2;
+        const file_number = try self.fileNumberAt(base);
+        const width = try values.asLong(try self.stackValueAt(base + 1));
+        if (width < 0 or width > 255) return error.IllegalFunctionCall;
+        const file = try self.fileAt(file_number);
+        if (file.mode != .random and file.mode != .binary) {
+            file.line_width = @intCast(width);
+            if (file.line_width != 0) file.print_column = @min(file.print_column, @as(usize, file.line_width - 1));
+        }
+        self.discardStackFrom(base);
+    }
+
+    fn deviceWidth(self: *Vm) ExecutionError!void {
+        if (self.stack.items.len < 2) return error.StackUnderflow;
+        const base = self.stack.items.len - 2;
+        const device_value = try self.stackValueAt(base);
+        const device = switch (device_value) {
+            .string => |bytes| std.mem.trim(u8, bytes, " \t"),
+            else => return error.TypeMismatch,
+        };
+        const width = try values.asLong(try self.stackValueAt(base + 1));
+        if (width < 0 or width > 255) return error.IllegalFunctionCall;
+        if (std.ascii.eqlIgnoreCase(device, "COM1:")) {
+            self.serial_line_width[0] = @intCast(width);
+        } else if (std.ascii.eqlIgnoreCase(device, "COM2:")) {
+            self.serial_line_width[1] = @intCast(width);
+        } else if (std.ascii.eqlIgnoreCase(device, "LPT1:")) {
+            self.printer_width = @intCast(width);
+            if (self.printer_width != 0) self.printer_column = @min(self.printer_column, self.printer_width - 1);
+        } else if (std.ascii.eqlIgnoreCase(device, "SCRN:") or std.ascii.eqlIgnoreCase(device, "CONS:")) {
+            if (width != 40 and width != 80) return error.IllegalFunctionCall;
+            try self.setTextGeometry(width, @intCast(self.text.active_rows));
+        } else return error.DeviceUnavailable;
+        self.discardStackFrom(base);
     }
 
     fn textColor(self: *Vm, mask: u32, argument_count: u32) ExecutionError!void {
@@ -3802,7 +4228,9 @@ pub const Vm = struct {
     fn printBeginFile(self: *Vm) ExecutionError!void {
         const file_number = try self.popFileNumber();
         const file = try self.fileAt(file_number);
-        if (file.mode != .output and file.mode != .append) return error.BadFileMode;
+        if (file.device == .serial) {
+            if (!fileCanWrite(file)) return error.BadFileMode;
+        } else if (file.mode != .output and file.mode != .append) return error.BadFileMode;
         self.active_print_file = @intCast(file_number);
     }
 
@@ -4020,6 +4448,7 @@ pub const Vm = struct {
 
     fn printBytes(self: *Vm, bytes: []const u8) ExecutionError!void {
         if (self.active_print_file) |raw_number| {
+            if (raw_number == printer_file_number) return self.appendPrinterBytes(bytes);
             const file = try self.fileAt(raw_number);
             if (file.mode != .output and file.mode != .append) return error.BadFileMode;
             try self.appendFileBytes(file, bytes);
@@ -4033,19 +4462,24 @@ pub const Vm = struct {
         const requested = try values.asLong(try self.stackValueAt(self.stack.items.len - 1));
         if (requested < 1 or requested > 255) return error.IllegalFunctionCall;
         if (self.active_print_file) |raw_number| {
+            if (raw_number == printer_file_number) {
+                const target: usize = @intCast(requested - 1);
+                if (target < self.printer_column) try self.appendPrinterBytes("\r\n");
+                try self.printSpaces(target -| self.printer_column);
+                self.discardStackFrom(self.stack.items.len - 1);
+                return;
+            }
             const file = try self.fileAt(raw_number);
             const target: usize = @intCast(requested - 1);
-            const newline = target < file.print_column;
-            const spaces = if (newline) target else target - file.print_column;
-            const additional = spaces + if (newline) @as(usize, 2) else 0;
-            try self.ensureFileOutputSpace(file, additional);
-            if (newline) try file.output.appendSlice(self.allocator, "\r\n");
-            try file.output.appendNTimes(self.allocator, ' ', spaces);
-            file.output_total_bytes += additional;
-            file.next_position +|= @intCast(additional);
-            file.size = @max(file.size, file.next_position - 1);
-            file.print_column = target;
-            self.noteFileOutputBuffer(file);
+            if (target < file.print_column) try self.appendFileBytes(file, "\r\n");
+            const spaces = target -| file.print_column;
+            const blank = [_]u8{' '} ** text_screen.columns;
+            var remaining = spaces;
+            while (remaining != 0) {
+                const amount = @min(remaining, blank.len);
+                try self.appendFileBytes(file, blank[0..amount]);
+                remaining -= amount;
+            }
             self.discardStackFrom(self.stack.items.len - 1);
             return;
         }
@@ -4055,6 +4489,11 @@ pub const Vm = struct {
 
     fn printComma(self: *Vm) ExecutionError!void {
         if (self.active_print_file) |raw_number| {
+            if (raw_number == printer_file_number) {
+                const next = (self.printer_column / text_screen.print_zone_columns + 1) * text_screen.print_zone_columns;
+                try self.printSpaces(next - self.printer_column);
+                return;
+            }
             const file = try self.fileAt(raw_number);
             const next = (file.print_column / text_screen.print_zone_columns + 1) * text_screen.print_zone_columns;
             try self.printSpaces(next - file.print_column);
@@ -4065,14 +4504,24 @@ pub const Vm = struct {
 
     fn printSpaces(self: *Vm, count: usize) ExecutionError!void {
         if (self.active_print_file) |raw_number| {
+            if (raw_number == printer_file_number) {
+                const spaces = [_]u8{' '} ** text_screen.columns;
+                var remaining = count;
+                while (remaining != 0) {
+                    const amount = @min(remaining, spaces.len);
+                    try self.appendPrinterBytes(spaces[0..amount]);
+                    remaining -= amount;
+                }
+                return;
+            }
             const file = try self.fileAt(raw_number);
-            try self.ensureFileOutputSpace(file, count);
-            try file.output.appendNTimes(self.allocator, ' ', count);
-            file.output_total_bytes += count;
-            file.next_position +|= @intCast(count);
-            file.size = @max(file.size, file.next_position - 1);
-            file.print_column +|= count;
-            self.noteFileOutputBuffer(file);
+            const blank = [_]u8{' '} ** text_screen.columns;
+            var remaining = count;
+            while (remaining != 0) {
+                const amount = @min(remaining, blank.len);
+                try self.appendFileBytes(file, blank[0..amount]);
+                remaining -= amount;
+            }
             return;
         }
         const spaces = [_]u8{' '} ** text_screen.columns;
@@ -4092,16 +4541,147 @@ pub const Vm = struct {
         }
     }
 
+    fn appendPrinterBytes(self: *Vm, bytes: []const u8) ExecutionError!void {
+        if (!self.printer_available) return error.OutOfPaper;
+        var index: usize = 0;
+        while (index < bytes.len) : (index += 1) {
+            const byte = bytes[index];
+            const adds_line_feed = byte == '\r' and (index + 1 == bytes.len or bytes[index + 1] != '\n');
+            const required: usize = 1 + @as(usize, @intFromBool(adds_line_feed));
+            if (required > maximum_printer_spool_bytes -| self.printer_spool.items.len) return error.DeviceIo;
+            try self.printer_spool.append(self.allocator, byte);
+            switch (byte) {
+                '\r', '\n' => self.printer_column = 0,
+                else => {
+                    self.printer_column += 1;
+                    if (self.printer_width != 0 and self.printer_column >= self.printer_width) {
+                        if (2 > maximum_printer_spool_bytes -| self.printer_spool.items.len) return error.DeviceIo;
+                        try self.printer_spool.appendSlice(self.allocator, "\r\n");
+                        self.printer_column = 0;
+                    }
+                },
+            }
+            if (adds_line_feed) try self.printer_spool.append(self.allocator, '\n');
+        }
+    }
+
+    fn printerPosition(self: *Vm, argument: values.Value) ExecutionError!values.Value {
+        const selector = try values.asLong(argument);
+        if (selector != 0 and selector != 1) return error.DeviceUnavailable;
+        if (!self.printer_available) return error.OutOfPaper;
+        return .{ .integer = @intCast(self.printer_column) };
+    }
+
+    fn deviceIoctl(self: *Vm) ExecutionError!void {
+        if (self.stack.items.len < 2) return error.StackUnderflow;
+        const base = self.stack.items.len - 2;
+        const file = try self.fileAt(try self.fileNumberAt(base));
+        const command_value = try self.stackValueAt(base + 1);
+        const command = switch (command_value) { .string => |bytes| std.mem.trim(u8, bytes, " \t"), else => return error.TypeMismatch };
+        if (command.len > values.maximum_string_bytes) return error.IllegalFunctionCall;
+        if (file.device != .serial) return error.AdvancedUnavailable;
+        file.ioctl_response.clearRetainingCapacity();
+        if (std.ascii.eqlIgnoreCase(command, "STATUS")) {
+            var status_storage: [128]u8 = undefined;
+            const status = std.fmt.bufPrint(&status_storage, "BAUD={d};RX={d};TX={d};OVERFLOW={d}", .{
+                file.serial_baud,
+                file.input.items.len - file.input_head,
+                self.serial_output[file.serial_port - 1].items.len,
+                @intFromBool(file.serial_overflow),
+            }) catch return error.DeviceIo;
+            try file.ioctl_response.appendSlice(self.allocator, status);
+        } else if (std.ascii.eqlIgnoreCase(command, "PURGE RX")) {
+            file.input.clearRetainingCapacity();
+            file.input_head = 0;
+            file.serial_overflow = false;
+            try file.ioctl_response.appendSlice(self.allocator, "1");
+        } else if (std.ascii.eqlIgnoreCase(command, "PURGE TX")) {
+            self.serial_output[file.serial_port - 1].clearRetainingCapacity();
+            file.serial_overflow = false;
+            try file.ioctl_response.appendSlice(self.allocator, "1");
+        } else if (startsAsciiIgnoreCase(command, "BAUD ")) {
+            const baud = std.fmt.parseInt(u16, std.mem.trim(u8, command[5..], " \t"), 10) catch return error.DeviceIo;
+            const valid = switch (baud) { 75, 110, 150, 300, 600, 1200, 1800, 2400, 4800, 9600 => true, else => false };
+            if (!valid) return error.DeviceIo;
+            file.serial_baud = baud;
+            try file.ioctl_response.appendSlice(self.allocator, "1");
+        } else if (std.ascii.eqlIgnoreCase(command, "DTR ON") or std.ascii.eqlIgnoreCase(command, "DTR OFF") or
+            std.ascii.eqlIgnoreCase(command, "RTS ON") or std.ascii.eqlIgnoreCase(command, "RTS OFF"))
+        {
+            try file.ioctl_response.appendSlice(self.allocator, "1");
+        } else return error.DeviceIo;
+        self.discardStackFrom(base);
+    }
+
+    fn ioctlString(self: *Vm, argument: values.Value) ExecutionError!values.Value {
+        const raw_number = try values.asLong(argument);
+        if (raw_number < 1 or raw_number > maximum_file_number) return error.BadFileNumber;
+        const file = try self.fileAt(@intCast(raw_number));
+        if (file.device != .serial) return error.AdvancedUnavailable;
+        return .{ .string = try self.allocator.dupe(u8, file.ioctl_response.items) };
+    }
+
     fn appendFileBytes(self: *Vm, file: *SequentialFile, bytes: []const u8) ExecutionError!void {
-        try self.ensureFileOutputSpace(file, bytes.len);
-        try file.output.appendSlice(self.allocator, bytes);
-        file.output_total_bytes += bytes.len;
-        file.next_position +|= @intCast(bytes.len);
+        var required: usize = 0;
+        var projected_column = file.print_column;
+        for (bytes, 0..) |byte, index| {
+            required +|= 1;
+            if (file.device == .serial and file.serial_lf and byte == '\r' and
+                (index + 1 == bytes.len or bytes[index + 1] != '\n')) required +|= 1;
+            switch (byte) {
+                '\r', '\n' => projected_column = 0,
+                else => {
+                    projected_column +|= 1;
+                    if (file.line_width != 0 and projected_column >= file.line_width) {
+                        required +|= 2;
+                        projected_column = 0;
+                    }
+                },
+            }
+        }
+        if (file.device == .serial) {
+            var output = &self.serial_output[file.serial_port - 1];
+            if (required > file.serial_transmit_capacity -| output.items.len) {
+                file.serial_overflow = true;
+                return error.CommunicationOverflow;
+            }
+            try output.ensureUnusedCapacity(self.allocator, required);
+            for (bytes, 0..) |byte, index| {
+                try output.append(self.allocator, byte);
+                if (file.serial_lf and byte == '\r' and
+                    (index + 1 == bytes.len or bytes[index + 1] != '\n')) try output.append(self.allocator, '\n');
+                switch (byte) {
+                    '\r', '\n' => file.print_column = 0,
+                    else => {
+                        file.print_column +|= 1;
+                        if (file.line_width != 0 and file.print_column >= file.line_width) {
+                            try output.appendSlice(self.allocator, "\r\n");
+                            file.print_column = 0;
+                        }
+                    },
+                }
+            }
+            file.next_position +|= @intCast(required);
+            file.size = @max(file.size, file.next_position - 1);
+            return;
+        }
+        try self.ensureFileOutputSpace(file, required);
+        for (bytes) |byte| {
+            try file.output.append(self.allocator, byte);
+            switch (byte) {
+                '\r', '\n' => file.print_column = 0,
+                else => {
+                    file.print_column +|= 1;
+                    if (file.line_width != 0 and file.print_column >= file.line_width) {
+                        try file.output.appendSlice(self.allocator, "\r\n");
+                        file.print_column = 0;
+                    }
+                },
+            }
+        }
+        file.output_total_bytes += required;
+        file.next_position +|= @intCast(required);
         file.size = @max(file.size, file.next_position - 1);
-        for (bytes) |byte| switch (byte) {
-            '\r', '\n' => file.print_column = 0,
-            else => file.print_column +|= 1,
-        };
         self.noteFileOutputBuffer(file);
     }
 
@@ -4176,7 +4756,7 @@ pub const Vm = struct {
             const raw_file = try values.asLong(try self.stackValueAt(base + 1));
             if (raw_file < 1 or raw_file > maximum_file_number) return error.BadFileNumber;
             const file = try self.fileAt(@intCast(raw_file));
-            if (file.mode != .input and file.mode != .binary) return error.BadFileMode;
+            if (file.device != .serial and file.mode != .input and file.mode != .binary) return error.BadFileMode;
             if (!fileCanRead(file)) return error.BadFileMode;
             const available = file.input.items.len - file.input_head;
             if (available < count) {
@@ -4546,6 +5126,12 @@ pub const Vm = struct {
             const symbol = std.ascii.toUpper(macro[index]);
             if (symbol == 'X') {
                 index += 1;
+                if (self.referenceFromPointerString(macro, &index)) |reference| {
+                    const value = try reference.value();
+                    const substring = switch (value) { .string => |bytes| bytes, else => return error.TypeMismatch };
+                    try self.expandPlayMacroBytes(substring, depth + 1);
+                    continue;
+                }
                 const name = try parsePlayVariableName(macro, &index);
                 const value = try self.drawVariableValue(name);
                 const substring = switch (value.*) {
@@ -4557,6 +5143,13 @@ pub const Vm = struct {
             }
             if (symbol == '=') {
                 index += 1;
+                if (self.referenceFromPointerString(macro, &index)) |reference| {
+                    const number = try values.asLong(try reference.value());
+                    var storage: [16]u8 = undefined;
+                    const formatted = std.fmt.bufPrint(&storage, "{d}", .{number}) catch return error.Overflow;
+                    try self.appendPlayExpansion(formatted);
+                    continue;
+                }
                 const name = try parsePlayVariableName(macro, &index);
                 const value = try self.drawVariableValue(name);
                 const number = try values.asLong(value.*);
@@ -4575,6 +5168,18 @@ pub const Vm = struct {
             return error.IllegalFunctionCall;
         }
         try self.play_scratch.appendSlice(self.allocator, bytes);
+    }
+
+    fn referenceFromPointerString(self: *Vm, bytes: []const u8, index: *usize) ?Reference {
+        if (bytes.len -| index.* < 4) return null;
+        const offset = std.mem.readInt(u16, bytes[index.* ..][0..2], .little);
+        const segment = std.mem.readInt(u16, bytes[index.* + 2 ..][0..2], .little);
+        for (self.guest_bindings.items) |binding| {
+            if (binding.address.segment != segment or binding.address.offset != offset) continue;
+            index.* += 4;
+            return binding.reference;
+        }
+        return null;
     }
 
     fn audioSound(self: *Vm, instruction_index: u32) ExecutionError!void {
@@ -4764,6 +5369,54 @@ pub const Vm = struct {
             break :blk @enumFromInt(@as(u8, @intCast(raw)));
         };
         try validateFileAccess(mode, access);
+
+        const serial_spec = parseSerialSpec(raw_path) catch return error.BadFileName;
+        if (serial_spec) |spec| {
+            if (mode == .append or mode == .binary) return error.BadFileMode;
+            if (!self.serial_signals_ready[spec.port - 1] and spec.timeout_ms != 0) return error.DeviceTimeout;
+            if (!self.serial_signals_ready[spec.port - 1]) return error.DeviceUnavailable;
+            for (self.open_files.items) |slot| if (slot.file.device == .serial and slot.file.serial_port == spec.port) {
+                return error.FileAlreadyOpen;
+            };
+            if (self.fileSlotIndex(file_number) != null) return error.FileAlreadyOpen;
+            const path = try self.allocator.dupe(u8, raw_path);
+            errdefer self.allocator.free(path);
+            const record_buffer: []u8 = if (mode == .random) try self.allocator.alloc(u8, record_length) else &.{};
+            errdefer if (record_buffer.len != 0) self.allocator.free(record_buffer);
+            if (record_buffer.len != 0) @memset(record_buffer, 0);
+            const previous_capacity = self.open_files.capacity;
+            try self.open_files.ensureUnusedCapacity(self.allocator, 1);
+            if (self.open_files.capacity != previous_capacity) self.file_table_capacity_grows +%= 1;
+            self.serial_output[spec.port - 1].clearRetainingCapacity();
+            self.open_files.appendAssumeCapacity(.{
+                .number = @intCast(file_number),
+                .file = .{
+                    .mode = mode,
+                    .access = access,
+                    .open_lock = .default,
+                    .path = path,
+                    .record_length = record_length,
+                    .generation = self.next_file_generation,
+                    .record_buffer = record_buffer,
+                    .storage_ready = true,
+                    .open_lock_ready = true,
+                    .line_width = self.serial_line_width[spec.port - 1],
+                    .device = .serial,
+                    .serial_port = spec.port,
+                    .serial_baud = spec.baud,
+                    .serial_receive_capacity = spec.receive_capacity,
+                    .serial_transmit_capacity = spec.transmit_capacity,
+                    .serial_lf = spec.lf,
+                    .serial_ascii = spec.ascii,
+                },
+            });
+            self.next_file_generation +%= 1;
+            if (self.next_file_generation == 0) self.next_file_generation = 1;
+            self.file_slot_indices[file_number] = @intCast(self.open_files.items.len);
+            self.maximum_open_files = @max(self.maximum_open_files, @as(u64, @intCast(self.open_files.items.len)));
+            self.discardStackFrom(statement_base);
+            return;
+        }
 
         if (self.pending_open_file == null) {
             if (self.fileSlotIndex(file_number) != null) return error.FileAlreadyOpen;
@@ -5103,6 +5756,7 @@ pub const Vm = struct {
                 std.mem.writeInt(u16, pending.buffer[1..3], pending.target_segment, .little);
                 std.mem.writeInt(u16, pending.buffer[3..5], pending.target_offset, .little);
                 std.mem.writeInt(u16, pending.buffer[5..7], @intCast(payload_length), .little);
+                try self.syncGuestBindingsToMemory();
                 try self.readGuestMemoryRange(
                     pending.target_segment,
                     pending.target_offset,
@@ -5239,6 +5893,7 @@ pub const Vm = struct {
                 self.discardPendingMemoryImage();
                 return fault;
             };
+            try self.syncGuestBindingsFromMemory();
         }
         const completed_base = pending.stack_base;
         self.discardPendingMemoryImage();
@@ -5251,9 +5906,10 @@ pub const Vm = struct {
             self.graphics.readPackedRange(offset, out) catch return error.IllegalFunctionCall;
             return;
         };
-        const first = try guestLinearRange(segment, offset, out.len);
-        const memory = try self.ensureGuestMemory();
-        @memcpy(out, memory[first .. first + out.len]);
+        self.guest.readRange(.{ .segment = segment, .offset = offset }, out) catch |fault| switch (fault) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidRange => return error.IllegalFunctionCall,
+        };
     }
 
     fn writeGuestMemoryRange(self: *Vm, segment: u16, offset: u16, bytes: []const u8) ExecutionError!void {
@@ -5261,18 +5917,10 @@ pub const Vm = struct {
             self.graphics.writePackedRange(offset, bytes) catch return error.IllegalFunctionCall;
             return;
         };
-        const first = try guestLinearRange(segment, offset, bytes.len);
-        const memory = try self.ensureGuestMemory();
-        @memcpy(memory[first .. first + bytes.len], bytes);
-    }
-
-    fn ensureGuestMemory(self: *Vm) ExecutionError![]u8 {
-        if (self.guest_memory == null) {
-            const memory = try self.allocator.alloc(u8, maximum_guest_linear_bytes);
-            @memset(memory, 0);
-            self.guest_memory = memory;
-        }
-        return self.guest_memory.?;
+        self.guest.writeRange(.{ .segment = segment, .offset = offset }, bytes) catch |fault| switch (fault) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidRange => return error.IllegalFunctionCall,
+        };
     }
 
     fn bindFileFields(self: *Vm, count: u32) ExecutionError!void {
@@ -5509,6 +6157,7 @@ pub const Vm = struct {
     }
 
     fn flushFileOutput(self: *Vm, file: *SequentialFile) ExecutionError!void {
+        if (file.device == .serial) return;
         if (file.mode == .input or file.output_head == file.output.items.len) {
             if (file.output_head != 0) {
                 file.output.clearRetainingCapacity();
@@ -5577,6 +6226,7 @@ pub const Vm = struct {
     }
 
     fn refillFileInput(self: *Vm, file: *SequentialFile) ExecutionError!void {
+        if (file.device == .serial) return error.WouldBlock;
         if (file.input_eof) return;
         self.compactFileInput(file);
         const is_binary = file.mode == .binary;
@@ -6352,6 +7002,7 @@ pub const Vm = struct {
         argument_count: u32,
     ) ExecutionError!void {
         if (procedure_id >= self.program.procedures.len) return error.InvalidInstruction;
+        if (self.program.procedures[procedure_id].is_external) return self.callExternal(procedure_id, argument_count);
         if (self.frames.items.len >= maximum_call_depth) return error.CallDepthExceeded;
         const procedure = self.program.procedures[procedure_id];
         if (argument_count != procedure.parameters.len or argument_count > self.stack.items.len) return error.InvalidInstruction;
@@ -6363,7 +7014,7 @@ pub const Vm = struct {
         for (procedure.parameters, 0..) |parameter, index| {
             const item = self.stack.items[stack_base + index];
             const local = switch (parameter.passing_mode) {
-                .by_ref => switch (item) {
+                .by_ref, .by_segment => switch (item) {
                     .reference => |cell| Cell{ .alias = cell },
                     .value => try self.cloneArgumentCell(item, parameter.value_type),
                 },
@@ -6376,6 +7027,201 @@ pub const Vm = struct {
         self.procedure_calls +%= 1;
         self.discardStackFrom(stack_base);
         self.instruction_pointer = procedure.entry_ip;
+    }
+
+    fn callAbsolute(self: *Vm, argument_count: u32) ExecutionError!void {
+        if (argument_count == 0 or argument_count > self.stack.items.len) return error.InvalidInstruction;
+        const base = self.stack.items.len - argument_count;
+        const code_reference = try self.stackReferenceAt(self.stack.items.len - 1);
+        const code_value = try code_reference.value();
+        const code_offset = try unsignedWord(try values.asLong(code_value));
+
+        var registers = guest_machine.Registers{
+            .cs = self.compatibility_segment,
+            .ip = code_offset,
+            .ds = guest_machine.default_data_segment,
+            .es = guest_machine.default_data_segment,
+        };
+        var index: usize = base;
+        while (index + 1 < self.stack.items.len) : (index += 1) {
+            const binding = try self.createGuestBinding(try self.stackReferenceAt(index), false);
+            if (binding.address.segment != guest_machine.default_data_segment) return error.OutOfMemory;
+            registers.sp -%= 2;
+            self.guest.writeWord(.{ .segment = registers.ss, .offset = registers.sp }, binding.address.offset) catch return error.OutOfMemory;
+        }
+        registers.sp -%= 2;
+        self.guest.writeWord(.{ .segment = registers.ss, .offset = registers.sp }, 0xFFFF) catch return error.OutOfMemory;
+        registers.sp -%= 2;
+        self.guest.writeWord(.{ .segment = registers.ss, .offset = registers.sp }, 0xFFFF) catch return error.OutOfMemory;
+        try self.syncGuestBindingsToMemory();
+        _ = self.guest.execute(registers, .{
+            .stop_address = .{ .segment = 0xFFFF, .offset = 0xFFFF },
+            .context = self,
+            .should_cancel = guestExecutionCancelled,
+            .interrupt = guestInterruptBridge,
+        }) catch |fault| return guestExecutionFault(fault);
+        try self.syncGuestBindingsFromMemory();
+        self.discardStackFrom(base);
+    }
+
+    fn callInterrupt(self: *Vm, kind: bytecode.InterruptCallKind) ExecutionError!void {
+        if (self.stack.items.len < 3) return error.StackUnderflow;
+        const base = self.stack.items.len - 3;
+        const interrupt_value = try self.stackValueAt(base);
+        const interrupt_number = try unsignedByte(try values.asLong(interrupt_value));
+        const input = try self.stackReferenceAt(base + 1);
+        const output = try self.stackReferenceAt(base + 2);
+        const required: usize = switch (kind) {
+            .int86old => 16,
+            .int86xold, .interrupt, .interruptx => 20,
+        };
+        if (try referenceByteLength(self.program, input) < required or try referenceByteLength(self.program, output) < required) {
+            return error.TypeMismatch;
+        }
+        var input_bytes: [20]u8 = .{0} ** 20;
+        var output_bytes: [20]u8 = .{0} ** 20;
+        const full_input_length = try referenceByteLength(self.program, input);
+        const input_buffer = try self.allocator.alloc(u8, full_input_length);
+        defer self.allocator.free(input_buffer);
+        try encodeReference(self.program, input, input_buffer);
+        @memcpy(input_bytes[0..required], input_buffer[0..required]);
+        var registers = registersFromBytes(&input_bytes);
+        if (kind == .int86old or kind == .interrupt) {
+            registers.ds = guest_machine.default_data_segment;
+            registers.es = guest_machine.default_data_segment;
+        } else {
+            if (registers.ds == 0xFFFF) registers.ds = guest_machine.default_data_segment;
+            if (registers.es == 0xFFFF) registers.es = guest_machine.default_data_segment;
+        }
+        if (!self.virtualInterrupt(interrupt_number, &registers)) return error.AdvancedUnavailable;
+        registersToBytes(registers, &output_bytes);
+        const full_output_length = try referenceByteLength(self.program, output);
+        const output_buffer = try self.allocator.alloc(u8, full_output_length);
+        defer self.allocator.free(output_buffer);
+        try encodeReference(self.program, output, output_buffer);
+        @memcpy(output_buffer[0..required], output_bytes[0..required]);
+        try decodeReference(self.program, output, output_buffer);
+        self.discardStackFrom(base);
+    }
+
+    fn callExternal(self: *Vm, procedure_id: u32, encoded_count: u32) ExecutionError!void {
+        if (procedure_id >= self.program.procedures.len) return error.InvalidInstruction;
+        const procedure = self.program.procedures[procedure_id];
+        if (!procedure.is_external) return self.callProcedure(procedure_id, encoded_count & bytecode.external_call_argument_mask);
+        const argument_count = encoded_count & bytecode.external_call_argument_mask;
+        if (argument_count > self.stack.items.len or argument_count > 32) return error.InvalidInstruction;
+        const base = self.stack.items.len - argument_count;
+        var numeric: [32]i32 = .{0} ** 32;
+        var references: [32]?Reference = .{null} ** 32;
+        for (0..argument_count) |index| {
+            const item = self.stack.items[base + index];
+            switch (item) {
+                .reference => |reference| {
+                    references[index] = reference;
+                    const binding = try self.createGuestBinding(reference, false);
+                    numeric[index] = (@as(i32, binding.address.segment) << 16) | binding.address.offset;
+                },
+                .value => |value| numeric[index] = try values.asLong(value),
+            }
+        }
+        try self.syncGuestBindingsToMemory();
+        const raw_symbol = if (procedure.external_alias) |alias| alias.bytes(self.program.source) else procedure.name.bytes(self.program.source);
+        const symbol = if (raw_symbol.len >= 2 and raw_symbol[0] == '"' and raw_symbol[raw_symbol.len - 1] == '"')
+            raw_symbol[1 .. raw_symbol.len - 1]
+        else
+            raw_symbol;
+        var result: i32 = 0;
+        if (std.ascii.eqlIgnoreCase(symbol, "R4BASIC.NOP") or std.ascii.eqlIgnoreCase(symbol, "_r4basic_nop")) {
+            result = 0;
+        } else if (std.ascii.eqlIgnoreCase(symbol, "R4BASIC.ADD16") or std.ascii.eqlIgnoreCase(symbol, "_r4basic_add16")) {
+            if (argument_count != 2) return error.IllegalFunctionCall;
+            result = @as(i32, @as(i16, @truncate(numeric[0]))) + @as(i32, @as(i16, @truncate(numeric[1])));
+        } else if (std.ascii.eqlIgnoreCase(symbol, "R4BASIC.INC16") or std.ascii.eqlIgnoreCase(symbol, "_r4basic_inc16")) {
+            if (argument_count != 1) return error.IllegalFunctionCall;
+            const reference = references[0] orelse return error.TypeMismatch;
+            const value = try reference.value();
+            const incremented = try values.convert(self.allocator, .{ .long = try values.asLong(value) + 1 }, value.valueType());
+            try reference.replaceNumeric(incremented);
+            try self.syncGuestBindingsToMemory();
+            result = try values.asLong(try reference.value());
+        } else if (std.ascii.eqlIgnoreCase(symbol, "R4BASIC.FILL") or std.ascii.eqlIgnoreCase(symbol, "_r4basic_fill")) {
+            if (argument_count != 3) return error.IllegalFunctionCall;
+            const reference = references[0] orelse return error.TypeMismatch;
+            const binding = try self.createGuestBinding(reference, false);
+            const byte = numeric[1];
+            const count = numeric[2];
+            if (byte < 0 or byte > 255 or count < 0 or count > binding.byte_length) return error.IllegalFunctionCall;
+            const bytes = try self.allocator.alloc(u8, @intCast(count));
+            defer self.allocator.free(bytes);
+            @memset(bytes, @intCast(byte));
+            self.guest.writeRange(binding.address, bytes) catch return error.OutOfMemory;
+            result = count;
+        } else {
+            return error.AdvancedUnavailable;
+        }
+        try self.syncGuestBindingsFromMemory();
+        self.discardStackFrom(base);
+        if (procedure.returnsValue()) {
+            try self.pushValue(switch (procedure.return_type) {
+                .integer => .{ .integer = @truncate(result) },
+                .long => .{ .long = result },
+                .single => .{ .single = @floatFromInt(result) },
+                .double => .{ .double = @floatFromInt(result) },
+                .string => return error.TypeMismatch,
+            });
+        }
+    }
+
+    fn virtualInterrupt(self: *Vm, number: u8, registers: *guest_machine.Registers) bool {
+        switch (number) {
+            0x10 => {
+                const ah: u8 = @truncate(registers.ax >> 8);
+                if (ah == 0x0F) {
+                    registers.ax = (@as(u16, @intCast(self.text.columnCount())) << 8) | @as(u16, @intCast(self.screen_mode & 0xFF));
+                    registers.bx &= 0x00FF;
+                    return true;
+                }
+                return false;
+            },
+            0x11 => {
+                registers.ax = 0;
+                return true;
+            },
+            0x12 => {
+                registers.ax = 640;
+                return true;
+            },
+            0x1A => {
+                if (@as(u8, @truncate(registers.ax >> 8)) != 0) return false;
+                const ticks: u32 = @intCast(@divTrunc(self.guest_now_ns * 182, 10 * std.time.ns_per_s));
+                registers.cx = @truncate(ticks >> 16);
+                registers.dx = @truncate(ticks);
+                registers.ax &= 0xFF00;
+                return true;
+            },
+            0x21 => {
+                const ah: u8 = @truncate(registers.ax >> 8);
+                switch (ah) {
+                    0x19 => registers.ax = (registers.ax & 0xFF00) | self.current_drive,
+                    0x2A => {
+                        const clock = self.currentWallClock() catch return false;
+                        registers.cx = clock.year;
+                        registers.dx = (@as(u16, clock.month) << 8) | clock.day;
+                        registers.ax = (registers.ax & 0xFF00) | clock.weekday;
+                    },
+                    0x2C => {
+                        const clock = self.currentWallClock() catch return false;
+                        registers.cx = (@as(u16, clock.hour) << 8) | clock.minute;
+                        registers.dx = (@as(u16, clock.second) << 8);
+                    },
+                    0x30 => registers.ax = 0x0005,
+                    else => return false,
+                }
+                registers.flags &= ~guest_machine.flag_carry;
+                return true;
+            },
+            else => return false,
+        }
     }
 
     fn returnProcedure(self: *Vm) ExecutionError!void {
@@ -6494,6 +7340,7 @@ pub const Vm = struct {
     }
 
     fn releaseFrameLocals(self: *Vm, frame: *Frame) void {
+        self.guest_bindings.clearRetainingCapacity();
         var storage = &self.frame_local_storage.items[frame.local_pool_index];
         var current = frame.initialized_local_head;
         while (current != bytecode.invalid_index) {
@@ -6641,10 +7488,16 @@ pub const Vm = struct {
             .eof => self.endOfFile(arguments[0]),
             .fileattr => self.fileAttribute(arguments[0], arguments[1]),
             .freefile => self.freeFileNumber(),
+            .fre => self.freeMemory(arguments[0]),
+            .inp => self.inputPort(arguments[0]),
+            .ioctl_string => self.ioctlString(arguments[0]),
+            .lpos => self.printerPosition(arguments[0]),
             .loc => self.fileLocation(arguments[0]),
             .lof => self.fileLength(arguments[0]),
             .seek => self.fileSeekPosition(arguments[0]),
             .err => self.errorNumber(),
+            .erdev => .{ .integer = self.last_device_error },
+            .erdev_string => .{ .string = try self.allocator.dupe(u8, self.last_device_name[0..self.last_device_name_length]) },
             .erl => self.errorLine(),
             .inkey_string => self.inkeyString(),
             .play => .{ .integer = @intCast(@min(self.audio_engine.playFunctionValue(), @as(u32, std.math.maxInt(i16)))) },
@@ -6672,7 +7525,30 @@ pub const Vm = struct {
                 try values.asDouble(arguments[0]),
                 try values.asLong(arguments[1]),
             )) },
+            .setmem => self.setMemory(arguments[0]),
         };
+    }
+
+    fn freeMemory(self: *Vm, argument: values.Value) ExecutionError!values.Value {
+        if (argument == .string) {
+            return .{ .long = @intCast(65_536 - self.guest_near_next) };
+        }
+        const selector = try values.asLong(argument);
+        return .{ .long = switch (selector) {
+            -1 => @intCast(@min(self.guest.far_heap_bytes, @as(u32, std.math.maxInt(i32)))),
+            -2 => @intCast(self.configured_stack_bytes),
+            else => @intCast(65_536 - self.guest_near_next),
+        } };
+    }
+
+    fn setMemory(self: *Vm, argument: values.Value) ExecutionError!values.Value {
+        const delta = try values.asLong(argument);
+        return .{ .long = @intCast(self.guest.setFarHeap(delta)) };
+    }
+
+    fn inputPort(self: *Vm, argument: values.Value) ExecutionError!values.Value {
+        const port = try unsignedWord(try values.asLong(argument));
+        return .{ .integer = self.guest.readPort(port) catch return error.DeviceUnavailable };
     }
 
     fn penValue(self: *Vm, selector_value: values.Value) ExecutionError!values.Value {
@@ -6743,6 +7619,7 @@ pub const Vm = struct {
         if (raw_number < 1 or raw_number > maximum_file_number) return error.BadFileNumber;
         const file = try self.fileAt(@intCast(raw_number));
         if (!fileCanRead(file)) return error.BadFileMode;
+        if (file.device == .serial) return .{ .integer = 0 };
         if (file.mode == .random) {
             const offset = @as(u64, file.next_position - 1) * file.record_length;
             return .{ .integer = if (offset >= file.size) -1 else 0 };
@@ -7310,7 +8187,27 @@ pub const Vm = struct {
     }
 
     fn recordError(self: *Vm, code: RuntimeCode, instruction: u32) void {
+        self.noteDeviceDiagnostic(code);
         self.recordDiagnostic(self.makeDiagnostic(code, instruction));
+    }
+
+    fn noteDeviceDiagnostic(self: *Vm, code: RuntimeCode) void {
+        const info: ?struct { code: i16, name: []const u8 } = switch (code) {
+            .device_timeout => .{ .code = 1, .name = "COM:" },
+            .device_fault => .{ .code = 2, .name = "DEVICE" },
+            .out_of_paper => .{ .code = 3, .name = "LPT1:" },
+            .device_io => .{ .code = 4, .name = "DEVICE" },
+            .device_unavailable => .{ .code = 5, .name = "DEVICE" },
+            .communication_overflow => .{ .code = 6, .name = "COM:" },
+            .disk_full, .path_not_found, .path_file_access => .{ .code = 2, .name = "DISK" },
+            else => null,
+        };
+        const selected = info orelse return;
+        self.last_device_error = selected.code;
+        const used = @min(selected.name.len, self.last_device_name.len);
+        @memset(&self.last_device_name, 0);
+        @memcpy(self.last_device_name[0..used], selected.name[0..used]);
+        self.last_device_name_length = @intCast(used);
     }
 
     fn recordDiagnostic(self: *Vm, diagnostic: RuntimeDiagnostic) void {
@@ -7352,12 +8249,57 @@ fn unsignedWord(value: i32) ExecutionError!u16 {
     return error.IllegalFunctionCall;
 }
 
-fn guestLinearRange(segment: u16, offset: u16, length: usize) ExecutionError!usize {
-    const first = @as(usize, segment) * 16 + @as(usize, offset);
-    if (first > maximum_guest_linear_bytes or length > maximum_guest_linear_bytes - first) {
-        return error.IllegalFunctionCall;
-    }
-    return first;
+fn unsignedByte(value: i32) ExecutionError!u8 {
+    if (value >= 0 and value <= std.math.maxInt(u8)) return @intCast(value);
+    return error.IllegalFunctionCall;
+}
+
+fn registersFromBytes(bytes: *const [20]u8) guest_machine.Registers {
+    return .{
+        .ax = std.mem.readInt(u16, bytes[0..2], .little),
+        .bx = std.mem.readInt(u16, bytes[2..4], .little),
+        .cx = std.mem.readInt(u16, bytes[4..6], .little),
+        .dx = std.mem.readInt(u16, bytes[6..8], .little),
+        .bp = std.mem.readInt(u16, bytes[8..10], .little),
+        .si = std.mem.readInt(u16, bytes[10..12], .little),
+        .di = std.mem.readInt(u16, bytes[12..14], .little),
+        .flags = std.mem.readInt(u16, bytes[14..16], .little) | guest_machine.flag_reserved,
+        .ds = std.mem.readInt(u16, bytes[16..18], .little),
+        .es = std.mem.readInt(u16, bytes[18..20], .little),
+    };
+}
+
+fn registersToBytes(registers: guest_machine.Registers, bytes: *[20]u8) void {
+    std.mem.writeInt(u16, bytes[0..2], registers.ax, .little);
+    std.mem.writeInt(u16, bytes[2..4], registers.bx, .little);
+    std.mem.writeInt(u16, bytes[4..6], registers.cx, .little);
+    std.mem.writeInt(u16, bytes[6..8], registers.dx, .little);
+    std.mem.writeInt(u16, bytes[8..10], registers.bp, .little);
+    std.mem.writeInt(u16, bytes[10..12], registers.si, .little);
+    std.mem.writeInt(u16, bytes[12..14], registers.di, .little);
+    std.mem.writeInt(u16, bytes[14..16], registers.flags, .little);
+    std.mem.writeInt(u16, bytes[16..18], registers.ds, .little);
+    std.mem.writeInt(u16, bytes[18..20], registers.es, .little);
+}
+
+fn guestExecutionCancelled(context: ?*anyopaque) bool {
+    const machine: *Vm = @ptrCast(@alignCast(context orelse return true));
+    return machine.cancel_requested or machine.host.should_cancel(machine.host.context);
+}
+
+fn guestInterruptBridge(context: ?*anyopaque, number: u8, registers: *guest_machine.Registers, _: *guest_machine.Machine) guest_machine.InterruptResult {
+    const machine: *Vm = @ptrCast(@alignCast(context orelse return .unavailable));
+    return if (machine.virtualInterrupt(number, registers)) .handled else .unavailable;
+}
+
+fn guestExecutionFault(fault: guest_machine.ExecuteError) ExecutionError {
+    return switch (fault) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InstructionBudget, error.InvalidInstruction, error.InterruptUnavailable => error.AdvancedUnavailable,
+        error.Cancelled => error.Cancelled,
+        error.DivideError => error.DivisionByZero,
+        error.PortUnavailable => error.DeviceUnavailable,
+    };
 }
 
 fn validMemoryImageLength(buffer: []const u8, expected: usize) bool {
@@ -7368,6 +8310,69 @@ fn validMemoryImageLength(buffer: []const u8, expected: usize) bool {
     return trailing == 8 and
         std.mem.eql(u8, buffer[0..memory_image_header_bytes], buffer[expected .. expected + memory_image_header_bytes]) and
         buffer[buffer.len - 1] == 0x1A;
+}
+
+fn parseSerialSpec(path: []const u8) error{Invalid}! ?SerialSpec {
+    if (path.len < 5 or !std.ascii.eqlIgnoreCase(path[0..3], "COM") or path[4] != ':') return null;
+    const port: u8 = switch (path[3]) {
+        '1' => 1,
+        '2' => 2,
+        else => return error.Invalid,
+    };
+    var spec = SerialSpec{ .port = port };
+    const options = path[5..];
+    var field_index: usize = 0;
+    var start: usize = 0;
+    while (start <= options.len) {
+        const comma = std.mem.indexOfScalarPos(u8, options, start, ',') orelse options.len;
+        const field = std.mem.trim(u8, options[start..comma], " \t");
+        if (field.len != 0) {
+            if (field_index == 0 and std.ascii.isDigit(field[0])) {
+                const baud = std.fmt.parseInt(u16, field, 10) catch return error.Invalid;
+                const valid = switch (baud) { 75, 110, 150, 300, 600, 1200, 1800, 2400, 4800, 9600 => true, else => false };
+                if (!valid) return error.Invalid;
+                spec.baud = baud;
+            } else if (field_index == 1 and field.len == 1) {
+                switch (std.ascii.toUpper(field[0])) { 'N', 'E', 'O', 'S', 'M' => {}, else => return error.Invalid }
+            } else if (field_index == 2 and field.len == 1) {
+                if (field[0] < '5' or field[0] > '8') return error.Invalid;
+            } else if (field_index == 3) {
+                if (!std.mem.eql(u8, field, "1") and !std.mem.eql(u8, field, "1.5") and !std.mem.eql(u8, field, "2")) return error.Invalid;
+            } else if (std.ascii.eqlIgnoreCase(field, "ASC")) {
+                spec.ascii = true;
+            } else if (std.ascii.eqlIgnoreCase(field, "BIN")) {
+                spec.ascii = false;
+            } else if (std.ascii.eqlIgnoreCase(field, "LF")) {
+                spec.lf = true;
+            } else if (std.ascii.eqlIgnoreCase(field, "RS")) {
+                // The private facade has no RTS dependency.
+            } else if (startsAsciiIgnoreCase(field, "RB")) {
+                spec.receive_capacity = try parseSerialCapacity(field[2..], 512);
+            } else if (startsAsciiIgnoreCase(field, "TB")) {
+                spec.transmit_capacity = try parseSerialCapacity(field[2..], 512);
+            } else if (startsAsciiIgnoreCase(field, "OP") or startsAsciiIgnoreCase(field, "CD") or
+                startsAsciiIgnoreCase(field, "CS") or startsAsciiIgnoreCase(field, "DS"))
+            {
+                const value = if (field.len == 2) @as(u16, 1000) else std.fmt.parseInt(u16, field[2..], 10) catch return error.Invalid;
+                spec.timeout_ms = @max(spec.timeout_ms, value);
+            } else return error.Invalid;
+        }
+        field_index += 1;
+        if (comma == options.len) break;
+        start = comma + 1;
+    }
+    return spec;
+}
+
+fn parseSerialCapacity(text: []const u8, default: u16) error{Invalid}!u16 {
+    if (text.len == 0) return default;
+    const value = std.fmt.parseInt(u16, text, 10) catch return error.Invalid;
+    if (value == 0 or value > 32_767) return error.Invalid;
+    return value;
+}
+
+fn startsAsciiIgnoreCase(text: []const u8, prefix: []const u8) bool {
+    return text.len >= prefix.len and std.ascii.eqlIgnoreCase(text[0..prefix.len], prefix);
 }
 
 const KeyMapping = struct {
@@ -8638,14 +9643,22 @@ fn runtimeCode(fault: ExecutionError) RuntimeCode {
         error.PermissionDenied => .permission_denied,
         error.PathNotFound => .path_not_found,
         error.PathFileAccess => .path_file_access,
+        error.DeviceTimeout => .device_timeout,
+        error.DeviceFault => .device_fault,
+        error.OutOfPaper => .out_of_paper,
+        error.DeviceIo => .device_io,
+        error.DeviceUnavailable => .device_unavailable,
+        error.CommunicationOverflow => .communication_overflow,
+        error.AdvancedUnavailable => .advanced_unavailable,
         error.Rethrow => .invalid_instruction,
         error.WouldBlock => .invalid_instruction,
+        error.Cancelled => .invalid_instruction,
     };
 }
 
 fn isCatchable(code: RuntimeCode) bool {
     return switch (code) {
-        .overflow, .division_by_zero, .type_mismatch, .illegal_function_call, .out_of_memory, .gosub_without_return, .raised_error, .subscript_out_of_range, .array_already_dimensioned, .out_of_data, .restricted_memory, .bad_file_number, .file_not_found, .bad_file_mode, .file_already_open, .input_past_end, .bad_file_name, .field_overflow, .field_active, .file_exists, .bad_record_length, .disk_full, .bad_record_number, .too_many_files, .permission_denied, .path_not_found, .path_file_access => true,
+        .overflow, .division_by_zero, .type_mismatch, .illegal_function_call, .out_of_memory, .gosub_without_return, .raised_error, .subscript_out_of_range, .array_already_dimensioned, .out_of_data, .restricted_memory, .bad_file_number, .file_not_found, .bad_file_mode, .file_already_open, .input_past_end, .bad_file_name, .field_overflow, .field_active, .file_exists, .bad_record_length, .disk_full, .bad_record_number, .too_many_files, .permission_denied, .path_not_found, .path_file_access, .device_timeout, .device_fault, .out_of_paper, .device_io, .device_unavailable, .communication_overflow, .advanced_unavailable => true,
         .stack_overflow, .stack_underflow, .call_depth_exceeded, .invalid_instruction, .host_failure, .no_resume, .resume_without_error => false,
     };
 }
@@ -9201,6 +10214,48 @@ fn resolveCell(original: *Cell) ?*Cell {
         }
     }
     return null;
+}
+
+fn cellReferenceExtent(original: *Cell, reference: Reference) ?usize {
+    const cell = resolveCell(original) orelse return null;
+    switch (cell.owned) {
+        .array => |*array| switch (array.storage) {
+            .integer => |items| return sliceReferenceExtent(i16, items, reference),
+            .long => |items| return sliceReferenceExtent(i32, items, reference),
+            .single => |items| return sliceReferenceExtent(f32, items, reference),
+            .double => |items| return sliceReferenceExtent(f64, items, reference),
+            .cells => |items| for (items) |*item| if (cellReferenceExtent(item, reference)) |extent| return extent,
+        },
+        .record => |*record| for (record.fields) |*field| if (cellReferenceExtent(field, reference)) |extent| return extent,
+        else => {},
+    }
+    return null;
+}
+
+fn sliceReferenceExtent(comptime T: type, items: []T, reference: Reference) ?usize {
+    const pointer: ?*T = switch (reference) {
+        .integer => |value| if (T == i16) @ptrCast(value) else null,
+        .long => |value| if (T == i32) @ptrCast(value) else null,
+        .single => |value| if (T == f32) @ptrCast(value) else null,
+        .double => |value| if (T == f64) @ptrCast(value) else null,
+        .cell => null,
+    };
+    const target = pointer orelse return null;
+    const start = @intFromPtr(items.ptr);
+    const address = @intFromPtr(target);
+    const end = start + items.len * @sizeOf(T);
+    if (address < start or address >= end or (address - start) % @sizeOf(T) != 0) return null;
+    return end - address;
+}
+
+fn referencesEqual(left: Reference, right: Reference) bool {
+    return switch (left) {
+        .cell => |pointer| switch (right) { .cell => |other| pointer == other, else => false },
+        .integer => |pointer| switch (right) { .integer => |other| pointer == other, else => false },
+        .long => |pointer| switch (right) { .long => |other| pointer == other, else => false },
+        .single => |pointer| switch (right) { .single => |other| pointer == other, else => false },
+        .double => |pointer| switch (right) { .double => |other| pointer == other, else => false },
+    };
 }
 
 fn resolveCellConst(original: *const Cell) ?*const Cell {

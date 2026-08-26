@@ -2134,7 +2134,7 @@ test "packed LONG arrays decode as mode 1 and mode 9 images without source speci
     try std.testing.expectEqual(@as(u32, 200), graphics.height);
 }
 
-test "DEF SEG PEEK and POKE expose only the private NumLock byte" {
+test "DEF SEG PEEK and POKE address the isolated wrapping 20-bit guest memory" {
     var program = try compileFixture(fixture_paths.private_memory);
     defer program.deinit();
     try expectProgramOk(&program);
@@ -2151,8 +2151,8 @@ test "DEF SEG PEEK and POKE expose only the private NumLock byte" {
     try std.testing.expectEqual(@as(u8, 0), first.virtualNumLockByte());
 
     const invalid_sources = [_][]const u8{
-        "DEFINT A-Z\nDEF SEG = 0\nValue = PEEK(1046)\nEND\n",
-        "DEFINT A-Z\nValue = PEEK(1047)\nEND\n",
+        "DEFINT A-Z\nDEF SEG = 0\nValue = PEEK(65536)\nEND\n",
+        "DEFINT A-Z\nDEF SEG = 0\nPOKE 0, 256\nEND\n",
     };
     for (invalid_sources) |source| {
         var invalid_program = try core.compiler.compile(std.testing.allocator, "restricted-memory.bas", source);
@@ -2161,7 +2161,7 @@ test "DEF SEG PEEK and POKE expose only the private NumLock byte" {
         var invalid = try core.vm.Vm.init(std.testing.allocator, &invalid_program, .{});
         defer invalid.deinit();
         try std.testing.expectEqual(core.vm.Status.runtime_error, invalid.runToCompletion(16, 8));
-        try std.testing.expectEqual(core.vm.RuntimeCode.restricted_memory, invalid.runtime_diagnostic.?.code);
+        try std.testing.expectEqual(core.vm.RuntimeCode.illegal_function_call, invalid.runtime_diagnostic.?.code);
         try std.testing.expectEqual(@as(i32, 5), invalid.exit_code);
     }
 
@@ -5094,7 +5094,6 @@ test "file modes numbers devices and missing paths fail visibly" {
         .{ .source = "OPEN \"input.txt\" FOR INPUT AS #0\nEND\n", .expected = .bad_file_number, .number = 52 },
         .{ .source = "OPEN \"missing.txt\" FOR INPUT AS #1\nEND\n", .expected = .file_not_found, .number = 53 },
         .{ .source = "OPEN \"input.txt\" FOR INPUT AS #1\nPRINT #1, \"bad\"\nEND\n", .expected = .bad_file_mode, .number = 54 },
-        .{ .source = "OPEN \"COM1:\" FOR OUTPUT AS #1\nEND\n", .expected = .bad_file_name, .number = 64 },
     };
     for (cases) |case| {
         var program = try core.compiler.compile(std.testing.allocator, "C:\\GAMES\\NEGATIVE.BAS", case.source);
@@ -5181,6 +5180,225 @@ fn appendSource(target: *std.ArrayList(u8), comptime format: []const u8, args: a
     var storage: [160]u8 = undefined;
     const text = try std.fmt.bufPrint(storage[0..], format, args);
     try target.appendSlice(std.testing.allocator, text);
+}
+
+test "0.70.13 pointers FRE SETMEM and CALL ABSOLUTE share one isolated 20-bit machine" {
+    const source =
+        \\DEFINT A-Z
+        \\DIM Code(0 TO 7) AS INTEGER
+        \\DIM Result AS INTEGER
+        \\CodeSegment = VARSEG(Code(0))
+        \\CodeOffset = VARPTR(Code(0))
+        \\DEF SEG = CodeSegment
+        \\FOR I = 0 TO 15
+        \\  READ B
+        \\  POKE CodeOffset + I, B
+        \\NEXT I
+        \\CALL ABSOLUTE(Result, CodeOffset)
+        \\S$ = "ABC"
+        \\StringSegment = VARSEG(S$)
+        \\StringOffset = SADD(S$)
+        \\Descriptor$ = VARPTR$(S$)
+        \\DEF SEG = StringSegment
+        \\POKE StringOffset + 1, 90
+        \\Changed$ = S$
+        \\StackFree& = FRE(-2)
+        \\HeapBefore& = SETMEM(0)
+        \\HeapReduced& = SETMEM(-1024)
+        \\HeapRestored& = SETMEM(1024)
+        \\END
+        \\DATA 85,139,236,184,52,18,139,94,6,137,7,93,202,2,0,144
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "guest-pointers-07013.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(512, 64));
+    try expectInteger(&machine, "Result", 0x1234);
+    try expectString(&machine, "Changed$", "AZC");
+    try std.testing.expectEqual(@as(usize, 4), (machine.global("Descriptor$") orelse return error.MissingGlobal).string.len);
+    try expectLong(&machine, "StackFree&", 2048);
+    try expectLong(&machine, "HeapReduced&", 512 * 1024 - 1024);
+    try expectLong(&machine, "HeapRestored&", 512 * 1024);
+}
+
+test "0.70.13 virtual INP OUT and WAIT yield until the private port changes" {
+    const source =
+        \\DEFINT A-Z
+        \\Before = INP(97)
+        \\OUT 97, 3
+        \\After = INP(97)
+        \\WAIT 97, 4
+        \\Done = 1
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "ports-07013.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try machine.defineVirtualPort(97, 0);
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runToCompletion(64, 8));
+    try expectInteger(&machine, "Before", 0);
+    try expectInteger(&machine, "After", 3);
+    try std.testing.expect(machine.setVirtualPort(97, 7));
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(64, 8));
+    try expectInteger(&machine, "Done", 1);
+
+    var unavailable_program = try core.compiler.compile(std.testing.allocator, "port-unavailable.bas", "Value = INP(1234)\nEND\n");
+    defer unavailable_program.deinit();
+    var unavailable = try core.vm.Vm.init(std.testing.allocator, &unavailable_program, .{});
+    defer unavailable.deinit();
+    try std.testing.expectEqual(core.vm.Status.runtime_error, unavailable.runToCompletion(16, 4));
+    try std.testing.expectEqual(@as(i32, 68), unavailable.runtime_diagnostic.?.qbasicErrorNumber());
+}
+
+test "0.70.13 VARPTR dollar descriptors feed compiled DRAW string and numeric macros" {
+    const source =
+        \\DEFINT A-Z
+        \\SCREEN 1
+        \\Part$ = "R2"
+        \\Amount = 3
+        \\DRAW "X" + VARPTR$(Part$)
+        \\DRAW "R=" + VARPTR$(Amount)
+        \\FinalX! = POINT(0)
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "pointer-macros-07013.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 16));
+    try expectSingle(&machine, "FinalX!", 165);
+}
+
+test "0.70.13 DECLARE foreign calls and virtual interrupts use typed guest layouts" {
+    const source =
+        \\DEFINT A-Z
+        \\DECLARE FUNCTION Add% CDECL ALIAS "R4BASIC.ADD16" (BYVAL A AS INTEGER, BYVAL B AS INTEGER)
+        \\DECLARE SUB Inc CDECL ALIAS "R4BASIC.INC16" (A AS INTEGER)
+        \\Sum = Add%(20, 22)
+        \\CALLS Inc(Sum)
+        \\DIM InRegs(0 TO 9) AS INTEGER
+        \\DIM OutRegs(0 TO 9) AS INTEGER
+        \\InterruptNumber = &H12
+        \\CALL INT86OLD(InterruptNumber, InRegs(), OutRegs())
+        \\MemoryKb = OutRegs(0)
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "foreign-interrupt-07013.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(256, 32));
+    try expectInteger(&machine, "Sum", 43);
+    try expectInteger(&machine, "MemoryKb", 640);
+}
+
+test "0.70.13 COM IOCTL events partial input and bounded output are cooperative" {
+    const input_source =
+        \\DEFINT A-Z
+        \\OPEN "COM1:9600,N,8,1,BIN,RB8,TB8" FOR INPUT AS #1
+        \\Payload$ = INPUT$(3, #1)
+        \\END
+    ;
+    var input_program = try core.compiler.compile(std.testing.allocator, "serial-input-07013.bas", input_source);
+    defer input_program.deinit();
+    try expectProgramOk(&input_program);
+    var input_machine = try core.vm.Vm.init(std.testing.allocator, &input_program, .{});
+    defer input_machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.waiting, input_machine.runToCompletion(64, 8));
+    try std.testing.expect(input_machine.feedSerial(1, "AB"));
+    try std.testing.expectEqual(core.vm.Status.waiting, input_machine.runToCompletion(64, 8));
+    try std.testing.expect(input_machine.feedSerial(1, "C"));
+    try std.testing.expectEqual(core.vm.Status.halted, input_machine.runToCompletion(64, 8));
+    try expectString(&input_machine, "Payload$", "ABC");
+
+    const output_source =
+        \\WIDTH "COM2:", 4
+        \\OPEN "COM2:9600,N,8,1,BIN,RB8,TB8" FOR OUTPUT AS #2
+        \\WIDTH #2, 3
+        \\IOCTL #2, "STATUS"
+        \\State$ = IOCTL$(#2)
+        \\PRINT #2, "ABCDE";
+        \\END
+    ;
+    var output_program = try core.compiler.compile(std.testing.allocator, "serial-output-07013.bas", output_source);
+    defer output_program.deinit();
+    try expectProgramOk(&output_program);
+    var output_machine = try core.vm.Vm.init(std.testing.allocator, &output_program, .{});
+    defer output_machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, output_machine.runToCompletion(128, 16));
+    try std.testing.expect(std.mem.startsWith(u8, (output_machine.global("State$") orelse return error.MissingGlobal).string, "BAUD=9600"));
+    try std.testing.expectEqualStrings("ABC\r\nDE", output_machine.serialOutput(2) orelse return error.MissingSerialOutput);
+}
+
+test "0.70.13 LPRINT reuses PRINT USING and exposes a bounded virtual spool" {
+    const source =
+        \\DEFINT A-Z
+        \\WIDTH LPRINT 20
+        \\LPRINT USING "##"; 7;
+        \\Position = LPOS(0)
+        \\LPRINT
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "printer-07013.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 16));
+    try expectInteger(&machine, "Position", 2);
+    try std.testing.expectEqualStrings(" 7\r\n", machine.printerSpool());
+
+    var unavailable = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer unavailable.deinit();
+    unavailable.setPrinterAvailable(false);
+    try std.testing.expectEqual(core.vm.Status.runtime_error, unavailable.runToCompletion(64, 8));
+    try std.testing.expectEqual(@as(i32, 27), unavailable.runtime_diagnostic.?.qbasicErrorNumber());
+
+    const trapped_source =
+        \\ON ERROR GOTO Handler
+        \\LPRINT "X"
+        \\AfterError = 1
+        \\END
+        \\Handler:
+        \\DeviceCode = ERDEV
+        \\DeviceName$ = ERDEV$
+        \\RESUME NEXT
+    ;
+    var trapped_program = try core.compiler.compile(std.testing.allocator, "printer-erdev-07013.bas", trapped_source);
+    defer trapped_program.deinit();
+    try expectProgramOk(&trapped_program);
+    var trapped = try core.vm.Vm.init(std.testing.allocator, &trapped_program, .{});
+    defer trapped.deinit();
+    trapped.setPrinterAvailable(false);
+    try std.testing.expectEqual(core.vm.Status.halted, trapped.runToCompletion(128, 16));
+    try expectSingle(&trapped, "DeviceCode", 3);
+    try expectString(&trapped, "DeviceName$", "LPT1:");
+    try expectSingle(&trapped, "AfterError", 1);
+}
+
+test "all 43 QuickBASIC Appendix-B errors round-trip through ERR ERL and RESUME NEXT" {
+    const numbers = [_]u8{ 2, 3, 4, 5, 6, 7, 9, 10, 11, 13, 14, 16, 19, 20, 24, 25, 27, 39, 40, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 61, 62, 63, 64, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76 };
+    for (numbers) |number| {
+        var source_storage: [256]u8 = undefined;
+        const source = try std.fmt.bufPrint(&source_storage,
+            "10 ON ERROR GOTO 100\n20 ERROR {d}\n30 Continued! = 1\n40 END\n100 Captured% = ERR\n110 ErrorLine& = ERL\n120 RESUME NEXT\n",
+            .{number});
+        var program = try core.compiler.compile(std.testing.allocator, "appendix-b-07013.bas", source);
+        defer program.deinit();
+        try expectProgramOk(&program);
+        var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+        defer machine.deinit();
+        try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(64, 8));
+        try expectInteger(&machine, "Captured%", number);
+        try expectLong(&machine, "ErrorLine&", 20);
+        try expectSingle(&machine, "Continued!", 1);
+    }
 }
 
 fn compileFixture(path: []const u8) !core.bytecode.Program {

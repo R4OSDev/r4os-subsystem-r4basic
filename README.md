@@ -28,7 +28,7 @@ guest time, input, events, or graphics.
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.26`
+- Module version: `1.2.27`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -164,6 +164,23 @@ now includes numeric and string-variable expansion, all note/rest/tempo/
 octave/length/articulation commands, a 32-note background bound, `PLAY(n)`
 events, and `PLAY(n)` queue inspection. `SOUND` uses the documented 18.2-Hz
 tick duration and the same transport-confirmed `MF`/`MB` fences as `BEEP`.
+
+R4BASIC 1.2.27 completes the private legacy and binary-interoperability
+machine. Every VM owns an exact 1-MiB 20-bit address space with real-mode
+segment wrapping, stable value/string/array descriptors, bounded near/far
+heaps and no conversion from a BASIC number to a host pointer. `DEF SEG`,
+`PEEK`/`POKE`, `SADD`, `VARPTR`/`VARSEG`/`VARPTR$`, `FRE`, `SETMEM`, and the
+`CLEAR` memory parameters all operate on that private state. `CALL ABSOLUTE`
+runs a cancellable, instruction-budgeted 16-bit x86 guest; declared
+`CALL`/`CALLS` symbols and the INT86/INTERRUPT families reach only registered
+private modules and virtual BIOS/DOS services.
+
+`INP`, `OUT`, and cooperative `WAIT` share one sparse VM-local virtual port
+bus. `OPEN COM`, `IOCTL`/`IOCTL$`, and COM events use bounded partial RX/TX
+buffers without blocking host I/O. `LPRINT`, `LPRINT USING`, `LPOS`, and all
+`WIDTH` forms use the common formatter on a bounded virtual spool or virtual
+channel. Device faults update `ERDEV`/`ERDEV$`; all 43 Appendix-B numbers
+round-trip through `ERROR`, `ERR`, `ERL`, `ON ERROR`, and `RESUME`.
 
 R4BASIC 1.2.22 uses a shared 262,144-instruction ceiling with adaptive bounded
 clock blocks and an 8-ms production time boundary. Active work requests a
