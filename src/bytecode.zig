@@ -1,7 +1,7 @@
 const std = @import("std");
 const frontend = @import("frontend.zig");
 
-pub const contract_version = "2.5.0";
+pub const contract_version = "2.6.0";
 pub const invalid_index: u32 = std.math.maxInt(u32);
 pub const unknown_dimensions: u8 = std.math.maxInt(u8);
 
@@ -168,6 +168,19 @@ pub const GraphicsPutAction = enum(u8) {
     xor,
 };
 
+pub const graphics_screen_mode: u32 = 1 << 0;
+pub const graphics_screen_color_switch: u32 = 1 << 1;
+pub const graphics_screen_active_page: u32 = 1 << 2;
+pub const graphics_screen_visible_page: u32 = 1 << 3;
+pub const graphics_view_bounds: u32 = 1 << 0;
+pub const graphics_view_screen: u32 = 1 << 1;
+pub const graphics_view_fill: u32 = 1 << 2;
+pub const graphics_view_border: u32 = 1 << 3;
+pub const graphics_window_bounds: u32 = 1 << 0;
+pub const graphics_window_screen: u32 = 1 << 1;
+pub const graphics_palette_reset: u32 = 1 << 0;
+pub const graphics_palette_using_index: u32 = 1 << 0;
+
 pub const graphics_point_relative: u32 = 1 << 0;
 pub const graphics_second_point_relative: u32 = 1 << 1;
 pub const graphics_color_present: u32 = 1 << 2;
@@ -227,6 +240,10 @@ pub const OpCode = enum(u8) {
     poke,
     screen_mode_probe,
     graphics_palette,
+    graphics_palette_using,
+    graphics_page_copy,
+    graphics_view,
+    graphics_window,
     graphics_pset,
     graphics_line,
     graphics_circle,
@@ -376,6 +393,7 @@ pub const Builtin = enum(u8) {
     erl,
     inkey_string,
     point,
+    pmap,
     rnd,
     sgn,
     timer,

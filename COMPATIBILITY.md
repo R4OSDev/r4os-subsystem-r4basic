@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 QuickBASIC 4.5 target contract
 
-Contract version: `2.5.0`
+Contract version: `2.6.0`
 
 R4BASIC v2 targets the complete Microsoft QuickBASIC 4.5 interpreter language
 and runtime. The target is not limited by GORILLA.BAS or by the historical v1
@@ -123,9 +123,9 @@ the same grammar family. All fixture paths are below `Tests/Fixtures/`.
 | DEBUG-01 | Cooperative `STOP`, productive host continuation, and visible bounded `TRON`/`TROFF` statement tracing | no | inline pause, reset, cancellation, host-input, and 256-entry ring vectors | inline lifecycle vectors |
 | EXPR-01 | Parentheses; unary `+`, `-`, `NOT`; power, multiply, divide, integer divide, `MOD`, add, subtract, comparisons, `AND`, `OR`, `XOR`, `EQV`, and `IMP` with reference precedence and signed-LONG logic | yes | all positive fixtures and inline numeric vectors | `negative_expressions.bas` |
 | EXPR-02 | Numeric conversion, IEEE/MBF byte conversion, math, string, time, graphics and host-query built-ins currently marked implemented in `src/conformance.zig` | yes | `positive_io_graphics.bas` and inline numeric/byte/error vectors | `negative_expressions.bas` |
-| TEXT-01 | Text `SCREEN`, `WIDTH`, `COLOR`, `CLS`, `LOCATE`, `VIEW PRINT`, `PRINT`, `PRINT USING`, `WRITE`, `INPUT`, `LINE INPUT`, and `INPUT$` | yes | `positive_io_graphics.bas` plus inline formatting/input vectors | `negative_statements.bas` |
+| TEXT-01 | Per-page text `SCREEN`, mode-valid optional-axis `WIDTH`, mode-specific `COLOR`, exact `CLS`, `LOCATE`, `VIEW PRINT`, `PRINT`, `PRINT USING`, `WRITE`, `INPUT`, `LINE INPUT`, and `INPUT$` | yes | `positive_io_graphics.bas` plus inline formatting/input and 0.70.10 mode/page vectors | `negative_statements.bas` plus inline mode/color boundaries |
 | TIME-01 | `RANDOMIZE`, `RND`, `TIMER`, extended two-byte `INKEY$`, and `SLEEP` syntax | yes | `positive_io_graphics.bas` plus inline queue vectors | `negative_expressions.bas`, `negative_statements.bas` |
-| GFX-01 | `SCREEN 1`/`9`, `PALETTE`, `PSET`, coordinate `POINT`, `LINE` including `B`/`BF`, `CIRCLE`, and `PAINT` | yes | `positive_io_graphics.bas` | `negative_statements.bas`, `negative_expressions.bas` |
+| GFX-01 | Logical `SCREEN 0`, `1`, `2`, `7`-`13` mode matrices; APAGE/VPAGE/`PCOPY`; `PALETTE`/`USING`; `VIEW`, `WINDOW`, `PMAP`, all `POINT` forms; `PSET`, `LINE` including `B`/`BF`, `CIRCLE`, and `PAINT` | yes | `positive_io_graphics.bas` plus inline 0.70.10 mode/page/transform vectors | `negative_statements.bas`, `negative_expressions.bas`, plus inline page/color/palette boundaries |
 | GFX-02 | Graphics `GET` and `PUT` with `PSET` and `XOR` actions | yes | `positive_io_graphics.bas` | `negative_statements.bas` |
 | AUDIO-01 | `BEEP` and `PLAY` expression syntax | yes | `positive_io_graphics.bas`, `vm_audio.bas` | `negative_statements.bas` |
 | FILE-01 | Old/new `OPEN` for `INPUT`, `OUTPUT`, `APPEND`, `RANDOM`, or `BINARY`; access/lock/LEN, `CLOSE`/`RESET`, sequential formatting/input, FIELD/LSET/RSET, typed GET/PUT, BINARY `INPUT$`, SEEK/LOC/LOF/EOF/FILEATTR/FREEFILE, and exact LOCK/UNLOCK | yes | `vm_sequential_files.bas` plus inline one-byte, sparse, record/UDT, exact-64-KiB, positioned-output, metadata, lock and catchable-error vectors | inline bad-mode, bad-record, FIELD, path/storage and device-name vectors |

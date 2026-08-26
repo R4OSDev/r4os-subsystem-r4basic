@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const contract_version = "2.5.0";
+pub const contract_version = "2.6.0";
 pub const maximum_source_bytes: usize = 256 * 1024;
 pub const maximum_identifier_bytes: usize = 40;
 pub const maximum_expression_depth: usize = 128;
@@ -218,8 +218,10 @@ pub const Keyword = enum(u8) {
     output,
     paint,
     palette,
+    pcopy,
     peek,
     play,
+    pmap,
     point,
     pos,
     poke,
@@ -282,6 +284,7 @@ pub const Keyword = enum(u8) {
     wend,
     while_,
     width,
+    window,
     write,
     swap,
     xor,
@@ -978,8 +981,10 @@ pub const supported_keyword_entries = [_]KeywordEntry{
     .{ .text = "OUTPUT", .keyword = .output },
     .{ .text = "PAINT", .keyword = .paint },
     .{ .text = "PALETTE", .keyword = .palette },
+    .{ .text = "PCOPY", .keyword = .pcopy },
     .{ .text = "PEEK", .keyword = .peek },
     .{ .text = "PLAY", .keyword = .play },
+    .{ .text = "PMAP", .keyword = .pmap },
     .{ .text = "POINT", .keyword = .point },
     .{ .text = "POS", .keyword = .pos },
     .{ .text = "POKE", .keyword = .poke },
@@ -1042,22 +1047,23 @@ pub const supported_keyword_entries = [_]KeywordEntry{
     .{ .text = "WEND", .keyword = .wend },
     .{ .text = "WHILE", .keyword = .while_ },
     .{ .text = "WIDTH", .keyword = .width },
+    .{ .text = "WINDOW", .keyword = .window },
     .{ .text = "WRITE", .keyword = .write },
     .{ .text = "SWAP", .keyword = .swap },
     .{ .text = "XOR", .keyword = .xor },
 };
 
 pub const unsupported_keyword_words = [_][]const u8{
-    "ALIAS",   "BLOAD",   "BSAVE",  "CALLS",
-    "CDECL",   "CHDRIVE", "COM",    "DRAW",
-    "ENDIF",   "ERDEV",   "ERDEV$", "FRE",
-    "INP",     "IOCTL",   "IOCTL$", "KEY",
-    "LIST",    "LOAD",    "LOCAL",  "LPOS",
-    "LPRINT",  "OFF",     "OUT",    "PCOPY",
-    "PEN",     "PMAP",    "PRESET", "SADD",
-    "SAVE",    "SETMEM",  "SIGNAL", "SOUND",
-    "STICK",   "STRIG",   "UEVENT", "VARPTR",
-    "VARPTR$", "VARSEG",  "WAIT",   "WINDOW",
+    "ALIAS",  "BLOAD",   "BSAVE",   "CALLS",
+    "CDECL",  "CHDRIVE", "COM",     "DRAW",
+    "ENDIF",  "ERDEV",   "ERDEV$",  "FRE",
+    "INP",    "IOCTL",   "IOCTL$",  "KEY",
+    "LIST",   "LOAD",    "LOCAL",   "LPOS",
+    "LPRINT", "OFF",     "OUT",     "PEN",
+    "PRESET", "SADD",    "SAVE",    "SETMEM",
+    "SIGNAL", "SOUND",   "STICK",   "STRIG",
+    "UEVENT", "VARPTR",  "VARPTR$", "VARSEG",
+    "WAIT",
 };
 
 const KeywordSlot = struct {

@@ -6,7 +6,7 @@ const graphics_screen = @import("graphics_screen.zig");
 const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "2.5.0";
+pub const contract_version = "2.6.0";
 pub const default_instruction_budget: u32 = 262_144;
 pub const timer_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
@@ -1045,6 +1045,7 @@ pub const Vm = struct {
         self.discardPendingDirectory();
         if (self.transition) |*transition| transition.deinit(self.allocator);
         self.deinitPlatformState();
+        self.text.deinit(self.allocator);
         self.graphics.deinit(self.allocator);
         deinitGlobals(self.allocator, self.globals);
         self.* = undefined;
@@ -1271,6 +1272,11 @@ pub const Vm = struct {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.IllegalFunctionCall => return error.InvalidProgram,
             };
+            const spec = graphics_screen.modeSpec(0) orelse return error.InvalidProgram;
+            self.text.ensurePages(self.allocator, spec.pages) catch |fault| switch (fault) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.IllegalFunctionCall => return error.InvalidProgram,
+            };
         }
         self.syncTextToGraphics();
         self.host_display_requested = false;
@@ -1373,7 +1379,7 @@ pub const Vm = struct {
         self.data_pointer = 0;
         self.compatibility_segment_zero = false;
         self.virtual_bios_byte = 0;
-        self.text.reset();
+        self.text.resetAllocated(self.allocator);
         self.graphics.reset(self.allocator);
         self.screen_mode = 0;
         self.host_display_requested = false;
@@ -1824,6 +1830,10 @@ pub const Vm = struct {
             => .control,
             .screen_mode_probe,
             .graphics_palette,
+            .graphics_palette_using,
+            .graphics_page_copy,
+            .graphics_view,
+            .graphics_window,
             .graphics_pset,
             .graphics_line,
             .graphics_circle,
@@ -1924,15 +1934,19 @@ pub const Vm = struct {
             .reset_segment => self.compatibility_segment_zero = false,
             .peek => try self.peek(),
             .poke => try self.poke(),
-            .screen_mode_probe => try self.screenModeProbe(),
-            .graphics_palette => try self.graphicsPalette(),
+            .screen_mode_probe => try self.screenModeProbe(instruction.a, instruction.b),
+            .graphics_palette => try self.graphicsPalette(instruction.a),
+            .graphics_palette_using => try self.graphicsPaletteUsing(instruction.a),
+            .graphics_page_copy => try self.graphicsPageCopy(),
+            .graphics_view => try self.graphicsViewStatement(instruction.a),
+            .graphics_window => try self.graphicsWindow(instruction.a),
             .graphics_pset => try self.graphicsPset(instruction.a),
             .graphics_line => try self.graphicsLine(instruction.a),
             .graphics_circle => try self.graphicsCircle(instruction.a, instruction.b),
             .graphics_paint => try self.graphicsPaint(instruction.a, instruction.b),
             .graphics_get => try self.graphicsGet(instruction.a),
             .graphics_put => try self.graphicsPut(instruction.a, instruction.b),
-            .text_width => try self.textWidth(instruction.a),
+            .text_width => try self.textWidth(instruction.a, instruction.b),
             .text_color => try self.textColor(instruction.a, instruction.b),
             .text_cls => try self.textCls(instruction.a),
             .text_locate => try self.textLocate(instruction.a, instruction.b),
@@ -2739,31 +2753,150 @@ pub const Vm = struct {
         self.virtual_bios_byte = @intCast(byte);
     }
 
-    fn screenModeProbe(self: *Vm) ExecutionError!void {
-        var mode_value = try self.popValue();
-        defer mode_value.deinit(self.allocator);
-        const mode = try values.asLong(mode_value);
-        if (mode != 0 and mode != 1 and mode != 9) return error.IllegalFunctionCall;
-        self.host.screen_mode(self.host.context, mode) catch return error.IllegalFunctionCall;
-        self.graphics.setMode(self.allocator, mode) catch |fault| return switch (fault) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.IllegalFunctionCall => error.IllegalFunctionCall,
-        };
-        self.text.configure(if (mode == 1) 40 else 80) catch return error.IllegalFunctionCall;
-        self.screen_mode = mode;
+    fn screenModeProbe(self: *Vm, mask: u32, argument_count: u32) ExecutionError!void {
+        var arguments = [_]?i32{null} ** 4;
+        try self.popOptionalLongs(mask, argument_count, &arguments);
+        if (arguments[0] == null and arguments[1] == null and arguments[2] == null and arguments[3] == null) return;
+        const mode = arguments[0] orelse self.screen_mode;
+        const spec = graphics_screen.modeSpec(mode) orelse return error.IllegalFunctionCall;
+        if (arguments[1]) |color_switch| if (color_switch < 0 or color_switch > 255) return error.IllegalFunctionCall;
+        const active_page = arguments[2] orelse if (arguments[0] != null or self.graphics.pixels == null) 0 else self.graphics.active_page;
+        const visible_page = arguments[3] orelse if (arguments[0] != null or self.graphics.pixels == null) 0 else self.graphics.visible_page;
+        if (active_page < 0 or visible_page < 0 or active_page >= spec.pages or visible_page >= spec.pages) {
+            return error.IllegalFunctionCall;
+        }
+
+        if (arguments[0] != null or self.graphics.pixels == null) {
+            self.host.screen_mode(self.host.context, mode) catch return error.IllegalFunctionCall;
+            self.graphics.setModePages(self.allocator, mode, active_page, visible_page) catch |fault| return switch (fault) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.IllegalFunctionCall => error.IllegalFunctionCall,
+            };
+            self.text.configureMode(
+                self.allocator,
+                spec.text_columns,
+                spec.text_rows,
+                spec.pages,
+                @intCast(active_page),
+                @intCast(visible_page),
+            ) catch |fault| return switch (fault) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.IllegalFunctionCall => error.IllegalFunctionCall,
+            };
+            self.text.setColorRange(
+                defaultScreenForeground(mode),
+                0,
+                @intCast(spec.attributes - 1),
+                0,
+            ) catch return error.IllegalFunctionCall;
+            self.screen_mode = mode;
+            self.syncTextToGraphics();
+        } else {
+            self.syncTextToGraphics();
+            self.graphics.selectPages(active_page, visible_page) catch return error.IllegalFunctionCall;
+            self.text.selectPages(@intCast(active_page), @intCast(visible_page)) catch return error.IllegalFunctionCall;
+        }
         self.host_display_requested = false;
     }
 
-    fn graphicsPalette(self: *Vm) ExecutionError!void {
+    fn graphicsPalette(self: *Vm, flags: u32) ExecutionError!void {
+        if ((flags & ~bytecode.graphics_palette_reset) != 0) return error.InvalidInstruction;
+        try self.ensureDefaultGraphics();
+        if ((flags & bytecode.graphics_palette_reset) != 0) {
+            self.graphics.resetPalettePublic();
+            return;
+        }
         const display_color = try self.popLong();
         const attribute = try self.popLong();
         self.graphics.setPalette(attribute, display_color) catch return error.IllegalFunctionCall;
+    }
+
+    fn graphicsPaletteUsing(self: *Vm, flags: u32) ExecutionError!void {
+        if ((flags & ~bytecode.graphics_palette_using_index) != 0) return error.InvalidInstruction;
+        try self.ensureDefaultGraphics();
+        const requested_start = if ((flags & bytecode.graphics_palette_using_index) != 0) try self.popLong() else null;
+        const array = try self.popArrayReference();
+        if ((array.value_type != .integer and array.value_type != .long) or
+            (self.screen_mode >= 11 and array.value_type != .long))
+        {
+            return error.TypeMismatch;
+        }
+        if (array.dimensions.len != 1) return error.IllegalFunctionCall;
+        const dimension = array.dimensions[0];
+        const start = requested_start orelse dimension.lower;
+        if (start < dimension.lower or start > dimension.upper) return error.SubscriptOutOfRange;
+        const first: usize = @intCast(start - dimension.lower);
+        const available = array.storage.len() - first;
+        const count = @as(usize, self.graphics.maximumAttribute()) + 1;
+        if (available < count) return error.IllegalFunctionCall;
+        var display_colors: [256]i32 = undefined;
+        for (0..count) |index| display_colors[index] = try numericArrayLongAt(array, first + index);
+        self.graphics.setPaletteUsing(display_colors[0..count]) catch return error.IllegalFunctionCall;
+    }
+
+    fn graphicsPageCopy(self: *Vm) ExecutionError!void {
+        const destination = try self.popLong();
+        const source = try self.popLong();
+        try self.ensureDefaultGraphics();
+        if (source < 0 or destination < 0 or source >= self.graphics.page_count or destination >= self.graphics.page_count) {
+            return error.IllegalFunctionCall;
+        }
+        self.syncTextToGraphics();
+        _ = self.graphics.copyPage(source, destination) catch return error.IllegalFunctionCall;
+        self.text.copyPage(@intCast(source), @intCast(destination)) catch return error.IllegalFunctionCall;
+    }
+
+    fn graphicsViewStatement(self: *Vm, flags: u32) ExecutionError!void {
+        const allowed = bytecode.graphics_view_bounds | bytecode.graphics_view_screen |
+            bytecode.graphics_view_fill | bytecode.graphics_view_border;
+        if ((flags & ~allowed) != 0 or
+            (flags & bytecode.graphics_view_bounds) == 0 and flags != 0)
+        {
+            return error.InvalidInstruction;
+        }
+        if ((flags & bytecode.graphics_view_bounds) == 0) {
+            self.graphics.setView(null, null, false, null, null) catch return error.IllegalFunctionCall;
+            return;
+        }
+        self.syncTextToGraphics();
+        const border = if ((flags & bytecode.graphics_view_border) != 0) try self.popLong() else null;
+        const fill = if ((flags & bytecode.graphics_view_fill) != 0) try self.popLong() else null;
+        const second = try self.popGraphicsPoint();
+        const first = try self.popGraphicsPoint();
+        self.graphics.setView(
+            first,
+            second,
+            (flags & bytecode.graphics_view_screen) != 0,
+            fill,
+            border,
+        ) catch |fault| return switch (fault) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.IllegalFunctionCall => error.IllegalFunctionCall,
+        };
+    }
+
+    fn graphicsWindow(self: *Vm, flags: u32) ExecutionError!void {
+        const allowed = bytecode.graphics_window_bounds | bytecode.graphics_window_screen;
+        if ((flags & ~allowed) != 0 or
+            (flags & bytecode.graphics_window_bounds) == 0 and flags != 0)
+        {
+            return error.InvalidInstruction;
+        }
+        if ((flags & bytecode.graphics_window_bounds) == 0) {
+            self.graphics.setWindow(null, null, false) catch return error.IllegalFunctionCall;
+            return;
+        }
+        const second = try self.popGraphicsPoint();
+        const first = try self.popGraphicsPoint();
+        self.graphics.setWindow(first, second, (flags & bytecode.graphics_window_screen) != 0) catch
+            return error.IllegalFunctionCall;
     }
 
     fn graphicsPset(self: *Vm, flags: u32) ExecutionError!void {
         if ((flags & ~(bytecode.graphics_point_relative | bytecode.graphics_color_present)) != 0) return error.InvalidInstruction;
         const color = if ((flags & bytecode.graphics_color_present) != 0) try self.popLong() else self.text.foreground;
         const raw = try self.popGraphicsPoint();
+        self.syncTextToGraphics();
         const target = self.graphics.resolvePoint(raw.x, raw.y, (flags & bytecode.graphics_point_relative) != 0);
         self.graphics.pset(target, color) catch return error.IllegalFunctionCall;
     }
@@ -2777,11 +2910,12 @@ pub const Vm = struct {
         const color = if ((flags & bytecode.graphics_color_present) != 0) try self.popLong() else self.text.foreground;
         const raw_second = try self.popGraphicsPoint();
         const raw_first = try self.popGraphicsPoint();
+        self.syncTextToGraphics();
         const first = self.graphics.resolvePoint(raw_first.x, raw_first.y, (flags & bytecode.graphics_point_relative) != 0);
         const second = if ((flags & bytecode.graphics_second_point_relative) != 0)
-            graphics_screen.Point{ .x = saturatingCoordinateAdd(first.x, raw_second.x), .y = saturatingCoordinateAdd(first.y, raw_second.y) }
+            self.graphics.resolveRelativeTo(first, raw_second.x, raw_second.y)
         else
-            raw_second;
+            self.graphics.resolvePoint(raw_second.x, raw_second.y, false);
         self.graphics.line(first, second, color, @enumFromInt(@as(u8, @intCast(encoded_box)))) catch return error.IllegalFunctionCall;
     }
 
@@ -2800,6 +2934,7 @@ pub const Vm = struct {
         if ((mask & 1) != 0) color = try self.popLong();
         const radius = try self.popDouble();
         const raw_center = try self.popGraphicsPoint();
+        self.syncTextToGraphics();
         const center = self.graphics.resolvePoint(raw_center.x, raw_center.y, (flags & bytecode.graphics_point_relative) != 0);
         self.graphics.circle(center, radius, color, start, end, aspect) catch |fault| return switch (fault) {
             error.OutOfMemory => error.OutOfMemory,
@@ -2817,6 +2952,7 @@ pub const Vm = struct {
         if ((mask & 2) != 0) border = try self.popLong();
         if ((mask & 1) != 0) fill = try self.popLong();
         const raw = try self.popGraphicsPoint();
+        self.syncTextToGraphics();
         const target = self.graphics.resolvePoint(raw.x, raw.y, (flags & bytecode.graphics_point_relative) != 0);
         self.graphics.paint(self.allocator, target, fill, border orelse fill) catch |fault| return switch (fault) {
             error.OutOfMemory => error.OutOfMemory,
@@ -2829,11 +2965,12 @@ pub const Vm = struct {
         const array = try self.popArrayReference();
         const raw_second = try self.popGraphicsPoint();
         const raw_first = try self.popGraphicsPoint();
+        self.syncTextToGraphics();
         const first = self.graphics.resolvePoint(raw_first.x, raw_first.y, (flags & bytecode.graphics_point_relative) != 0);
         const second = if ((flags & bytecode.graphics_second_point_relative) != 0)
-            graphics_screen.Point{ .x = saturatingCoordinateAdd(first.x, raw_second.x), .y = saturatingCoordinateAdd(first.y, raw_second.y) }
+            self.graphics.resolveRelativeTo(first, raw_second.x, raw_second.y)
         else
-            raw_second;
+            self.graphics.resolvePoint(raw_second.x, raw_second.y, false);
         const bytes = try arrayRawBytes(array);
         _ = self.graphics.captureInto(first, second, bytes) catch |fault| return switch (fault) {
             error.OutOfMemory => error.OutOfMemory,
@@ -2847,14 +2984,15 @@ pub const Vm = struct {
         }
         const array = try self.popArrayReference();
         const raw = try self.popGraphicsPoint();
+        self.syncTextToGraphics();
         const target = self.graphics.resolvePoint(raw.x, raw.y, (flags & bytecode.graphics_point_relative) != 0);
         const bytes = try arrayRawBytesConst(array);
         self.graphics.put(target, bytes, @enumFromInt(@as(u8, @intCast(encoded_action)))) catch return error.IllegalFunctionCall;
     }
 
-    fn popGraphicsPoint(self: *Vm) ExecutionError!graphics_screen.Point {
-        const y = try self.popLong();
-        const x = try self.popLong();
+    fn popGraphicsPoint(self: *Vm) ExecutionError!graphics_screen.LogicalPoint {
+        const y = try self.popDouble();
+        const x = try self.popDouble();
         return .{ .x = x, .y = y };
     }
 
@@ -2869,41 +3007,118 @@ pub const Vm = struct {
     fn syncTextToGraphics(self: *Vm) void {
         self.text_sync_checks +%= 1;
         if (self.graphics.view() == null) return;
-        const dirty = self.text.takeDirty();
-        if (dirty.count != 0) {
+        var page: usize = 0;
+        while (page < self.text.page_count) : (page += 1) {
+            const dirty = self.text.takeDirtyPage(page);
+            if (dirty.count == 0) continue;
             self.text_sync_renders +%= 1;
-            for (dirty.slice()) |region| self.graphics.renderText(&self.text, region);
+            for (dirty.slice()) |region| self.graphics.renderTextPage(&self.text, page, region);
         }
     }
 
-    fn textWidth(self: *Vm, argument_count: u32) ExecutionError!void {
-        if (argument_count < 1 or argument_count > 2) return error.InvalidInstruction;
-        const requested_rows = if (argument_count == 2) try self.popLong() else null;
-        const requested_columns = try self.popLong();
-        self.text.setWidth(requested_columns, requested_rows) catch return error.IllegalFunctionCall;
+    fn ensureDefaultGraphics(self: *Vm) ExecutionError!void {
+        if (self.graphics.pixels != null) return;
+        const spec = graphics_screen.modeSpec(self.screen_mode) orelse return error.IllegalFunctionCall;
+        self.graphics.setModePages(self.allocator, self.screen_mode, 0, 0) catch |fault| return switch (fault) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.IllegalFunctionCall => error.IllegalFunctionCall,
+        };
+        self.text.ensurePages(self.allocator, spec.pages) catch |fault| return switch (fault) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.IllegalFunctionCall => error.IllegalFunctionCall,
+        };
+        self.syncTextToGraphics();
+    }
+
+    fn textWidth(self: *Vm, mask: u32, argument_count: u32) ExecutionError!void {
+        var arguments = [_]?i32{null} ** 2;
+        try self.popOptionalLongs(mask, argument_count, &arguments);
+        if (arguments[0] == null and arguments[1] == null) return;
+        const columns_value = arguments[0] orelse @as(i32, @intCast(self.text.active_columns));
+        const rows_value = arguments[1] orelse @as(i32, @intCast(self.text.active_rows));
+        if (!validTextGeometry(self.screen_mode, columns_value, rows_value)) return error.IllegalFunctionCall;
+        self.graphics.setModePages(
+            self.allocator,
+            self.screen_mode,
+            self.graphics.active_page,
+            self.graphics.visible_page,
+        ) catch |fault| return switch (fault) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.IllegalFunctionCall => error.IllegalFunctionCall,
+        };
+        self.text.configureMode(
+            self.allocator,
+            @intCast(columns_value),
+            @intCast(rows_value),
+            self.graphics.page_count,
+            self.graphics.active_page,
+            self.graphics.visible_page,
+        ) catch |fault| return switch (fault) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.IllegalFunctionCall => error.IllegalFunctionCall,
+        };
+        self.syncTextToGraphics();
     }
 
     fn textColor(self: *Vm, mask: u32, argument_count: u32) ExecutionError!void {
-        var arguments = [_]?i32{null} ** 2;
+        var arguments = [_]?i32{null} ** 3;
         try self.popOptionalLongs(mask, argument_count, &arguments);
-        self.text.setColor(arguments[0], arguments[1]) catch return error.IllegalFunctionCall;
+        switch (self.screen_mode) {
+            0 => {
+                if (arguments[2]) |border| if (border < 0 or border > 15) return error.IllegalFunctionCall;
+                self.text.setColorRange(arguments[0], arguments[1], 31, 7) catch return error.IllegalFunctionCall;
+            },
+            1 => {
+                if (arguments[2] != null) return error.IllegalFunctionCall;
+                self.graphics.setCgaColor(arguments[0], arguments[1]) catch return error.IllegalFunctionCall;
+                self.text.setColorRange(3, 0, 3, 3) catch return error.IllegalFunctionCall;
+            },
+            2, 11 => return error.IllegalFunctionCall,
+            7, 8, 9, 10 => {
+                if (arguments[2] != null) return error.IllegalFunctionCall;
+                const maximum_attribute: i32 = self.graphics.maximumAttribute();
+                if (arguments[0]) |foreground| if (foreground < 0 or foreground > maximum_attribute) return error.IllegalFunctionCall;
+                if (arguments[1]) |background| {
+                    if (background < 0 or background > self.graphics.maximumDisplayColor()) return error.IllegalFunctionCall;
+                    self.graphics.setPalette(0, background) catch return error.IllegalFunctionCall;
+                }
+                self.text.setColorRange(arguments[0], null, maximum_attribute, 0) catch
+                    return error.IllegalFunctionCall;
+            },
+            12, 13 => {
+                if (arguments[1] != null or arguments[2] != null) return error.IllegalFunctionCall;
+                const maximum_attribute: i32 = self.graphics.maximumAttribute();
+                self.text.setColorRange(arguments[0], null, maximum_attribute, 0) catch
+                    return error.IllegalFunctionCall;
+            },
+            else => return error.IllegalFunctionCall,
+        }
     }
 
     fn textCls(self: *Vm, argument_count: u32) ExecutionError!void {
         if (argument_count > 1) return error.InvalidInstruction;
         const mode = if (argument_count == 1) try self.popLong() else null;
+        if (mode) |requested| if (requested < 0 or requested > 2) return error.IllegalFunctionCall;
         if (self.screen_mode == 0) {
-            self.text.clear(mode) catch return error.IllegalFunctionCall;
+            if (mode == null or mode.? == 2 or mode.? == 0) {
+                self.text.clear(mode orelse 2) catch return error.IllegalFunctionCall;
+            } else {
+                self.text.homeCursor();
+            }
             return;
         }
-        const graphics_mode = mode orelse 0;
-        if (graphics_mode < 0 or graphics_mode > 2) return error.IllegalFunctionCall;
-        if (graphics_mode == 0 or graphics_mode == 1) {
-            self.graphics.clear(@as(i32, self.text.background & self.graphics.maximumAttribute())) catch return error.IllegalFunctionCall;
+        const effective_mode: i32 = mode orelse 1;
+        if (effective_mode == 0 or effective_mode == 1) {
+            self.syncTextToGraphics();
+            if (effective_mode == 0)
+                self.graphics.clearAll(0) catch return error.IllegalFunctionCall
+            else
+                self.graphics.clear(0) catch return error.IllegalFunctionCall;
         }
-        if (graphics_mode == 0 or graphics_mode == 2) {
-            self.text.clear(if (graphics_mode == 2) 2 else 0) catch return error.IllegalFunctionCall;
-        }
+        if (effective_mode == 0 or effective_mode == 2)
+            self.text.clear(if (effective_mode == 2) 2 else 0) catch return error.IllegalFunctionCall
+        else
+            self.text.homeCursor();
     }
 
     fn textLocate(self: *Vm, mask: u32, argument_count: u32) ExecutionError!void {
@@ -5412,10 +5627,19 @@ pub const Vm = struct {
             .environ_string => self.environmentString(arguments[0]),
             .time_string => self.timeString(),
             .point => blk: {
-                const x = try values.asLong(arguments[0]);
-                const y = try values.asLong(arguments[1]);
-                break :blk .{ .integer = @intCast(try self.graphics.point(.{ .x = x, .y = y })) };
+                self.syncTextToGraphics();
+                if (arguments.len == 1) {
+                    const selector = try values.asLong(arguments[0]);
+                    break :blk .{ .single = @floatCast(try self.graphics.currentCoordinate(selector)) };
+                }
+                const x = try values.asDouble(arguments[0]);
+                const y = try values.asDouble(arguments[1]);
+                break :blk .{ .single = @floatFromInt(try self.graphics.pointLogical(.{ .x = x, .y = y })) };
             },
+            .pmap => .{ .single = @floatCast(try self.graphics.mapCoordinate(
+                try values.asDouble(arguments[0]),
+                try values.asLong(arguments[1]),
+            )) },
         };
     }
 
@@ -7012,9 +7236,35 @@ fn signum(input: values.Value) ExecutionError!values.Value {
     return .{ .integer = if (number < 0) -1 else if (number > 0) 1 else 0 };
 }
 
-fn saturatingCoordinateAdd(first: i32, second: i32) i32 {
-    const result = @as(i64, first) + second;
-    return @intCast(std.math.clamp(result, std.math.minInt(i32), std.math.maxInt(i32)));
+fn validTextGeometry(mode: i32, requested_columns: i32, requested_rows: i32) bool {
+    return switch (mode) {
+        0 => (requested_columns == 40 or requested_columns == 80) and
+            (requested_rows == 25 or requested_rows == 43 or requested_rows == 50),
+        1, 7, 13 => requested_columns == 40 and requested_rows == 25,
+        2, 8 => requested_columns == 80 and requested_rows == 25,
+        9, 10 => requested_columns == 80 and (requested_rows == 25 or requested_rows == 43),
+        11, 12 => requested_columns == 80 and (requested_rows == 30 or requested_rows == 60),
+        else => false,
+    };
+}
+
+fn defaultScreenForeground(mode: i32) i32 {
+    return switch (mode) {
+        0, 7, 8, 9, 12, 13 => 7,
+        1, 10 => 3,
+        2, 11 => 1,
+        else => 7,
+    };
+}
+
+fn numericArrayLongAt(array: *const ArrayValue, index: usize) ExecutionError!i32 {
+    return switch (array.storage) {
+        .integer => |items| values.asLong(.{ .integer = items[index] }),
+        .long => |items| values.asLong(.{ .long = items[index] }),
+        .single => |items| values.asLong(.{ .single = items[index] }),
+        .double => |items| values.asLong(.{ .double = items[index] }),
+        .cells => error.TypeMismatch,
+    };
 }
 
 fn arrayRawBytesConst(array: *const ArrayValue) ExecutionError![]const u8 {

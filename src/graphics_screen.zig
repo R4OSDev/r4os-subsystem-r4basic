@@ -79,6 +79,42 @@ pub const Point = struct {
     y: i32,
 };
 
+pub const LogicalPoint = struct {
+    x: f64,
+    y: f64,
+};
+
+pub const ModeSpec = struct {
+    mode: i32,
+    width: u32,
+    height: u32,
+    text_columns: usize,
+    text_rows: usize,
+    alternate_text_rows: ?usize = null,
+    pages: u8,
+    attributes: u16,
+    maximum_color: i32,
+    bits_per_pixel_per_plane: u8,
+    planes: u8,
+    packed_page_bytes: usize,
+};
+
+pub fn modeSpec(mode: i32) ?ModeSpec {
+    return switch (mode) {
+        0 => .{ .mode = 0, .width = 640, .height = 400, .text_columns = 80, .text_rows = 25, .alternate_text_rows = 50, .pages = 8, .attributes = 16, .maximum_color = 63, .bits_per_pixel_per_plane = 0, .planes = 0, .packed_page_bytes = 0 },
+        1 => .{ .mode = 1, .width = 320, .height = 200, .text_columns = 40, .text_rows = 25, .pages = 1, .attributes = 4, .maximum_color = 15, .bits_per_pixel_per_plane = 2, .planes = 1, .packed_page_bytes = 16 * 1024 },
+        2 => .{ .mode = 2, .width = 640, .height = 200, .text_columns = 80, .text_rows = 25, .pages = 1, .attributes = 2, .maximum_color = 15, .bits_per_pixel_per_plane = 1, .planes = 1, .packed_page_bytes = 16 * 1024 },
+        7 => .{ .mode = 7, .width = 320, .height = 200, .text_columns = 40, .text_rows = 25, .pages = 8, .attributes = 16, .maximum_color = 15, .bits_per_pixel_per_plane = 1, .planes = 4, .packed_page_bytes = 32 * 1024 },
+        8 => .{ .mode = 8, .width = 640, .height = 200, .text_columns = 80, .text_rows = 25, .pages = 4, .attributes = 16, .maximum_color = 15, .bits_per_pixel_per_plane = 1, .planes = 4, .packed_page_bytes = 64 * 1024 },
+        9 => .{ .mode = 9, .width = 640, .height = 350, .text_columns = 80, .text_rows = 25, .alternate_text_rows = 43, .pages = 2, .attributes = 16, .maximum_color = 63, .bits_per_pixel_per_plane = 1, .planes = 4, .packed_page_bytes = 128 * 1024 },
+        10 => .{ .mode = 10, .width = 640, .height = 350, .text_columns = 80, .text_rows = 25, .alternate_text_rows = 43, .pages = 4, .attributes = 4, .maximum_color = 8, .bits_per_pixel_per_plane = 1, .planes = 2, .packed_page_bytes = 64 * 1024 },
+        11 => .{ .mode = 11, .width = 640, .height = 480, .text_columns = 80, .text_rows = 30, .alternate_text_rows = 60, .pages = 1, .attributes = 2, .maximum_color = 262_143, .bits_per_pixel_per_plane = 1, .planes = 1, .packed_page_bytes = 64 * 1024 },
+        12 => .{ .mode = 12, .width = 640, .height = 480, .text_columns = 80, .text_rows = 30, .alternate_text_rows = 60, .pages = 1, .attributes = 16, .maximum_color = 262_143, .bits_per_pixel_per_plane = 1, .planes = 4, .packed_page_bytes = 256 * 1024 },
+        13 => .{ .mode = 13, .width = 320, .height = 200, .text_columns = 40, .text_rows = 25, .pages = 1, .attributes = 256, .maximum_color = 262_143, .bits_per_pixel_per_plane = 8, .planes = 1, .packed_page_bytes = 64 * 1024 },
+        else => null,
+    };
+}
+
 pub const View = struct {
     pixels: []u8,
     palette: []u32,
@@ -123,21 +159,13 @@ pub const PerformanceStats = struct {
     put_calls: u64 = 0,
     put_pixels: u64 = 0,
     put_bytes: u64 = 0,
+    page_switches: u64 = 0,
+    page_copies: u64 = 0,
+    page_copy_bytes: u64 = 0,
+    hidden_page_commits: u64 = 0,
 };
 
-const mode_1_width: u32 = 320;
-const mode_1_height: u32 = 200;
-const mode_9_width: u32 = 640;
-const mode_9_height: u32 = 350;
-const mode_0_width: u32 = 640;
-const mode_0_height: u32 = 400;
-const text_columns_mode_1: usize = 40;
-const text_columns_mode_9: usize = 80;
-const text_rows: usize = 25;
 const text_cell_width: usize = 8;
-const text_cell_height_mode_1: usize = 8;
-const text_cell_height_mode_9: usize = 14;
-const text_cell_height_mode_0: usize = 16;
 const image_header_bytes: usize = 4;
 const maximum_circle_segments: usize = 16_384;
 
@@ -171,13 +199,36 @@ const ImageLayout = struct {
     byte_count: usize,
 };
 
+const Viewport = struct {
+    left: i32 = 0,
+    top: i32 = 0,
+    right: i32 = 0,
+    bottom: i32 = 0,
+    screen_coordinates: bool = true,
+    active: bool = false,
+};
+
+const Window = struct {
+    first: LogicalPoint,
+    second: LogicalPoint,
+    screen_coordinates: bool,
+};
+
 pub const Screen = struct {
     pixels: ?[]u8 = null,
     palette: [256]u32 = [_]u32{0} ** 256,
     width: u32 = 0,
     height: u32 = 0,
     mode: i32 = 0,
+    page_stride: usize = 0,
+    page_count: u8 = 0,
+    active_page: u8 = 0,
+    visible_page: u8 = 0,
+    cga_palette_select: u8 = 1,
     current: Point = .{ .x = 0, .y = 0 },
+    current_view: LogicalPoint = .{ .x = 0, .y = 0 },
+    viewport: Viewport = .{},
+    window: ?Window = null,
     mode_revision: u64 = 1,
     content_revision: u64 = 1,
     damage: Damage = .{},
@@ -199,19 +250,24 @@ pub const Screen = struct {
     }
 
     pub fn setMode(self: *Screen, allocator: std.mem.Allocator, mode: i32) Error!void {
-        const width: u32 = switch (mode) {
-            0 => mode_0_width,
-            1 => mode_1_width,
-            9 => mode_9_width,
-            else => return error.IllegalFunctionCall,
-        };
-        const height: u32 = switch (mode) {
-            0 => mode_0_height,
-            1 => mode_1_height,
-            9 => mode_9_height,
-            else => unreachable,
-        };
-        const count = std.math.mul(usize, width, height) catch return error.OutOfMemory;
+        return self.setModePages(allocator, mode, 0, 0);
+    }
+
+    pub fn setModePages(
+        self: *Screen,
+        allocator: std.mem.Allocator,
+        mode: i32,
+        requested_active_page: i32,
+        requested_visible_page: i32,
+    ) Error!void {
+        const spec = modeSpec(mode) orelse return error.IllegalFunctionCall;
+        if (requested_active_page < 0 or requested_visible_page < 0 or
+            requested_active_page >= spec.pages or requested_visible_page >= spec.pages)
+        {
+            return error.IllegalFunctionCall;
+        }
+        const page_stride = std.math.mul(usize, spec.width, spec.height) catch return error.OutOfMemory;
+        const count = std.math.mul(usize, page_stride, spec.pages) catch return error.OutOfMemory;
         if (self.pixels != null and self.pixels.?.len == count) {
             @memset(self.pixels.?, 0);
             self.stats.mode_reuses +%= 1;
@@ -223,12 +279,22 @@ pub const Screen = struct {
             self.stats.mode_allocations +%= 1;
         }
         self.stats.mode_clear_bytes +%= count;
-        self.width = width;
-        self.height = height;
+        self.width = spec.width;
+        self.height = spec.height;
         self.mode = mode;
+        self.page_stride = page_stride;
+        self.page_count = spec.pages;
+        self.active_page = @intCast(requested_active_page);
+        self.visible_page = @intCast(requested_visible_page);
         self.current = .{ .x = 0, .y = 0 };
+        self.current_view = .{ .x = 0, .y = 0 };
+        self.viewport = .{
+            .right = @intCast(spec.width - 1),
+            .bottom = @intCast(spec.height - 1),
+        };
+        self.window = null;
         self.resetPalette();
-        self.damage.full(width, height);
+        self.damage.full(spec.width, spec.height);
         self.stats.damage_commits +%= 1;
         self.stats.damage_regions +%= 1;
         self.stats.full_damage_commits +%= 1;
@@ -236,12 +302,47 @@ pub const Screen = struct {
         self.content_revision +%= 1;
     }
 
+    pub fn selectPages(self: *Screen, requested_active_page: i32, requested_visible_page: i32) Error!void {
+        if (requested_active_page < 0 or requested_visible_page < 0 or
+            requested_active_page >= self.page_count or requested_visible_page >= self.page_count)
+        {
+            return error.IllegalFunctionCall;
+        }
+        const next_active: u8 = @intCast(requested_active_page);
+        const next_visible: u8 = @intCast(requested_visible_page);
+        if (self.active_page != next_active) self.active_page = next_active;
+        if (self.visible_page == next_visible) return;
+        self.visible_page = next_visible;
+        self.stats.page_switches +%= 1;
+        self.damage.full(self.width, self.height);
+        self.stats.damage_commits +%= 1;
+        self.stats.damage_regions +%= 1;
+        self.stats.full_damage_commits +%= 1;
+        self.mode_revision +%= 1;
+        self.content_revision +%= 1;
+    }
+
+    pub fn copyPage(self: *Screen, source: i32, destination: i32) Error!bool {
+        if (source < 0 or destination < 0 or source >= self.page_count or destination >= self.page_count) {
+            return error.IllegalFunctionCall;
+        }
+        if (source == destination) return false;
+        const source_pixels = self.pagePixels(@intCast(source)) orelse return error.IllegalFunctionCall;
+        const destination_pixels = self.pagePixels(@intCast(destination)) orelse return error.IllegalFunctionCall;
+        self.stats.page_copies +%= 1;
+        self.stats.page_copy_bytes +%= source_pixels.len;
+        if (std.mem.eql(u8, source_pixels, destination_pixels)) return false;
+        @memcpy(destination_pixels, source_pixels);
+        if (destination == self.visible_page) self.markFull() else self.stats.hidden_page_commits +%= 1;
+        return true;
+    }
+
     pub fn performanceStats(self: *const Screen) PerformanceStats {
         return self.stats;
     }
 
     pub fn view(self: *Screen) ?View {
-        const pixels = self.pixels orelse return null;
+        const pixels = self.pagePixels(self.visible_page) orelse return null;
         return .{
             .pixels = pixels,
             .palette = self.palette[0..],
@@ -259,54 +360,220 @@ pub const Screen = struct {
     }
 
     pub fn maximumAttribute(self: *const Screen) u8 {
-        return if (self.mode == 1) 3 else if (self.mode == 0 or self.mode == 9) 15 else 0;
+        const spec = modeSpec(self.mode) orelse return 0;
+        return @intCast(spec.attributes - 1);
+    }
+
+    pub fn textColumns(self: *const Screen) usize {
+        return if (modeSpec(self.mode)) |spec| spec.text_columns else 0;
+    }
+
+    pub fn textRows(self: *const Screen) usize {
+        return if (modeSpec(self.mode)) |spec| spec.text_rows else 0;
+    }
+
+    pub fn packedPageBytes(self: *const Screen) usize {
+        return if (modeSpec(self.mode)) |spec| spec.packed_page_bytes else 0;
+    }
+
+    pub fn maximumDisplayColor(self: *const Screen) i32 {
+        return if (modeSpec(self.mode)) |spec| spec.maximum_color else -1;
+    }
+
+    pub fn setCgaColor(self: *Screen, requested_background: ?i32, requested_palette: ?i32) Error!void {
+        if (self.mode != 1) return error.IllegalFunctionCall;
+        if (requested_background) |value| if (value < 0 or value > 15) return error.IllegalFunctionCall;
+        if (requested_palette) |value| if (value < 0 or value > 255) return error.IllegalFunctionCall;
+        const selected: u8 = if (requested_palette) |value|
+            @intCast(value & 1)
+        else
+            self.cga_palette_select;
+        var replacement = self.palette;
+        if (requested_background) |value| replacement[0] = try self.displayColorRgb(value);
+        const defaults = if (selected == 0) [_]i32{ 2, 4, 6 } else [_]i32{ 3, 5, 7 };
+        for (defaults, 1..) |display_color, attribute_index| {
+            replacement[attribute_index] = try self.displayColorRgb(display_color);
+        }
+        self.cga_palette_select = selected;
+        if (std.mem.eql(u32, replacement[0..], self.palette[0..])) return;
+        self.palette = replacement;
+        self.markFull();
     }
 
     pub fn setPalette(self: *Screen, requested_attribute: i32, display_color: i32) Error!void {
-        if (self.mode == 0) return error.IllegalFunctionCall;
         if (requested_attribute < 0 or requested_attribute > self.maximumAttribute()) return error.IllegalFunctionCall;
-        const hardware_code: u8 = switch (self.mode) {
-            1 => if (display_color >= 0 and display_color < ega_16_codes.len)
-                ega_16_codes[@intCast(display_color)]
-            else
-                return error.IllegalFunctionCall,
-            9 => if (display_color >= 0 and display_color <= 63)
-                @intCast(display_color)
-            else
-                return error.IllegalFunctionCall,
-            else => return error.IllegalFunctionCall,
-        };
+        const rgb = try self.displayColorRgb(display_color);
         const index: usize = @intCast(requested_attribute);
-        const rgb = egaRgb(hardware_code);
         if (self.palette[index] == rgb) return;
         self.palette[index] = rgb;
         self.markFull();
     }
 
-    pub fn clear(self: *Screen, requested_attribute: i32) Error!void {
-        const color = try self.attribute(requested_attribute);
-        const pixels = self.pixels orelse return error.IllegalFunctionCall;
-        const unchanged = std.mem.count(u8, pixels, &[_]u8{color});
-        self.stats.pixel_probes +%= pixels.len;
-        if (unchanged == pixels.len) return;
-        @memset(pixels, color);
-        self.stats.pixel_changes +%= pixels.len - unchanged;
-        self.stats.span_operations +%= self.height;
-        self.stats.span_pixels +%= pixels.len;
+    pub fn resetPalettePublic(self: *Screen) void {
+        const previous = self.palette;
+        self.resetPalette();
+        if (!std.mem.eql(u32, previous[0..], self.palette[0..])) self.markFull();
+    }
+
+    pub fn setPaletteUsing(self: *Screen, display_colors: []const i32) Error!void {
+        const count = @min(display_colors.len, @as(usize, self.maximumAttribute()) + 1);
+        var replacement = self.palette;
+        for (display_colors[0..count], 0..) |display_color, index| {
+            if (display_color == -1) continue;
+            replacement[index] = try self.displayColorRgb(display_color);
+        }
+        if (std.mem.eql(u32, replacement[0..], self.palette[0..])) return;
+        self.palette = replacement;
         self.markFull();
     }
 
-    pub fn resolvePoint(self: *const Screen, x: i32, y: i32, relative: bool) Point {
-        if (!relative) return .{ .x = x, .y = y };
-        return .{
-            .x = saturatingAdd(self.current.x, x),
-            .y = saturatingAdd(self.current.y, y),
+    pub fn clear(self: *Screen, requested_attribute: i32) Error!void {
+        const color = try self.attribute(requested_attribute);
+        if (self.pixels == null) return error.IllegalFunctionCall;
+        var mutation: Mutation = .{};
+        var y = self.viewport.top;
+        while (y <= self.viewport.bottom) : (y += 1) {
+            self.writeSolidSpan(
+                &mutation,
+                @intCast(y),
+                @intCast(self.viewport.left),
+                @intCast(self.viewport.right),
+                color,
+            );
+        }
+        self.commitMutation(mutation);
+    }
+
+    pub fn clearAll(self: *Screen, requested_attribute: i32) Error!void {
+        const color = try self.attribute(requested_attribute);
+        if (self.pixels == null) return error.IllegalFunctionCall;
+        const width: usize = @intCast(self.width);
+        const height: usize = @intCast(self.height);
+        var mutation: Mutation = .{};
+        var y: usize = 0;
+        while (y < height) : (y += 1) self.writeSolidSpan(
+            &mutation,
+            y,
+            0,
+            width - 1,
+            color,
+        );
+        self.commitMutation(mutation);
+    }
+
+    pub fn setView(
+        self: *Screen,
+        requested_first: ?LogicalPoint,
+        requested_second: ?LogicalPoint,
+        screen_coordinates: bool,
+        requested_fill: ?i32,
+        requested_border: ?i32,
+    ) Error!void {
+        if (self.mode == 0 or self.pixels == null) return error.IllegalFunctionCall;
+        if (requested_first == null and requested_second == null) {
+            if (requested_fill != null or requested_border != null or screen_coordinates) return error.IllegalFunctionCall;
+            self.viewport = .{
+                .right = @intCast(self.width - 1),
+                .bottom = @intCast(self.height - 1),
+            };
+            return;
+        }
+        const first = requested_first orelse return error.IllegalFunctionCall;
+        const second = requested_second orelse return error.IllegalFunctionCall;
+        if (!finitePoint(first) or !finitePoint(second)) return error.IllegalFunctionCall;
+        const left = roundedPointCoordinate(first.x);
+        const top = roundedPointCoordinate(first.y);
+        const right = roundedPointCoordinate(second.x);
+        const bottom = roundedPointCoordinate(second.y);
+        if (left < 0 or top < 0 or right <= left or bottom <= top or
+            right >= self.width or bottom >= self.height)
+        {
+            return error.IllegalFunctionCall;
+        }
+        const fill = if (requested_fill) |value| try self.attribute(value) else null;
+        const border = if (requested_border) |value| try self.attribute(value) else null;
+        self.viewport = .{
+            .left = left,
+            .top = top,
+            .right = right,
+            .bottom = bottom,
+            .screen_coordinates = screen_coordinates,
+            .active = true,
+        };
+        var mutation: Mutation = .{};
+        if (fill) |color| self.fillBox(
+            &mutation,
+            .{ .x = left, .y = top },
+            .{ .x = right, .y = bottom },
+            color,
+        );
+        if (border) |color| self.drawViewportBorder(&mutation, left, top, right, bottom, color);
+        self.commitMutation(mutation);
+    }
+
+    pub fn setWindow(
+        self: *Screen,
+        requested_first: ?LogicalPoint,
+        requested_second: ?LogicalPoint,
+        screen_coordinates: bool,
+    ) Error!void {
+        if (self.mode == 0 or self.pixels == null) return error.IllegalFunctionCall;
+        if (requested_first == null and requested_second == null) {
+            if (screen_coordinates) return error.IllegalFunctionCall;
+            self.window = null;
+            return;
+        }
+        const first = requested_first orelse return error.IllegalFunctionCall;
+        const second = requested_second orelse return error.IllegalFunctionCall;
+        if (!finitePoint(first) or !finitePoint(second) or first.x == second.x or first.y == second.y) {
+            return error.IllegalFunctionCall;
+        }
+        self.window = .{
+            .first = first,
+            .second = second,
+            .screen_coordinates = screen_coordinates,
+        };
+        self.current_view = self.physicalToLogical(self.current);
+    }
+
+    pub fn resolvePoint(self: *const Screen, x: f64, y: f64, relative: bool) Point {
+        const requested = if (relative)
+            LogicalPoint{ .x = self.current_view.x + x, .y = self.current_view.y + y }
+        else
+            LogicalPoint{ .x = x, .y = y };
+        return self.logicalToPhysical(requested);
+    }
+
+    pub fn resolveRelativeTo(self: *const Screen, origin: Point, x: f64, y: f64) Point {
+        const logical_origin = self.physicalToLogical(origin);
+        return self.logicalToPhysical(.{ .x = logical_origin.x + x, .y = logical_origin.y + y });
+    }
+
+    pub fn mapCoordinate(self: *const Screen, value: f64, mode_value: i32) Error!f64 {
+        if (self.mode == 0 or self.pixels == null or !std.math.isFinite(value)) return error.IllegalFunctionCall;
+        return switch (mode_value) {
+            0 => self.logicalXToPhysical(value),
+            1 => self.logicalYToPhysical(value),
+            2 => self.physicalXToLogical(value),
+            3 => self.physicalYToLogical(value),
+            else => error.IllegalFunctionCall,
+        };
+    }
+
+    pub fn currentCoordinate(self: *const Screen, selector: i32) Error!f64 {
+        if (self.mode == 0 or self.pixels == null) return error.IllegalFunctionCall;
+        return switch (selector) {
+            0 => @floatFromInt(self.current.x),
+            1 => @floatFromInt(self.current.y),
+            2 => self.current_view.x,
+            3 => self.current_view.y,
+            else => error.IllegalFunctionCall,
         };
     }
 
     pub fn pset(self: *Screen, target: Point, requested_color: i32) Error!void {
         const color = try self.attribute(requested_color);
-        self.current = target;
+        self.noteCurrent(target);
         var mutation: Mutation = .{};
         self.writePixelChecked(&mutation, target.x, target.y, color);
         self.commitMutation(mutation);
@@ -314,9 +581,14 @@ pub const Screen = struct {
 
     pub fn point(self: *const Screen, point_value: Point) Error!i32 {
         if (self.mode == 0) return error.IllegalFunctionCall;
-        const pixels = self.pixels orelse return error.IllegalFunctionCall;
+        const pixels = self.activePixelsConst() orelse return error.IllegalFunctionCall;
         if (!self.contains(point_value.x, point_value.y)) return -1;
         return pixels[self.pixelIndex(point_value.x, point_value.y)];
+    }
+
+    pub fn pointLogical(self: *const Screen, requested: LogicalPoint) Error!i32 {
+        if (!finitePoint(requested)) return error.IllegalFunctionCall;
+        return self.point(self.logicalToPhysical(requested));
     }
 
     pub fn line(
@@ -327,7 +599,7 @@ pub const Screen = struct {
         box_mode: bytecode.GraphicsBoxMode,
     ) Error!void {
         const color = try self.attribute(requested_color);
-        self.current = second;
+        self.noteCurrent(second);
         var mutation: Mutation = .{};
         switch (box_mode) {
             .line => self.drawLine(&mutation, first, second, color),
@@ -404,7 +676,7 @@ pub const Screen = struct {
     ) Error!void {
         const fill_color = try self.attribute(requested_fill);
         const border_color = try self.attribute(requested_border);
-        const pixels = self.pixels orelse return error.IllegalFunctionCall;
+        const pixels = self.activePixels() orelse return error.IllegalFunctionCall;
         if (!self.contains(start.x, start.y)) return;
         const initial_index = self.pixelIndex(start.x, start.y);
         const target = pixels[initial_index];
@@ -428,12 +700,14 @@ pub const Screen = struct {
             const row_start = y * row_width;
             var left = index - row_start;
             var right = left;
-            while (left != 0) {
+            const view_left: usize = @intCast(self.viewport.left);
+            const view_right: usize = @intCast(self.viewport.right);
+            while (left > view_left) {
                 self.stats.paint_pixel_probes +%= 1;
                 if (pixels[row_start + left - 1] != target) break;
                 left -= 1;
             }
-            while (right + 1 < row_width) {
+            while (right < view_right) {
                 self.stats.paint_pixel_probes +%= 1;
                 if (pixels[row_start + right + 1] != target) break;
                 right += 1;
@@ -448,8 +722,8 @@ pub const Screen = struct {
             self.stats.paint_pixels +%= span.len;
             mutation.noteSpan(@intCast(left), @intCast(y), @intCast(span.len));
 
-            if (y != 0) try self.appendPaintRuns(&pending, allocator, pixels, row_start - row_width, left, right, target);
-            if (y + 1 < self.height) try self.appendPaintRuns(&pending, allocator, pixels, row_start + row_width, left, right, target);
+            if (y > self.viewport.top) try self.appendPaintRuns(&pending, allocator, pixels, row_start - row_width, left, right, target);
+            if (y < self.viewport.bottom) try self.appendPaintRuns(&pending, allocator, pixels, row_start + row_width, left, right, target);
         }
         self.commitMutation(mutation);
     }
@@ -496,7 +770,7 @@ pub const Screen = struct {
         self.stats.put_pixels +%= image_width * image_height;
         self.stats.put_bytes +%= image_header_bytes + payload;
         var mutation: Mutation = .{};
-        const pixels = self.pixels.?;
+        const pixels = self.activePixels() orelse return error.IllegalFunctionCall;
         var y: usize = 0;
         while (y < image_height) : (y += 1) {
             const target_y: u32 = @intCast(origin.y + @as(i32, @intCast(y)));
@@ -526,14 +800,23 @@ pub const Screen = struct {
     }
 
     pub fn renderText(self: *Screen, text: *const text_screen.Screen, cells: text_screen.CellRect) void {
-        const pixels = self.pixels orelse return;
-        const columns = if (self.mode == 1) text_columns_mode_1 else text_columns_mode_9;
-        const cell_height = switch (self.mode) {
-            0 => text_cell_height_mode_0,
-            1 => text_cell_height_mode_1,
-            9 => text_cell_height_mode_9,
-            else => return,
-        };
+        self.renderTextPage(text, self.active_page, cells);
+    }
+
+    pub fn renderTextPage(
+        self: *Screen,
+        text: *const text_screen.Screen,
+        page_index: usize,
+        cells: text_screen.CellRect,
+    ) void {
+        if (page_index >= self.page_count or page_index >= text.page_count) return;
+        const page: u8 = @intCast(page_index);
+        const pixels = self.pagePixels(page) orelse return;
+        const columns = text.active_columns;
+        const text_rows = text.active_rows;
+        if (columns == 0 or text_rows == 0 or self.width % columns != 0) return;
+        const cell_width: usize = self.width / columns;
+        if (cell_width == 0 or cell_width > 16) return;
         const first_x = @min(cells.x, columns);
         const first_y = @min(cells.y, text_rows);
         const last_x = @min(columns, cells.x +| cells.w);
@@ -543,31 +826,35 @@ pub const Screen = struct {
         var cell_y = first_y;
         while (cell_y < last_y) : (cell_y += 1) {
             const cell_count = last_x - first_x;
-            var cached_cells: [text_columns_mode_9]text_screen.Cell = undefined;
-            var cached_glyphs: [text_columns_mode_9][8]u8 = undefined;
+            var cached_cells: [text_screen.columns]text_screen.Cell = undefined;
+            var cached_glyphs: [text_screen.columns][8]u8 = undefined;
             for (0..cell_count) |index| {
-                const cell = text.cell(cell_y, first_x + index) orelse unreachable;
+                const cell = text.cellOnPage(page_index, cell_y, first_x + index) orelse return;
                 cached_cells[index] = cell;
                 cached_glyphs[index] = basic_font.glyph(cell.character);
                 self.stats.text_cells +%= 1;
             }
 
-            const raster_x = first_x * text_cell_width;
-            const raster_width = cell_count * text_cell_width;
+            const raster_x = first_x * cell_width;
+            const raster_width = cell_count * cell_width;
+            const raster_top = cell_y * self.height / text_rows;
+            const raster_bottom = (cell_y + 1) * self.height / text_rows;
+            const cell_height = raster_bottom - raster_top;
             var row: usize = 0;
             while (row < cell_height) : (row += 1) {
-                var raster_row: [mode_0_width]u8 = undefined;
+                var raster_row: [640]u8 = undefined;
                 for (0..cell_count) |cell_index| {
                     const cell = cached_cells[cell_index];
                     const glyph_row = cached_glyphs[cell_index][(row * 8) / cell_height];
-                    const cell_offset = cell_index * text_cell_width;
+                    const cell_offset = cell_index * cell_width;
                     var column: usize = 0;
-                    while (column < text_cell_width) : (column += 1) {
-                        const bit = (@as(u8, 0x80) >> @intCast(column));
+                    while (column < cell_width) : (column += 1) {
+                        const glyph_column = column * 8 / cell_width;
+                        const bit = (@as(u8, 0x80) >> @intCast(glyph_column));
                         raster_row[cell_offset + column] = (if ((glyph_row & bit) != 0) cell.foreground else cell.background) & maximum_attribute;
                     }
                 }
-                const raster_y = cell_y * cell_height + row;
+                const raster_y = raster_top + row;
                 const offset = raster_y * self.width + raster_x;
                 const destination = pixels[offset .. offset + raster_width];
                 const replacement = raster_row[0..raster_width];
@@ -583,20 +870,54 @@ pub const Screen = struct {
                 mutation.noteSpan(@intCast(raster_x), @intCast(raster_y), @intCast(raster_width));
             }
         }
-        self.commitMutation(mutation);
+        self.commitMutationForPage(page, mutation);
     }
 
     fn resetPalette(self: *Screen) void {
         @memset(self.palette[0..], 0);
-        if (self.mode == 1) {
-            for (screen_1_defaults, 0..) |logical_color, palette_index| {
+        self.cga_palette_select = 1;
+        switch (self.mode) {
+            1 => for (screen_1_defaults, 0..) |logical_color, palette_index| {
                 self.palette[palette_index] = egaRgb(ega_16_codes[logical_color]);
-            }
-        } else if (self.mode == 0 or self.mode == 9) {
-            for (ega_16_codes, 0..) |hardware_code, palette_index| {
+            },
+            2, 11 => self.palette[1] = 0xFFFFFF,
+            10 => {
+                self.palette[1] = egaRgb(2);
+                self.palette[2] = egaRgb(18);
+                self.palette[3] = 0xFFFFFF;
+            },
+            0, 7, 8, 9, 12 => for (ega_16_codes, 0..) |hardware_code, palette_index| {
                 self.palette[palette_index] = egaRgb(hardware_code);
-            }
+            },
+            13 => {
+                for (ega_16_codes, 0..) |hardware_code, palette_index| {
+                    self.palette[palette_index] = egaRgb(hardware_code);
+                }
+                var index: usize = 16;
+                for (0..6) |red| for (0..6) |green| for (0..6) |blue| {
+                    self.palette[index] = (@as(u32, @intCast(red * 51)) << 16) |
+                        (@as(u32, @intCast(green * 51)) << 8) |
+                        @as(u32, @intCast(blue * 51));
+                    index += 1;
+                };
+                while (index < self.palette.len) : (index += 1) {
+                    const gray: u32 = @intCast((index - 232) * 255 / 23);
+                    self.palette[index] = (gray << 16) | (gray << 8) | gray;
+                }
+            },
+            else => {},
         }
+    }
+
+    fn displayColorRgb(self: *const Screen, display_color: i32) Error!u32 {
+        const spec = modeSpec(self.mode) orelse return error.IllegalFunctionCall;
+        if (display_color < 0 or display_color > spec.maximum_color) return error.IllegalFunctionCall;
+        if (spec.maximum_color <= 63) return egaRgb(@intCast(display_color));
+        const packed_color: u32 = @intCast(display_color);
+        const red = scaleDac(packed_color & 63);
+        const green = scaleDac((packed_color >> 8) & 63);
+        const blue = scaleDac((packed_color >> 16) & 63);
+        return (red << 16) | (green << 8) | blue;
     }
 
     fn attribute(self: *const Screen, requested: i32) Error!u8 {
@@ -606,8 +927,118 @@ pub const Screen = struct {
         return @intCast(requested);
     }
 
+    fn pagePixels(self: *Screen, page_index: u8) ?[]u8 {
+        const pixels = self.pixels orelse return null;
+        if (page_index >= self.page_count or self.page_stride == 0) return null;
+        const first = @as(usize, page_index) * self.page_stride;
+        return pixels[first .. first + self.page_stride];
+    }
+
+    fn activePixels(self: *Screen) ?[]u8 {
+        return self.pagePixels(self.active_page);
+    }
+
+    fn activePixelsConst(self: *const Screen) ?[]const u8 {
+        const pixels = self.pixels orelse return null;
+        if (self.active_page >= self.page_count or self.page_stride == 0) return null;
+        const first = @as(usize, self.active_page) * self.page_stride;
+        return pixels[first .. first + self.page_stride];
+    }
+
+    fn noteCurrent(self: *Screen, point_value: Point) void {
+        self.current = point_value;
+        self.current_view = self.physicalToLogical(point_value);
+    }
+
+    fn logicalToPhysical(self: *const Screen, point_value: LogicalPoint) Point {
+        if (!finitePoint(point_value)) return .{
+            .x = if (point_value.x < 0) std.math.minInt(i32) else std.math.maxInt(i32),
+            .y = if (point_value.y < 0) std.math.minInt(i32) else std.math.maxInt(i32),
+        };
+        return .{
+            .x = roundedPointCoordinate(self.logicalXToPhysical(point_value.x)),
+            .y = roundedPointCoordinate(self.logicalYToPhysical(point_value.y)),
+        };
+    }
+
+    fn physicalToLogical(self: *const Screen, point_value: Point) LogicalPoint {
+        return .{
+            .x = self.physicalXToLogical(@floatFromInt(point_value.x)),
+            .y = self.physicalYToLogical(@floatFromInt(point_value.y)),
+        };
+    }
+
+    fn logicalXToPhysical(self: *const Screen, value: f64) f64 {
+        if (self.window) |configured| {
+            return affineMap(
+                value,
+                configured.first.x,
+                configured.second.x,
+                @floatFromInt(self.viewport.left),
+                @floatFromInt(self.viewport.right),
+            );
+        }
+        const offset: f64 = if (self.viewport.active and !self.viewport.screen_coordinates)
+            @floatFromInt(self.viewport.left)
+        else
+            0;
+        return value + offset;
+    }
+
+    fn logicalYToPhysical(self: *const Screen, value: f64) f64 {
+        if (self.window) |configured| {
+            return affineMap(
+                value,
+                configured.first.y,
+                configured.second.y,
+                @floatFromInt(if (configured.screen_coordinates) self.viewport.top else self.viewport.bottom),
+                @floatFromInt(if (configured.screen_coordinates) self.viewport.bottom else self.viewport.top),
+            );
+        }
+        const offset: f64 = if (self.viewport.active and !self.viewport.screen_coordinates)
+            @floatFromInt(self.viewport.top)
+        else
+            0;
+        return value + offset;
+    }
+
+    fn physicalXToLogical(self: *const Screen, value: f64) f64 {
+        if (self.window) |configured| {
+            return affineMap(
+                value,
+                @floatFromInt(self.viewport.left),
+                @floatFromInt(self.viewport.right),
+                configured.first.x,
+                configured.second.x,
+            );
+        }
+        const offset: f64 = if (self.viewport.active and !self.viewport.screen_coordinates)
+            @floatFromInt(self.viewport.left)
+        else
+            0;
+        return value - offset;
+    }
+
+    fn physicalYToLogical(self: *const Screen, value: f64) f64 {
+        if (self.window) |configured| {
+            return affineMap(
+                value,
+                @floatFromInt(if (configured.screen_coordinates) self.viewport.top else self.viewport.bottom),
+                @floatFromInt(if (configured.screen_coordinates) self.viewport.bottom else self.viewport.top),
+                configured.first.y,
+                configured.second.y,
+            );
+        }
+        const offset: f64 = if (self.viewport.active and !self.viewport.screen_coordinates)
+            @floatFromInt(self.viewport.top)
+        else
+            0;
+        return value - offset;
+    }
+
     fn contains(self: *const Screen, x: i32, y: i32) bool {
-        return x >= 0 and y >= 0 and x < self.width and y < self.height;
+        return x >= self.viewport.left and x <= self.viewport.right and
+            y >= self.viewport.top and y <= self.viewport.bottom;
     }
 
     fn pixelIndex(self: *const Screen, x: i32, y: i32) usize {
@@ -621,7 +1052,7 @@ pub const Screen = struct {
     }
 
     fn writePixelAt(self: *Screen, mutation: *Mutation, index: usize, x: u32, y: u32, color: u8) void {
-        const pixels = self.pixels.?;
+        const pixels = self.activePixels() orelse return;
         self.stats.pixel_probes +%= 1;
         if (pixels[index] == color) return;
         pixels[index] = color;
@@ -631,7 +1062,7 @@ pub const Screen = struct {
 
     fn writeSolidSpan(self: *Screen, mutation: *Mutation, y: usize, left: usize, right: usize, color: u8) void {
         const row_start = y * self.width;
-        const destination = self.pixels.?[row_start + left .. row_start + right + 1];
+        const destination = (self.activePixels() orelse return)[row_start + left .. row_start + right + 1];
         self.stats.span_operations +%= 1;
         self.stats.span_pixels +%= destination.len;
         const unchanged = std.mem.count(u8, destination, &[_]u8{color});
@@ -675,15 +1106,62 @@ pub const Screen = struct {
     }
 
     fn fillBox(self: *Screen, mutation: *Mutation, first: Point, second: Point, color: u8) void {
-        const left = @max(@as(i32, 0), @min(first.x, second.x));
-        const right = @min(@as(i32, @intCast(self.width - 1)), @max(first.x, second.x));
-        const top = @max(@as(i32, 0), @min(first.y, second.y));
-        const bottom = @min(@as(i32, @intCast(self.height - 1)), @max(first.y, second.y));
+        const left = @max(self.viewport.left, @min(first.x, second.x));
+        const right = @min(self.viewport.right, @max(first.x, second.x));
+        const top = @max(self.viewport.top, @min(first.y, second.y));
+        const bottom = @min(self.viewport.bottom, @max(first.y, second.y));
         if (left > right or top > bottom) return;
         var y = top;
         while (y <= bottom) : (y += 1) {
             self.stats.fill_spans +%= 1;
             self.writeSolidSpan(mutation, @intCast(y), @intCast(left), @intCast(right), color);
+        }
+    }
+
+    fn drawViewportBorder(
+        self: *Screen,
+        mutation: *Mutation,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+        color: u8,
+    ) void {
+        const border_left = if (left > 0) left - 1 else left;
+        const border_right = if (right + 1 < self.width) right + 1 else right;
+        if (top > 0) self.writeSolidSpan(
+            mutation,
+            @intCast(top - 1),
+            @intCast(border_left),
+            @intCast(border_right),
+            color,
+        );
+        if (bottom + 1 < self.height) self.writeSolidSpan(
+            mutation,
+            @intCast(bottom + 1),
+            @intCast(border_left),
+            @intCast(border_right),
+            color,
+        );
+        if (left > 0) {
+            var y = top;
+            while (y <= bottom) : (y += 1) self.writePixelAt(
+                mutation,
+                self.pixelIndex(left - 1, y),
+                @intCast(left - 1),
+                @intCast(y),
+                color,
+            );
+        }
+        if (right + 1 < self.width) {
+            var y = top;
+            while (y <= bottom) : (y += 1) self.writePixelAt(
+                mutation,
+                self.pixelIndex(right + 1, y),
+                @intCast(right + 1),
+                @intCast(y),
+                color,
+            );
         }
     }
 
@@ -753,7 +1231,7 @@ pub const Screen = struct {
         @memset(out, 0);
         std.mem.writeInt(u16, out[0..2], @intCast(layout.width_bits), .little);
         std.mem.writeInt(u16, out[2..4], @intCast(layout.height), .little);
-        const pixels = self.pixels.?;
+        const pixels = self.activePixels() orelse return;
         const source_left: usize = @intCast(layout.left);
         const source_top: usize = @intCast(layout.top);
         var y: usize = 0;
@@ -824,19 +1302,21 @@ pub const Screen = struct {
 
     fn clipLine(self: *const Screen, first: *Point, second: *Point) bool {
         if (self.width == 0 or self.height == 0) return false;
-        const max_x: f64 = @floatFromInt(self.width - 1);
-        const max_y: f64 = @floatFromInt(self.height - 1);
+        const min_x: f64 = @floatFromInt(self.viewport.left);
+        const min_y: f64 = @floatFromInt(self.viewport.top);
+        const max_x: f64 = @floatFromInt(self.viewport.right);
+        const max_y: f64 = @floatFromInt(self.viewport.bottom);
         var x0: f64 = @floatFromInt(first.x);
         var y0: f64 = @floatFromInt(first.y);
         var x1: f64 = @floatFromInt(second.x);
         var y1: f64 = @floatFromInt(second.y);
-        var code0 = outCode(x0, y0, max_x, max_y);
-        var code1 = outCode(x1, y1, max_x, max_y);
+        var code0 = outCode(x0, y0, min_x, min_y, max_x, max_y);
+        var code1 = outCode(x1, y1, min_x, min_y, max_x, max_y);
         var iterations: usize = 0;
         while (iterations < 16) : (iterations += 1) {
             if ((code0 | code1) == 0) {
-                first.* = .{ .x = roundClipCoordinate(x0, self.width), .y = roundClipCoordinate(y0, self.height) };
-                second.* = .{ .x = roundClipCoordinate(x1, self.width), .y = roundClipCoordinate(y1, self.height) };
+                first.* = .{ .x = roundClipCoordinate(x0, self.viewport.left, self.viewport.right), .y = roundClipCoordinate(y0, self.viewport.top, self.viewport.bottom) };
+                second.* = .{ .x = roundClipCoordinate(x1, self.viewport.left, self.viewport.right), .y = roundClipCoordinate(y1, self.viewport.top, self.viewport.bottom) };
                 return true;
             }
             if ((code0 & code1) != 0) return false;
@@ -849,25 +1329,25 @@ pub const Screen = struct {
                 x = x0 + (x1 - x0) * (max_y - y0) / (y1 - y0);
             } else if ((code & 4) != 0) {
                 if (y1 == y0) return false;
-                y = 0;
-                x = x0 + (x1 - x0) * (0 - y0) / (y1 - y0);
+                y = min_y;
+                x = x0 + (x1 - x0) * (min_y - y0) / (y1 - y0);
             } else if ((code & 2) != 0) {
                 if (x1 == x0) return false;
                 x = max_x;
                 y = y0 + (y1 - y0) * (max_x - x0) / (x1 - x0);
             } else {
                 if (x1 == x0) return false;
-                x = 0;
-                y = y0 + (y1 - y0) * (0 - x0) / (x1 - x0);
+                x = min_x;
+                y = y0 + (y1 - y0) * (min_x - x0) / (x1 - x0);
             }
             if (code == code0) {
                 x0 = x;
                 y0 = y;
-                code0 = outCode(x0, y0, max_x, max_y);
+                code0 = outCode(x0, y0, min_x, min_y, max_x, max_y);
             } else {
                 x1 = x;
                 y1 = y;
-                code1 = outCode(x1, y1, max_x, max_y);
+                code1 = outCode(x1, y1, min_x, min_y, max_x, max_y);
             }
         }
         return false;
@@ -883,9 +1363,17 @@ pub const Screen = struct {
     }
 
     fn commitMutation(self: *Screen, mutation: Mutation) void {
+        self.commitMutationForPage(self.active_page, mutation);
+    }
+
+    fn commitMutationForPage(self: *Screen, page_index: u8, mutation: Mutation) void {
         if (mutation.damage.count == 0) return;
         self.stats.damage_merges +%= mutation.damage.merges;
         self.stats.damage_overflow_merges +%= mutation.damage.overflow_merges;
+        if (page_index != self.visible_page) {
+            self.stats.hidden_page_commits +%= 1;
+            return;
+        }
         for (mutation.damage.slice()) |damage| self.mark(damage);
         self.stats.damage_commits +%= 1;
         self.stats.damage_regions +%= mutation.damage.count;
@@ -923,17 +1411,9 @@ fn rectsTouchOrOverlap(a: Rect, b: Rect) bool {
         @as(u64, a.y) <= b_bottom and @as(u64, b.y) <= a_bottom;
 }
 
-fn saturatingAdd(first: i32, second: i32) i32 {
-    const result = @as(i64, first) + second;
-    return @intCast(std.math.clamp(result, std.math.minInt(i32), std.math.maxInt(i32)));
-}
-
 fn defaultAspect(mode: i32) f64 {
-    return switch (mode) {
-        1 => 4.0 * (@as(f64, mode_1_height) / @as(f64, mode_1_width)) / 3.0,
-        9 => 4.0 * (@as(f64, mode_9_height) / @as(f64, mode_9_width)) / 3.0,
-        else => 1.0,
-    };
+    const spec = modeSpec(mode) orelse return 1.0;
+    return 4.0 * (@as(f64, @floatFromInt(spec.height)) / @as(f64, @floatFromInt(spec.width))) / 3.0;
 }
 
 fn normalizedEllipseDistance(x: f64, y: f64, center_x: f64, center_y: f64, radius_x: f64, radius_y: f64) f64 {
@@ -954,16 +1434,32 @@ fn roundedPointCoordinate(value: f64) i32 {
     return @intFromFloat(std.math.clamp(rounded, @as(f64, std.math.minInt(i32)), @as(f64, std.math.maxInt(i32))));
 }
 
-fn outCode(x: f64, y: f64, max_x: f64, max_y: f64) u4 {
+fn outCode(x: f64, y: f64, min_x: f64, min_y: f64, max_x: f64, max_y: f64) u4 {
     var code: u4 = 0;
-    if (x < 0) code |= 1 else if (x > max_x) code |= 2;
-    if (y < 0) code |= 4 else if (y > max_y) code |= 8;
+    if (x < min_x) code |= 1 else if (x > max_x) code |= 2;
+    if (y < min_y) code |= 4 else if (y > max_y) code |= 8;
     return code;
 }
 
-fn roundClipCoordinate(value: f64, limit: u32) i32 {
+fn roundClipCoordinate(value: f64, minimum: i32, maximum: i32) i32 {
     const rounded = if (value >= 0) @floor(value + 0.5) else @ceil(value - 0.5);
-    return @intFromFloat(std.math.clamp(rounded, 0, @as(f64, @floatFromInt(limit - 1))));
+    return @intFromFloat(std.math.clamp(
+        rounded,
+        @as(f64, @floatFromInt(minimum)),
+        @as(f64, @floatFromInt(maximum)),
+    ));
+}
+
+fn finitePoint(point_value: LogicalPoint) bool {
+    return std.math.isFinite(point_value.x) and std.math.isFinite(point_value.y);
+}
+
+fn affineMap(value: f64, source_first: f64, source_second: f64, target_first: f64, target_second: f64) f64 {
+    return target_first + (value - source_first) * (target_second - target_first) / (source_second - source_first);
+}
+
+fn scaleDac(value: u32) u32 {
+    return (value * 255 + 31) / 63;
 }
 
 fn egaRgb(code: u8) u32 {

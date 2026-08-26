@@ -7,8 +7,9 @@ R4X module with the subsystem identity `r4os.basic` and the guest format
 The installed R4X is the productive R4BASIC v2 foundation. Explorer passes one
 absolute `.BAS` path through `R4SUBSYS1`; R4BASIC loads it through the storage
 facade, compiles it once, and runs an isolated VM in a movable, resizable, and
-maximizable window. `SCREEN 0`, `SCREEN 1`, and `SCREEN 9` are presented as
-whole or damaged indexed raster frames through `r4os.subsystem_host`.
+maximizable window. The logical QuickBASIC `SCREEN` modes 0, 1, 2, and 7
+through 13 are presented as whole or damaged indexed raster frames through
+`r4os.subsystem_host`.
 
 `BEEP` and the supported QuickBASIC `PLAY` Music Macro Language generate
 24 kHz stereo PCM through the buffered subsystem runtime; HDA converts it to
@@ -27,7 +28,7 @@ input, or graphics.
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.23`
+- Module version: `1.2.24`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -105,6 +106,24 @@ before compilation. `SHELL` invokes the R4OS Terminal process facade with an
 opaque `/C` argument and polls its process handle cooperatively. `SYSTEM`,
 normal completion, error, cancellation, and Close share one idempotent
 resource teardown.
+
+R4BASIC 1.2.24 completes the logical QuickBASIC screen, page, palette, and
+coordinate foundation. Every mode has its reference resolution, text grid,
+attribute count, packed page layout, page limit, and deterministic default
+palette. `SCREEN` selects independent active and visible pages, `PCOPY`
+copies both text and graphics state, and hidden-page changes remain invisible
+to the presenter until that page is selected. `PALETTE`, `PALETTE USING`,
+mode-specific `COLOR`, `WIDTH`, `CLS`, `LOCATE`, `VIEW PRINT`, the text
+`SCREEN` function, and every `POINT` form operate on the selected page with
+validated atomic updates.
+
+`VIEW` fill and its outside border, `WINDOW`/`WINDOW SCREEN`, `PMAP`, `STEP`,
+and current-point queries share one reversible transform and clipping path.
+Palette changes recolor existing indices without rewriting pixels. Page and
+copy counters supplement the bounded eight-region damage ledger; a hidden or
+unchanged page produces no false frame, visible-page rebinding is generation
+safe, and the presentation path retains 128 by 128 maximum tiles without
+per-pixel R4DRAW calls.
 
 R4BASIC 1.2.22 uses a shared 262,144-instruction ceiling with adaptive bounded
 clock blocks and an 8-ms production time boundary. Active work requests a

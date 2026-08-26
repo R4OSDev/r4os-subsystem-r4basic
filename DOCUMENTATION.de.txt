@@ -6,7 +6,7 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.70.9
+Stand 0.70.10
 ------------
 
 Diese Ausbaustufe ergaenzt das Vertragsfundament des produktiven R4BASIC-v2-
@@ -33,6 +33,12 @@ COMMAND$/ENVIRON aus R4SUBSYS1, getrennte Wand- und monotone Gastzeit sowie
 atomare RUN-/CHAIN-Programmwechsel im selben R4X. SHELL startet die
 R4OS-Terminalfassade und wartet kooperativ; SYSTEM verwendet den gemeinsamen
 idempotenten Abbaupfad.
+0.70.10 vervollstaendigt die logischen SCREEN-Modi 0, 1, 2 und 7 bis 13 mit
+Referenzaufloesung, Textgeometrie, Attributen, Planes, gepackten
+Seitengroessen, Standardpaletten und Seitenlimits. APAGE/VPAGE, PCOPY,
+PALETTE USING, alle POINT-Formen sowie VIEW/WINDOW/PMAP teilen sich
+seitenlokalen Zustand, einen reversiblen Koordinatenvertrag und die bestehende
+begrenzte Indexed8-/Damage-Praesentation.
 Explorer uebergibt eine absolute BAS-Datei ueber `R4SUBSYS1`; das R4X liest
 sie und relative `$INCLUDE`-Quellen durch die Storage-Fassade jeweils exakt
 einmal, baut daraus einen begrenzten Quellgraphen und fuehrt eine getrennte VM in
@@ -302,14 +308,21 @@ sind strukturell unerreichbar.
 Textbildschirm und Tastatur
 ---------------------------
 
-Jede VM besitzt einen eigenen Zellbildschirm mit 25 Zeilen und 80 aktiven
-Spalten in SCREEN 0 und 9 beziehungsweise 40 Spalten in SCREEN 1. Eine Zelle
-speichert ein Byte sowie Vorder- und Hintergrundattribut. Cursorposition,
-Sichtbarkeit, Form, VIEW-PRINT-Bereich und Revisionsstand gehoeren ebenfalls
-zur Instanz. SCREEN, WIDTH, COLOR, CLS, LOCATE und VIEW PRINT arbeiten nur auf
-diesem Zustand. In Grafikmodi werden Textzellen mit einer lokalen ASCII-
-Bitmapfont in denselben Gastpixelpuffer gerastert. Fehlerhafte mehrteilige
-COLOR- oder LOCATE-Werte veraendern keinen Teilzustand.
+Jede VM besitzt fuer jede logische Bildschirmseite einen eigenen
+Zellbildschirm. Die Modi 0, 1/7/13, 2/8, 9/10 und 11/12 beginnen mit 80x25,
+40x25, 80x25, 80x25 beziehungsweise 80x30 Zellen. WIDTH erlaubt zusaetzlich
+40/80x25/43/50 in Modus 0, 80x43 in 9/10 und 80x60 in 11/12; ausgelassene
+Spalten oder Zeilen behalten die jeweilige Achse bei. Eine Zelle speichert
+ein Byte sowie Vorder- und Hintergrundattribut. Cursorposition, Sichtbarkeit,
+Form, Farben, VIEW-PRINT-Bereich, Revisions- und Dirtyzustand gehoeren zur
+aktiven Seite. In Grafikmodi werden Textzellen mit einer lokalen ASCII-
+Bitmapfont in dieselbe aktive Gastseite gerastert.
+
+SCREEN, WIDTH, modusspezifisches COLOR, CLS 0/1/2, LOCATE und VIEW PRINT
+validieren alle Argumente vor einer Teilmutation. CLS 0 leert die ganze
+aktive Text-/Grafikseite, CLS 1 den Grafikviewport und CLS 2 den
+Textviewport unter Erhalt der physischen Schlusszeile. SCREEN als Funktion
+liest Zeichen oder kombiniertes Attribut aus der aktiven Textseite.
 
 CSRLIN und POS lesen die aktuelle einsbasierte Cursorposition. Die SCREEN-
 Funktionsform liefert an validierten Textkoordinaten das Zeichenbyte oder das
@@ -350,12 +363,31 @@ Zeileneingabe.
 Indexed8-Grafik
 ---------------
 
-SCREEN 1 erzeugt einen instanzlokalen 320x200-Pixelpuffer mit vier
-Attributfarben, SCREEN 9 einen 640x350-Pixelpuffer mit 16 Attributfarben.
-Die Pixel bleiben indizierte Bytes; eine getrennte 256-Eintrag-XRGB-Palette
-bildet Attribute auf Hostfarben ab. PALETTE kann deshalb bereits gezeichnete
-Pixel ohne Neuzeichnen umfaerben. Ein Moduswechsel setzt Palette,
-Grafikkoordinate, Textgeometrie und Damagezustand gemeinsam zurueck.
+SCREEN 0, 1, 2 und 7 bis 13 besitzen logische Indexed8-Seiten. Ihre
+Aufloesungen lauten 640x400, 320x200, 640x200, 320x200, 640x200, zweimal
+640x350, zweimal 640x480 und 320x200. Die Attributzahlen sind 16, 4, 2, 16,
+16, 16, 4, 2, 16 und 256; die Seitenlimits 8, 1, 1, 8, 4, 2, 4, 1, 1 und 1.
+Planes, Bits je Pixel und Plane sowie 16/32/64/128/256-KiB-Seitenlayouts
+bleiben als QuickBASIC-Gastvertrag erhalten, waehrend der Host stets genau
+ein indiziertes Byte je Pixel erhaelt. Grafikprimitive bleiben in Modus 0
+ungueltig.
+
+Alle Seiten eines Modus liegen in einer privaten zusammenhaengenden
+Allokation. SCREEN waehlt APAGE und VPAGE unabhaengig, PCOPY kopiert Grafik-
+und Textzustand. Aenderungen oder Kopien einer verdeckten Seite erzeugen
+weder sichtbare Revision noch Damage; ein echter VPAGE-Wechsel bindet einmal
+vollstaendig neu. Die getrennte 256-Eintrag-XRGB-Palette recoloriert bereits
+gezeichnete Indices ohne Pixelrewrite. PALETTE kann einzeln oder vollstaendig
+resetten, PALETTE USING validiert den kompletten INTEGER-/LONG-Bereich und
+verlangt in den Modi 11 bis 13 LONG.
+
+VIEW setzt einen inklusiven physischen Clipbereich, fuellt ihn optional und
+zeichnet den Rahmen ausserhalb, soweit Bildschirmplatz vorhanden ist.
+WINDOW und WINDOW SCREEN legen beliebig gerichtete logische Achsen darueber.
+PMAP, POINT(0 bis 3), POINT(x,y), STEP und alle Grafikprimitive verwenden
+dieselbe Rundung und reversible Transformation. Ein Moduswechsel setzt
+Palette, Seiten, Grafikpunkt, VIEW/WINDOW, Textgeometrie und Damagezustand
+gemeinsam zurueck.
 
 PSET, POINT, LINE mit B und BF, CIRCLE mit Winkelbereich und Aspect sowie
 PAINT arbeiten ausschliesslich im Gastpuffer. BASIC-Zahlen werden vor dem
@@ -527,8 +559,8 @@ weist Uebergroesse vor einer Inhaltslesung ab, allokiert die exakte Groesse
 und fuellt denselben Puffer mit `readAt` bis hoechstens 256 KiB. Teilreads
 bleiben erlaubt, EOF vor der gemeldeten Groesse ist ein sichtbarer Fehler.
 Lade-, Syntax- und Laufzeitfehler erscheinen mit Datei und Quellposition im
-Fenster. `SCREEN 0` wird als 640x400-Textbild
-sichtbar; SCREEN 1 und 9 verwenden die bisherigen Gastpixelpuffer.
+Fenster. `SCREEN 0` wird als 640x400-Textbild sichtbar; die Modi 1, 2 und 7
+bis 13 verwenden ihre jeweiligen logischen Gastpixelpuffer.
 
 Vor dem Binden wird dasselbe Programmfenster mit Dateiname, Compilephase und
 Prozentbalken sichtbar. Der Lexer meldet spaetestens nach 2 KiB Quellarbeit,
@@ -635,11 +667,15 @@ Environments, Kalender-/Uhrvalidierung, TIMER ueber Mitternacht, lokalen RUN,
 atomare RUN-/CHAIN-Uebergaenge, tiefen COMMON-/ALL-Transfer, CHAIN DELETE,
 kooperatives SHELL sowie SYSTEM-Abbau ab. Negative Vektoren pruefen
 Wurzelausbruch, reservierte Geraetenamen, ungueltige Zeitwerte und
-Environmentgrenzen ohne Teilmutation. Der
-Grafikhosttest prueft pixelidentische Integer- und Fractionalbilder,
-Indexed8-ABI- und XRGB-Fallbackpfad, die 15 Bloecke eines Vollframes, getrennte
-sparse Damage-Regionen, Unterdrueckung unveraenderter Frames, mindestens 20
-Bilder pro Sekunde sowie Resize und Letterboxing.
+Environmentgrenzen ohne Teilmutation. Der 0.70.10-Grafiktest prueft
+zusaetzlich die komplette Modusmatrix, Textgeometrien und Seitenlimits,
+verdeckte Seitenwrites und PCOPY, generationstreue VPAGE-Wechsel,
+Palette/COLOR-Grenzen, VIEW-Fill und Aussenrahmen, reversible
+WINDOW-/PMAP-/POINT-Werte, STEP/Clipping sowie die exakten CLS-Bereiche. Der
+Grafikhosttest behaelt pixelidentische Integer- und Fractionalbilder,
+Indexed8-ABI- und XRGB-Fallbackpfad, bounded 128x128-Tiles, getrennte sparse
+Damage-Regionen, Unterdrueckung unveraenderter Frames, mindestens 20 Bilder
+pro Sekunde sowie Resize und Letterboxing bei.
 
 Ein synthetischer Compiler-Stresstest bindet 128 TYPEs mit Feldern, 512
 Arrays, 256 Prozeduren und 1.024 Label-Fixups zweimal bytecodeidentisch. Er
@@ -691,8 +727,9 @@ Noch offene v2-Bereiche
 -----------------------
 
 Der Interpretervertrag zielt auf die vollstaendige QuickBASIC-4.5-Sprache
-und -Laufzeit. Nach 0.70.9 folgen insbesondere weitere Grafikmodi und
--primitive, Audio/Ereignisse sowie die private sichere Abbildung historischer Geraete- und
-Fremdcodeoberflaechen. IDE, Debugger, nativer Compiler, Linker und Editor sind
+und -Laufzeit. Nach 0.70.10 folgen insbesondere die noch fehlenden
+Grafikprimitive und Bildaktionen, Audio/Ereignisse sowie die private sichere
+Abbildung historischer Geraete- und Fremdcodeoberflaechen. IDE, Debugger,
+nativer Compiler, Linker und Editor sind
 getrennte Produkte; Notepad bleibt fuer BAS-Dateien ueber `Open With` als
 separater Editor verfuegbar.

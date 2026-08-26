@@ -9,7 +9,7 @@ Fachliche Entstehung:
 Primaere Sprachreferenz:
 - Microsoft QuickBASIC 4.5 Language Reference.
 - Microsoft QuickBASIC 4.5 Programming in BASIC.
-- Lokaler Referenzindex: D:\R4OS\ExFiles\Reference\Basic\README.txt
+- Lokaler Referenzindex: ExFiles/Reference/Basic/README.txt
 - PCjs-Revision: 67b950f7eed3447c5c056e3d048ba4f62a94aead
 - Fuer VM-Vertrag 1.1 wurden die Abschnitte zu DIM, REDIM, TYPE, DATA,
   READ, RESTORE, DECLARE/AS ANY, ON ERROR, RESUME, DEF SEG, PEEK und POKE
@@ -21,12 +21,19 @@ Primaere Sprachreferenz:
 - Fuer VM-Vertrag 1.3 wurden die Abschnitte zu SCREEN 1 und 9, PALETTE,
   PSET, POINT, LINE, CIRCLE, PAINT sowie dem gepackten GET/PUT-Format
   unmittelbar aus denselben lokalen Arbeitskopien ausgewertet.
+- Fuer VM-Vertrag 2.6 wurden SCREEN, SCREEN-Funktion, PCOPY, PMAP, POINT,
+  VIEW, WINDOW, WIDTH, CLS, COLOR und PALETTE/PALETTE USING sowie die
+  Modus-, Attribut-, Seiten- und Speicherlayouttabellen unmittelbar aus der
+  Microsoft-QuickBASIC-4.5-Language-Reference ausgewertet. Die PCjs-
+  Transkription unter
+  https://www.pcjs.org/documents/books/mspl13/basic/qblang/ diente auf der
+  Linux-Entwicklungsumgebung als identische primaere Lesefassung.
 - Daraus uebernommen wurden ausschliesslich Sprachsemantik und Grenzen;
   Parser-, Speicher-, Alias-, Bytecode- und Fehlerflusscode sind eine neue
   eigenstaendige R4OS-Implementierung.
 
 Reale lokale Abnahmequelle:
-- Pfad: D:\R4OS\Artifacts\Distribution\Injection\Temp\gorilla.bas
+- Workspace-Pfad: Artifacts/Distribution/Injection/Temp/gorilla.bas
 - Groesse: 29.434 Byte
 - SHA-256: 9926FC1F50C4B489EC4C1B0DA5BD2C497EBF4282B3259C28A835A743E24699F7
 - Die Datei wird direkt aus dem vom Git-Push ausgeschlossenen lokalen

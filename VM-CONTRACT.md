@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 execution foundation
 
-Contract version: `2.5.0`
+Contract version: `2.6.0`
 
 This document freezes the executable R4BASIC foundation and its non-regression
 invariants while the complete v2 target in `COMPATIBILITY.md` and
@@ -225,16 +225,17 @@ The VM executes:
   number from 1 through 255 through the same handler path;
 - cooperative `STOP` plus `TRON` and `TROFF`;
 - the restricted `DEF SEG`, `PEEK`, and `POKE` compatibility device;
-- `SCREEN 0`, 80-column `WIDTH`, `COLOR`, `CLS`, `LOCATE`, and
-  `VIEW PRINT` on the private text screen;
+- `SCREEN 0`, `1`, `2`, and `7` through `13`, independent active/visible
+  pages, `PCOPY`, every mode-valid screen `WIDTH`, `COLOR`, `CLS`, `LOCATE`,
+  and `VIEW PRINT` on the private text pages;
 - screen and sequential-file `PRINT` including the `?` shorthand, console and file `INPUT`, and
   `LINE INPUT`; `PRINT USING`, `PRINT # USING`, `WRITE`, `WRITE #`, and
   console/file `INPUT$` use the same bounded output/input machinery;
 - in-place `MID$` assignment to variable or fixed strings without changing
   their length;
-- `SCREEN 1`, `SCREEN 9`, `PALETTE`, `PSET`, coordinate `POINT`, `LINE`
-  including `B` and `BF`, `CIRCLE`, `PAINT`, and packed `GET`/`PUT` with
-  `PSET` and `XOR`;
+- `PALETTE`, `PALETTE USING`, `VIEW`, `WINDOW`, `PMAP`, `PSET`, every
+  coordinate/state `POINT` form, `LINE` including `B` and `BF`, `CIRCLE`,
+  `PAINT`, and packed `GET`/`PUT` with `PSET` and `XOR`;
 - `BEEP` and `PLAY` with the bounded Music Macro Language described below;
 - `RANDOMIZE`, `SLEEP`, and sequential `OPEN`/`CLOSE`;
 - `END`.
@@ -314,21 +315,26 @@ guest address can become an R4OS or host pointer.
 
 ## Text screen and interactive input
 
-- Every VM owns one 25-row cell screen with 80 active columns in modes 0 and
-  9 and 40 active columns in mode 1. A cell contains one byte,
-  foreground attribute 0 through 31, and background attribute 0 through 7.
-  Cursor position, visibility, shape, print viewport, and revision are part
-  of that same instance-local state.
-- `SCREEN 0` resets the text screen. `WIDTH` accepts the active mode width
-  and an optional 25 rows. In graphics modes text cells are rasterized into
-  the same guest pixel buffer using a subsystem-local 8 by 8 ASCII font;
-  mode 9 maps it deterministically onto 8 by 14 cells. `CLS 2` clears only
-  the active text viewport. Invalid multi-argument `COLOR` or `LOCATE`
+- Every VM owns one cell screen per logical page. Modes 0, 1/7/13, 2/8,
+  9/10, and 11/12 begin at 80x25, 40x25, 80x25, 80x25, and 80x30
+  respectively. `WIDTH` additionally selects 40/80 by 25/43/50 in mode 0,
+  80x43 in modes 9/10, and 80x60 in modes 11/12; an omitted columns or rows
+  argument preserves that axis. A cell contains one byte plus validated
+  foreground and background attributes. Cursor position, visibility, shape,
+  print viewport, colors, revision, and dirty state belong to the active
+  page and survive an active-page switch independently.
+- In graphics modes text cells are rasterized into the same selected guest
+  page using the subsystem-local ASCII bitmap font. `CLS 0` clears the whole
+  active text and graphics page, `CLS 1` the graphics viewport, and `CLS 2`
+  the text viewport while preserving its physical bottom line. Bare `CLS`
+  chooses text in mode 0 and graphics in a graphics mode. Invalid
+  multi-argument `SCREEN`, `WIDTH`, `COLOR`, `CLS`, `LOCATE`, or `VIEW PRINT`
   updates are atomic.
 - BASIC rows and columns are one-based. `VIEW PRINT top TO bottom` selects an
-  inclusive scrolling region; bare `VIEW PRINT` restores rows 1 through 25.
-  Output outside that region can be positioned with `LOCATE`, while newline
-  scrolling remains confined to the region.
+  inclusive scrolling region on the active page; bare `VIEW PRINT` restores
+  its complete current row range. Output outside that region can be
+  positioned with `LOCATE`, while newline scrolling remains confined to the
+  region.
 - `CSRLIN`, `POS`, and `SCREEN(row,column[,color])` query the same live cell
   state. SCREEN returns either the stored byte or its combined foreground and
   background attribute; all coordinates are validated before access.
@@ -369,22 +375,39 @@ guest address can become an R4OS or host pointer.
 
 ## Indexed graphics screen
 
-- Each VM owns a host-visible 640 by 400 `SCREEN 0` text raster, a 320 by 200
-  `SCREEN 1` surface with four attributes, or a 640 by 350 `SCREEN 9` surface
-  with sixteen attributes. Graphics primitives remain illegal in mode 0.
-  Pixels are indexed bytes and the mutable 256-entry XRGB palette is separate,
-  so `PALETTE` recolors existing graphics pixels immediately.
-- Mode changes reset the default CGA/EGA palette, current graphics point and
-  text geometry, clear every target pixel, and mark one full damage rectangle.
-  A same-size surface allocation is retained and cleared; a different size is
-  allocated atomically before the previous surface is released. An injected
-  unavailable mode raises catchable BASIC error 5 without replacing the
-  previous surface, which permits the normal `ON ERROR` fallback from mode 9
-  to mode 1.
-- Coordinates apply BASIC numeric rounding before clipping. `PSET` clips
-  silently, `POINT` returns the stored attribute or `-1` outside the screen,
-  and `LINE` uses the current point for `STEP`. Boxes, filled boxes, arcs,
-  aspect-scaled circles, and bounded flood fill modify only guest pixels.
+- Each VM owns logical Indexed8 pages for modes 0, 1, 2, and 7 through 13.
+  Their resolutions are 640x400, 320x200, 640x200, 320x200, 640x200,
+  640x350, 640x350, 640x480, 640x480, and 320x200. Their attribute counts
+  are 16, 4, 2, 16, 16, 16, 4, 2, 16, and 256; their page limits are 8, 1,
+  1, 8, 4, 2, 4, 1, 1, and 1. The recorded plane count, bits per pixel per
+  plane, and packed page sizes retain the corresponding QuickBASIC memory
+  contract even though the host-facing surface is always one indexed byte
+  per pixel. Graphics primitives remain illegal in mode 0.
+- All pages of one mode occupy one private contiguous allocation. `SCREEN`
+  changes APAGE and VPAGE independently; `PCOPY` copies both the packed
+  logical raster and text-page state. A hidden-page mutation or copy does not
+  advance visible content or create damage. Selecting another visible page
+  performs one full generation-safe rebind, while reselecting it does not.
+- Each mode installs its deterministic standard CGA/EGA/VGA/MCGA palette.
+  `PALETTE` changes one attribute or resets the mode palette; `PALETTE USING`
+  consumes the complete remaining INTEGER/LONG palette range, requires LONG
+  values for modes 11 through 13, honors `-1` as unchanged, and validates
+  before mutation. Mode-specific `COLOR` ranges and illegal modes follow the
+  reference. Palette changes mark visible damage and immediately recolor
+  indices without rewriting any pixel byte.
+- Mode changes reset palette, current point, viewport, world window, pages,
+  text geometry, and pixels together. A same-size allocation is retained and
+  cleared; a different size is allocated atomically before the previous one
+  is released. An injected unavailable mode raises catchable BASIC error 5
+  without replacing the previous surface, preserving the normal mode-9 to
+  mode-1 `ON ERROR` fallback.
+- `VIEW` defines one inclusive physical clipping rectangle, optionally fills
+  it and draws an outside border where screen space exists. `WINDOW` and
+  `WINDOW SCREEN` define the reversible logical coordinate axes over that
+  viewport. `PMAP`, `POINT(0..3)`, coordinate `POINT`, absolute/`STEP`
+  resolution, and every primitive use the same rounding and transform.
+  Reversed axes are valid; out-of-viewport pixels clip silently and query as
+  `-1`.
 - `GET` writes the four-byte QuickBASIC header followed by mode-appropriate
   packed data into the raw bytes of any numeric array. Mode 1 packs two bits
   per pixel; mode 9 stores four one-bit planes per scan line. `PUT` decodes
@@ -394,16 +417,19 @@ guest address can become an R4OS or host pointer.
   target the compact numeric storage is already the required little-endian
   raw view: `GET` writes only the image prefix and `PUT` reads only the bytes
   named by its header, without serializing an oversized array.
-- Pixel changes, palette changes, and text-cell rasterization merge into one
-  damage rectangle. Text rows, clipped line pixels, solid spans, scanline
-  flood-fill runs and decoded image rows accumulate that rectangle locally
-  and advance the content revision once per changed operation. The runtime
-  adapter hands an Indexed8 surface to
+- Pixel changes, palette changes, and text-cell rasterization accumulate in
+  at most eight sparse damage rectangles. Touching rectangles merge; only an
+  overflow is folded into the region with the least area growth. Text rows,
+  clipped line pixels, solid spans, scanline flood-fill runs, decoded image
+  rows, page switches, copies, and hidden-page commits have bounded counters.
+  Visible content advances once per changed operation. The runtime adapter
+  hands an Indexed8 surface to
   `r4os.subsystem_host`; it never calls R4DRAW for individual primitives.
-  A 640 by 350 full frame becomes fifteen bounded raster blocks, later
-  changes use damage frames, and an unchanged guest image publishes no frame.
-  Mode revisions remain distinct across VM reset so a presenter always binds
-  the replacement pixel allocation before publishing it.
+  Every full or damaged frame is divided into blocks no larger than 128 by
+  128 pixels, later changes use damage frames, and an unchanged or hidden
+  guest page publishes no frame. Mode revisions remain distinct across mode,
+  page, and VM reset transitions so a presenter always binds the replacement
+  visible allocation before publishing it.
 
 ## Audio and Music Macro Language
 
@@ -705,9 +731,11 @@ The permanent general fixtures below are part of this contract:
   BINARY sparse scalar/string/UDT/whole-array transfer, one-byte progress,
   the exact 64-KiB boundary, positional sequential overwrite, metadata,
   locking, catchable errors, CLOSE/RESET, and BINARY `INPUT$`.
-- `vm_graphics.bas`: modes, palette, text-compatible drawing, clipping,
-  circle, flood fill, GET/PUT, POINT, STEP, XOR reversibility, and
-  two-instance pixel/palette isolation.
+- `vm_graphics.bas` plus inline vectors: all logical mode dimensions,
+  attributes, page counts and text geometries; APAGE/VPAGE/PCOPY;
+  PALETTE/USING and mode-specific COLOR; VIEW/WINDOW/PMAP/POINT; clipping,
+  STEP, circle, flood fill, GET/PUT, XOR reversibility, and two-instance
+  pixel/palette isolation.
 - `vm_packed_images.bas`: original synthetic LONG arrays in the mode 1 and
   mode 9 packed formats, including reversible PUT XOR.
 - `vm_audio.bas`: stateful MML commands, MB continuation, transport-fenced MF
@@ -720,9 +748,11 @@ positions, QBasic error numbers, string overflow, host failure, and
 two-instance keyboard isolation, interactive RANDOMIZE retry, paused time,
 host polling while asleep, storage-facade error classification, unsupported
 file modes and device names, and atomic text-state errors.
-`Tests/graphics_host_test.zig` fixes 128 by 128 raster bounds, the fifteen
-blocks of a 640 by 350 full frame, real damage frames, unchanged-frame
-suppression, a sustained 30-frame animation above 20 frames per second, and
-resize letterboxing. The local GORILLA.BAS acceptance exercises the same
+`Tests/graphics_host_test.zig` fixes every logical mode matrix, hidden-page
+writes and copies, generation-safe visible-page switches, reversible world
+coordinates, VIEW fill/outside-border clipping, exact CLS bounds, palette
+recoloring without index mutation, 128 by 128 raster bounds, sparse and
+unchanged-frame suppression, sustained animation, and resize letterboxing.
+The local GORILLA.BAS acceptance exercises the same
 public compiler, VM, packed-image, presentation, timing, and audio paths
 through a complete deterministic round.

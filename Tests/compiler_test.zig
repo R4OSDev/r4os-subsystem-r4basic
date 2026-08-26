@@ -1890,6 +1890,107 @@ test "QBasic graphics execute on isolated indexed guest screens" {
     try std.testing.expectEqualSlices(u8, first_view.pixels, second_view.pixels);
 }
 
+test "SCREEN pages VIEW WINDOW PMAP and PALETTE USING share one coherent raster" {
+    const source =
+        \\DEFINT A-Z
+        \\DIM Pal&(0 TO 15)
+        \\FOR I = 0 TO 15
+        \\  Pal&(I) = -1
+        \\NEXT I
+        \\Pal&(3) = 63
+        \\SCREEN 7,,1,0
+        \\PSET (5,5),4
+        \\Hidden = POINT(5,5)
+        \\SCREEN ,,,1
+        \\Shown = POINT(5,5)
+        \\PCOPY 1,2
+        \\SCREEN ,,2,2
+        \\Copied = POINT(5,5)
+        \\VIEW (10,10)-(110,110),1,2
+        \\WINDOW SCREEN (0,0)-(10,10)
+        \\PSET (5,5),3
+        \\Mapped = POINT(5,5)
+        \\MapX! = PMAP(5,0)
+        \\MapY! = PMAP(5,1)
+        \\PhysX! = POINT(0)
+        \\PhysY! = POINT(1)
+        \\LogicX! = POINT(2)
+        \\LogicY! = POINT(3)
+        \\WINDOW
+        \\VIEW
+        \\SCREEN 9
+        \\WIDTH ,43
+        \\PALETTE USING Pal&(0)
+        \\LOCATE 43,80
+        \\PRINT "Z";
+        \\LastRow = CSRLIN
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "graphics-pages.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(4096, 64));
+    try expectInteger(&machine, "Hidden", 4);
+    try expectInteger(&machine, "Shown", 4);
+    try expectInteger(&machine, "Copied", 4);
+    try expectInteger(&machine, "Mapped", 3);
+    try expectSingle(&machine, "MapX!", 60);
+    try expectSingle(&machine, "MapY!", 60);
+    try expectSingle(&machine, "PhysX!", 60);
+    try expectSingle(&machine, "PhysY!", 60);
+    try expectSingle(&machine, "LogicX!", 5);
+    try expectSingle(&machine, "LogicY!", 5);
+    try expectInteger(&machine, "LastRow", 43);
+    try std.testing.expectEqual(@as(u8, 'Z'), machine.textScreen().cell(42, 79).?.character);
+    const view = machine.graphicsView() orelse return error.MissingGraphicsView;
+    try std.testing.expectEqual(@as(u32, 640), view.width);
+    try std.testing.expectEqual(@as(u32, 350), view.height);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFF), view.palette[3]);
+}
+
+test "graphics defaults and COLOR PALETTE restrictions match each screen mode" {
+    const defaults_source =
+        \\DEFINT A-Z
+        \\SCREEN 1: PSET (1,1): Cga = POINT(1,1)
+        \\SCREEN 2: PSET (1,1): Mono = POINT(1,1)
+        \\SCREEN 10: PSET (1,1): Pseudo = POINT(1,1)
+        \\SCREEN 11: PSET (1,1): VgaMono = POINT(1,1)
+        \\SCREEN 13: PSET (1,1): Mcga = POINT(1,1)
+        \\END
+    ;
+    var defaults_program = try core.compiler.compile(std.testing.allocator, "graphics-defaults.bas", defaults_source);
+    defer defaults_program.deinit();
+    try expectProgramOk(&defaults_program);
+    var defaults = try core.vm.Vm.init(std.testing.allocator, &defaults_program, .{});
+    defer defaults.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, defaults.runToCompletion(256, 32));
+    try expectInteger(&defaults, "Cga", 3);
+    try expectInteger(&defaults, "Mono", 1);
+    try expectInteger(&defaults, "Pseudo", 3);
+    try expectInteger(&defaults, "VgaMono", 1);
+    try expectInteger(&defaults, "Mcga", 7);
+
+    const invalid_sources = [_][]const u8{
+        "SCREEN 2\nCOLOR 1\nEND\n",
+        "SCREEN 11\nCOLOR 1\nEND\n",
+        "SCREEN 12\nCOLOR 1,0\nEND\n",
+        "DEFINT A-Z\nDIM P(0 TO 2)\nSCREEN 1\nPALETTE USING P(0)\nEND\n",
+        "DEFINT A-Z\nDIM P(0 TO 15)\nSCREEN 12\nPALETTE USING P(0)\nEND\n",
+    };
+    for (invalid_sources) |source| {
+        var program = try core.compiler.compile(std.testing.allocator, "graphics-color-error.bas", source);
+        defer program.deinit();
+        try expectProgramOk(&program);
+        var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+        defer machine.deinit();
+        try std.testing.expectEqual(core.vm.Status.runtime_error, machine.runToCompletion(128, 16));
+        const diagnostic = machine.runtime_diagnostic orelse return error.MissingRuntimeDiagnostic;
+        try std.testing.expect(diagnostic.code == .illegal_function_call or diagnostic.code == .type_mismatch);
+    }
+}
+
 test "packed LONG arrays decode as mode 1 and mode 9 images without source special cases" {
     var program = try compileFixture(fixture_paths.packed_images);
     defer program.deinit();

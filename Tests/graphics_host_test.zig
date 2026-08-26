@@ -325,7 +325,169 @@ test "same-mode SCREEN reuses and clears its pixel allocation" {
     const stats = screen.performanceStats();
     try std.testing.expectEqual(@as(u64, 1), stats.mode_allocations);
     try std.testing.expectEqual(@as(u64, 1), stats.mode_reuses);
-    try std.testing.expectEqual(@as(u64, 2 * 640 * 350), stats.mode_clear_bytes);
+    try std.testing.expectEqual(@as(u64, 2 * 640 * 350 * 2), stats.mode_clear_bytes);
+}
+
+test "all canonical SCREEN modes expose exact geometry attributes palettes and page counts" {
+    const expectations = [_]struct {
+        mode: i32,
+        width: u32,
+        height: u32,
+        text_columns: usize,
+        text_rows: usize,
+        pages: u8,
+        attributes: u16,
+        packed_bytes: usize,
+    }{
+        .{ .mode = 0, .width = 640, .height = 400, .text_columns = 80, .text_rows = 25, .pages = 8, .attributes = 16, .packed_bytes = 0 },
+        .{ .mode = 1, .width = 320, .height = 200, .text_columns = 40, .text_rows = 25, .pages = 1, .attributes = 4, .packed_bytes = 16 * 1024 },
+        .{ .mode = 2, .width = 640, .height = 200, .text_columns = 80, .text_rows = 25, .pages = 1, .attributes = 2, .packed_bytes = 16 * 1024 },
+        .{ .mode = 7, .width = 320, .height = 200, .text_columns = 40, .text_rows = 25, .pages = 8, .attributes = 16, .packed_bytes = 32 * 1024 },
+        .{ .mode = 8, .width = 640, .height = 200, .text_columns = 80, .text_rows = 25, .pages = 4, .attributes = 16, .packed_bytes = 64 * 1024 },
+        .{ .mode = 9, .width = 640, .height = 350, .text_columns = 80, .text_rows = 25, .pages = 2, .attributes = 16, .packed_bytes = 128 * 1024 },
+        .{ .mode = 10, .width = 640, .height = 350, .text_columns = 80, .text_rows = 25, .pages = 4, .attributes = 4, .packed_bytes = 64 * 1024 },
+        .{ .mode = 11, .width = 640, .height = 480, .text_columns = 80, .text_rows = 30, .pages = 1, .attributes = 2, .packed_bytes = 64 * 1024 },
+        .{ .mode = 12, .width = 640, .height = 480, .text_columns = 80, .text_rows = 30, .pages = 1, .attributes = 16, .packed_bytes = 256 * 1024 },
+        .{ .mode = 13, .width = 320, .height = 200, .text_columns = 40, .text_rows = 25, .pages = 1, .attributes = 256, .packed_bytes = 64 * 1024 },
+    };
+    var screen: core.graphics_screen.Screen = .{};
+    defer screen.deinit(std.testing.allocator);
+    for (expectations) |expected| {
+        const spec = core.graphics_screen.modeSpec(expected.mode) orelse return error.MissingModeSpec;
+        try std.testing.expectEqual(expected.width, spec.width);
+        try std.testing.expectEqual(expected.height, spec.height);
+        try std.testing.expectEqual(expected.text_columns, spec.text_columns);
+        try std.testing.expectEqual(expected.text_rows, spec.text_rows);
+        try std.testing.expectEqual(expected.pages, spec.pages);
+        try std.testing.expectEqual(expected.attributes, spec.attributes);
+        try std.testing.expectEqual(expected.packed_bytes, spec.packed_page_bytes);
+        try screen.setMode(std.testing.allocator, expected.mode);
+        const view = screen.view() orelse return error.MissingGraphicsView;
+        try std.testing.expectEqual(expected.width, view.width);
+        try std.testing.expectEqual(expected.height, view.height);
+        try std.testing.expectEqual(@as(usize, expected.width * expected.height), view.pixels.len);
+        try std.testing.expectEqual(@as(u8, @intCast(expected.attributes - 1)), screen.maximumAttribute());
+    }
+    try std.testing.expect(core.graphics_screen.modeSpec(3) == null);
+    try std.testing.expectError(error.IllegalFunctionCall, screen.setMode(std.testing.allocator, 3));
+}
+
+test "hidden page writes copies and palette changes publish only truthful frames" {
+    var screen: core.graphics_screen.Screen = .{};
+    defer screen.deinit(std.testing.allocator);
+    try screen.setModePages(std.testing.allocator, 7, 0, 0);
+    _ = screen.takeDamage();
+    try screen.pset(.{ .x = 5, .y = 6 }, 2);
+    _ = screen.takeDamage();
+    const page_zero_revision = screen.content_revision;
+
+    try screen.selectPages(1, 0);
+    try screen.pset(.{ .x = 5, .y = 6 }, 4);
+    try std.testing.expectEqual(page_zero_revision, screen.content_revision);
+    try std.testing.expectEqual(@as(usize, 0), screen.takeDamage().count);
+    try std.testing.expectEqual(@as(u8, 2), screen.view().?.pixels[6 * 320 + 5]);
+
+    try screen.selectPages(1, 1);
+    const shown = screen.takeDamage();
+    try std.testing.expectEqual(@as(usize, 1), shown.count);
+    try std.testing.expectEqual(@as(u8, 4), screen.view().?.pixels[6 * 320 + 5]);
+    const visible_revision = screen.content_revision;
+    try std.testing.expect(try screen.copyPage(1, 2));
+    try std.testing.expectEqual(visible_revision, screen.content_revision);
+    try std.testing.expectEqual(@as(usize, 0), screen.takeDamage().count);
+    try std.testing.expect(!(try screen.copyPage(1, 2)));
+
+    try screen.selectPages(2, 2);
+    _ = screen.takeDamage();
+    try std.testing.expectEqual(@as(u8, 4), screen.view().?.pixels[6 * 320 + 5]);
+    const pixel_before = screen.view().?.pixels[6 * 320 + 5];
+    const palette_before = screen.view().?.palette[4];
+    try screen.setPalette(4, 15);
+    try std.testing.expectEqual(pixel_before, screen.view().?.pixels[6 * 320 + 5]);
+    try std.testing.expect(palette_before != screen.view().?.palette[4]);
+    try std.testing.expectEqual(@as(usize, 1), screen.takeDamage().count);
+
+    const stats = screen.performanceStats();
+    try std.testing.expectEqual(@as(u64, 2), stats.page_switches);
+    try std.testing.expectEqual(@as(u64, 2), stats.page_copies);
+    try std.testing.expect(stats.hidden_page_commits >= 2);
+}
+
+test "VIEW WINDOW and PMAP use one reversible clipped transform" {
+    var screen: core.graphics_screen.Screen = .{};
+    defer screen.deinit(std.testing.allocator);
+    try screen.setMode(std.testing.allocator, 9);
+    _ = screen.takeDamage();
+    try screen.setView(.{ .x = 100, .y = 50 }, .{ .x = 300, .y = 250 }, false, 1, 2);
+    try std.testing.expectEqual(@as(i32, 1), try screen.point(.{ .x = 100, .y = 50 }));
+    try std.testing.expectEqual(@as(i32, 1), try screen.point(.{ .x = 101, .y = 51 }));
+    const pixels = screen.view().?.pixels;
+    try std.testing.expectEqual(@as(u8, 2), pixels[49 * 640 + 99]);
+    try std.testing.expectEqual(@as(u8, 2), pixels[251 * 640 + 301]);
+
+    try screen.setWindow(.{ .x = 0, .y = 0 }, .{ .x = 10, .y = 10 }, false);
+    try std.testing.expectApproxEqAbs(@as(f64, 200), try screen.mapCoordinate(5, 0), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 150), try screen.mapCoordinate(5, 1), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), try screen.mapCoordinate(200, 2), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), try screen.mapCoordinate(150, 3), 0.000001);
+    const middle = screen.resolvePoint(5, 5, false);
+    try std.testing.expectEqual(core.graphics_screen.Point{ .x = 200, .y = 150 }, middle);
+    try screen.pset(middle, 3);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), try screen.currentCoordinate(2), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), try screen.currentCoordinate(3), 0.000001);
+
+    _ = screen.takeDamage();
+    try screen.line(.{ .x = -100, .y = 150 }, .{ .x = 500, .y = 150 }, 4, .line);
+    const clipped = screen.takeDamage();
+    try std.testing.expectEqual(@as(usize, 1), clipped.count);
+    try std.testing.expectEqual(@as(u32, 100), clipped.regions[0].x);
+    try std.testing.expectEqual(@as(u32, 201), clipped.regions[0].w);
+    try std.testing.expectEqual(@as(i32, -1), try screen.point(.{ .x = 99, .y = 150 }));
+
+    try screen.setWindow(.{ .x = 10, .y = 10 }, .{ .x = 0, .y = 0 }, true);
+    try std.testing.expectApproxEqAbs(@as(f64, 300), try screen.mapCoordinate(0, 0), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 250), try screen.mapCoordinate(0, 1), 0.000001);
+    try screen.setWindow(null, null, false);
+    try std.testing.expectEqual(core.graphics_screen.Point{ .x = 100, .y = 50 }, screen.resolvePoint(0, 0, false));
+    try screen.setView(null, null, false, null, null);
+    try std.testing.expectEqual(core.graphics_screen.Point{ .x = 0, .y = 0 }, screen.resolvePoint(0, 0, false));
+}
+
+test "CLS graphics viewport and full-screen paths keep their exact bounds" {
+    var screen: core.graphics_screen.Screen = .{};
+    defer screen.deinit(std.testing.allocator);
+    try screen.setMode(std.testing.allocator, 9);
+    try screen.pset(.{ .x = 10, .y = 10 }, 3);
+    try screen.setView(.{ .x = 100, .y = 50 }, .{ .x = 300, .y = 250 }, false, null, null);
+    try screen.pset(.{ .x = 150, .y = 100 }, 4);
+    try screen.clear(0);
+    var pixels = screen.view().?.pixels;
+    try std.testing.expectEqual(@as(u8, 3), pixels[10 * 640 + 10]);
+    try std.testing.expectEqual(@as(u8, 0), pixels[100 * 640 + 150]);
+
+    try screen.clearAll(0);
+    pixels = screen.view().?.pixels;
+    try std.testing.expectEqual(@as(u8, 0), pixels[10 * 640 + 10]);
+}
+
+test "CGA COLOR selects a standard palette and replaces prior PALETTE overrides" {
+    var screen: core.graphics_screen.Screen = .{};
+    defer screen.deinit(std.testing.allocator);
+    try screen.setMode(std.testing.allocator, 1);
+    const palette_one = screen.view().?.palette[0..4].*;
+    try screen.setCgaColor(4, 2);
+    const palette_zero = screen.view().?.palette[0..4].*;
+    try std.testing.expect(palette_zero[0] != palette_one[0]);
+    try std.testing.expect(palette_zero[1] != palette_one[1]);
+    try std.testing.expect(palette_zero[2] != palette_one[2]);
+    try std.testing.expect(palette_zero[3] != palette_one[3]);
+
+    try screen.setPalette(1, 15);
+    const override = screen.view().?.palette[1];
+    try screen.setCgaColor(null, null);
+    try std.testing.expect(override != screen.view().?.palette[1]);
+    try std.testing.expectEqual(palette_zero[1], screen.view().?.palette[1]);
+    try std.testing.expectError(error.IllegalFunctionCall, screen.setCgaColor(null, 256));
 }
 
 test "VM GET and PUT expose only the packed image prefix of a large numeric array" {

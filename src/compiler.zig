@@ -853,13 +853,15 @@ const Builder = struct {
             .color => self.parseTextColor(),
             .cls => self.parseTextCls(),
             .locate => self.parseTextLocate(),
-            .view => self.parseTextView(),
+            .view => if (self.peek(1).kind == .keyword and self.peek(1).keyword == .print) self.parseTextView() else self.parseGraphicsView(),
+            .window => self.parseGraphicsWindow(),
             .print => self.parsePrintStatement(),
             .write => self.parseWriteStatement(),
             .input => self.parseInputStatement(false),
             .line => self.parseLineStatement(),
             .mid_string => self.parseMidStringAssignment(),
             .palette => self.parseGraphicsPalette(),
+            .pcopy => self.parseGraphicsPageCopy(),
             .pset => self.parseGraphicsPset(),
             .circle => self.parseGraphicsCircle(),
             .paint => self.parseGraphicsPaint(),
@@ -2280,23 +2282,37 @@ const Builder = struct {
 
     fn parseScreen(self: *Builder) !bool {
         const statement = self.advance();
-        const mode_type = (try self.parseExpression()) orelse return false;
-        if (!mode_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
-        _ = try self.emit(.screen_mode_probe, 0, 0, statement.span);
+        var mask: u32 = 0;
+        var count: u32 = 0;
+        var position: u32 = 0;
+        while (position < 4 and !self.atBoundary() and !self.atKeyword(.else_)) : (position += 1) {
+            if (!self.at(.comma)) {
+                const value_type = (try self.parseExpression()) orelse return false;
+                if (!value_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+                mask |= @as(u32, 1) << @intCast(position);
+                count += 1;
+            }
+            if (!self.consume(.comma)) break;
+        }
+        _ = try self.emit(.screen_mode_probe, mask, count, statement.span);
         return true;
     }
 
     fn parseTextWidth(self: *Builder) !bool {
         const statement = self.advance();
-        const columns_type = (try self.parseExpression()) orelse return false;
-        if (!columns_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
-        var count: u32 = 1;
-        if (self.consume(.comma)) {
-            const rows_type = (try self.parseExpression()) orelse return false;
-            if (!rows_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
-            count = 2;
+        var mask: u32 = 0;
+        var count: u32 = 0;
+        var position: u32 = 0;
+        while (position < 2 and !self.atBoundary() and !self.atKeyword(.else_)) : (position += 1) {
+            if (!self.at(.comma)) {
+                const value_type = (try self.parseExpression()) orelse return false;
+                if (!value_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+                mask |= @as(u32, 1) << @intCast(position);
+                count += 1;
+            }
+            if (!self.consume(.comma)) break;
         }
-        _ = try self.emit(.text_width, count, 0, statement.span);
+        _ = try self.emit(.text_width, mask, count, statement.span);
         return true;
     }
 
@@ -2305,7 +2321,7 @@ const Builder = struct {
         var mask: u32 = 0;
         var count: u32 = 0;
         var position: u32 = 0;
-        while (position < 2 and !self.atBoundary() and !self.atKeyword(.else_)) : (position += 1) {
+        while (position < 3 and !self.atBoundary() and !self.atKeyword(.else_)) : (position += 1) {
             if (!self.at(.comma)) {
                 const value_type = (try self.parseExpression()) orelse return false;
                 if (!value_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
@@ -2361,6 +2377,52 @@ const Builder = struct {
         const bottom_type = (try self.parseExpression()) orelse return false;
         if (!bottom_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
         _ = try self.emit(.text_view_print, 2, 0, statement.span);
+        return true;
+    }
+
+    fn parseGraphicsView(self: *Builder) !bool {
+        const statement = self.advance();
+        if (self.atBoundary() or self.atKeyword(.else_)) {
+            _ = try self.emit(.graphics_view, 0, 0, statement.span);
+            return true;
+        }
+        var flags: u32 = bytecode.graphics_view_bounds;
+        if (self.consumeKeyword(.screen)) flags |= bytecode.graphics_view_screen;
+        const first_relative = (try self.parseGraphicsPoint(statement.span)) orelse return false;
+        if (first_relative) try self.addDiagnostic(.unexpected_token, statement.span);
+        if (!try self.expect(.minus)) return false;
+        const second_relative = (try self.parseGraphicsPoint(statement.span)) orelse return false;
+        if (second_relative) try self.addDiagnostic(.unexpected_token, statement.span);
+        if (self.consume(.comma)) {
+            if (!self.at(.comma) and !self.atBoundary() and !self.atKeyword(.else_)) {
+                const fill_type = (try self.parseExpression()) orelse return false;
+                if (!fill_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+                flags |= bytecode.graphics_view_fill;
+            }
+            if (self.consume(.comma)) {
+                const border_type = (try self.parseExpression()) orelse return false;
+                if (!border_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+                flags |= bytecode.graphics_view_border;
+            }
+        }
+        _ = try self.emit(.graphics_view, flags, 0, statement.span);
+        return true;
+    }
+
+    fn parseGraphicsWindow(self: *Builder) !bool {
+        const statement = self.advance();
+        if (self.atBoundary() or self.atKeyword(.else_)) {
+            _ = try self.emit(.graphics_window, 0, 0, statement.span);
+            return true;
+        }
+        var flags: u32 = bytecode.graphics_window_bounds;
+        if (self.consumeKeyword(.screen)) flags |= bytecode.graphics_window_screen;
+        const first_relative = (try self.parseGraphicsPoint(statement.span)) orelse return false;
+        if (first_relative) try self.addDiagnostic(.unexpected_token, statement.span);
+        if (!try self.expect(.minus)) return false;
+        const second_relative = (try self.parseGraphicsPoint(statement.span)) orelse return false;
+        if (second_relative) try self.addDiagnostic(.unexpected_token, statement.span);
+        _ = try self.emit(.graphics_window, flags, 0, statement.span);
         return true;
     }
 
@@ -2535,12 +2597,53 @@ const Builder = struct {
 
     fn parseGraphicsPalette(self: *Builder) !bool {
         const statement = self.advance();
+        if (self.atBoundary() or self.atKeyword(.else_)) {
+            _ = try self.emit(.graphics_palette, bytecode.graphics_palette_reset, 0, statement.span);
+            return true;
+        }
+        if (self.consumeKeyword(.using)) return self.parseGraphicsPaletteUsing(statement);
         const attribute_type = (try self.parseExpression()) orelse return false;
         if (!attribute_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
         if (!try self.expect(.comma)) return false;
         const color_type = (try self.parseExpression()) orelse return false;
         if (!color_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
         _ = try self.emit(.graphics_palette, 0, 0, statement.span);
+        return true;
+    }
+
+    fn parseGraphicsPaletteUsing(self: *Builder, statement: frontend.Token) !bool {
+        const name = (try self.expectIdentifier()) orelse return false;
+        const variable = (try self.resolveVariable(name.span, true)) orelse return false;
+        if (variable.dimensions == 0 or
+            (variable.dimensions != 1 and variable.dimensions != bytecode.unknown_dimensions) or
+            (variable.value_type != .integer and variable.value_type != .long) or
+            variable.record_type != bytecode.invalid_index)
+        {
+            try self.addDiagnostic(.invalid_array_argument, name.span);
+            return false;
+        }
+        try self.emitReference(variable, name.span);
+        var flags: u32 = 0;
+        if (self.consume(.left_paren)) {
+            if (!self.consume(.right_paren)) {
+                const index_type = (try self.parseExpression()) orelse return false;
+                if (!index_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+                if (!try self.expect(.right_paren)) return false;
+                flags |= bytecode.graphics_palette_using_index;
+            }
+        }
+        _ = try self.emit(.graphics_palette_using, flags, 0, statement.span);
+        return true;
+    }
+
+    fn parseGraphicsPageCopy(self: *Builder) !bool {
+        const statement = self.advance();
+        const source_type = (try self.parseExpression()) orelse return false;
+        if (!source_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        if (!try self.expect(.comma)) return false;
+        const destination_type = (try self.parseExpression()) orelse return false;
+        if (!destination_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        _ = try self.emit(.graphics_page_copy, 0, 0, statement.span);
         return true;
     }
 
@@ -3975,13 +4078,14 @@ const Builder = struct {
         const expected_min: usize = switch (builtin) {
             .instr, .mid_string => 2,
             .left_string, .right_string, .string_string, .screen => 2,
-            .point, .fileattr => 2,
+            .point => 1,
+            .pmap, .fileattr => 2,
             .rnd, .inkey_string, .timer, .err, .erl, .csrlin, .freefile, .command_string, .date_string, .time_string => 0,
             else => 1,
         };
         const expected_max: usize = switch (builtin) {
             .instr, .mid_string, .screen => 3,
-            .rnd => 1,
+            .rnd, .point => 2,
             else => expected_min,
         };
         if (arguments.len < expected_min or arguments.len > expected_max) {
@@ -4020,11 +4124,11 @@ const Builder = struct {
             => .string,
             .inkey_string => .string,
             .command_string, .date_string, .environ_string, .time_string => .string,
-            .asc, .cint, .cvi, .csrlin, .err, .instr, .len, .eof, .fileattr, .freefile, .peek, .point, .pos, .screen, .sgn => .integer,
+            .asc, .cint, .cvi, .csrlin, .err, .instr, .len, .eof, .fileattr, .freefile, .peek, .pos, .screen, .sgn => .integer,
             .erl, .loc, .lof, .seek => .long,
             .fix, .int => arguments[0],
             .val => .double,
-            .rnd, .timer => .single,
+            .point, .pmap, .rnd, .timer => .single,
         };
 
         switch (builtin) {
@@ -4072,7 +4176,12 @@ const Builder = struct {
                     try self.addDiagnostic(.type_mismatch, span);
                 }
             },
-            .point => if (!arguments[0].isNumeric() or !arguments[1].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
+            .point => {
+                if (!arguments[0].isNumeric() or (arguments.len == 2 and !arguments[1].isNumeric())) {
+                    try self.addDiagnostic(.type_mismatch, span);
+                }
+            },
+            .pmap => if (!arguments[0].isNumeric() or !arguments[1].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
             .fileattr => if (!arguments[0].isNumeric() or !arguments[1].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
             .pos => if (!arguments[0].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
             .screen => {
@@ -5176,6 +5285,7 @@ fn builtinForKeyword(keyword: frontend.Keyword) ?bytecode.Builtin {
         .erl => .erl,
         .inkey_string => .inkey_string,
         .point => .point,
+        .pmap => .pmap,
         .rnd => .rnd,
         .sgn => .sgn,
         .timer => .timer,
