@@ -915,7 +915,7 @@ const Builder = struct {
             .exit => self.parseExit(),
             .end => self.parseEnd(),
             .unsupported => self.fail(.unsupported_core_feature),
-            else => self.parseDeferredStatement(),
+            else => self.parseUnsupportedStatement(),
         };
     }
 
@@ -3450,13 +3450,13 @@ const Builder = struct {
         return true;
     }
 
-    fn parseDeferredStatement(self: *Builder) !bool {
+    fn parseUnsupportedStatement(self: *Builder) !bool {
         const statement = self.advance();
         while (!self.atBoundary() and !self.atKeyword(.else_)) _ = self.advance();
         try self.addCatalogDiagnostic(
             .unsupported_core_feature,
             statement.span,
-            conformance.deferredStatementId(statement.keyword),
+            conformance.unsupportedStatementId(statement.keyword),
         );
         return false;
     }

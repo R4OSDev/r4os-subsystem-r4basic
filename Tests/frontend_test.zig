@@ -320,10 +320,10 @@ test "bounded caller storage fails visibly in the lexer" {
 
 test "ERROR is accepted through the sole lexer compiler and binder" {
     const source = "ERROR 5\nEND\n";
-    const lexed = frontend.tokenizeNamed("deferred.bas", source, tokens[0..], diagnostics[0..]);
+    const lexed = frontend.tokenizeNamed("error_statement.bas", source, tokens[0..], diagnostics[0..]);
     try std.testing.expect(lexed.ok());
 
-    var program = try core.compiler.compile(std.testing.allocator, "deferred.bas", source);
+    var program = try core.compiler.compile(std.testing.allocator, "error_statement.bas", source);
     defer program.deinit();
     try std.testing.expect(program.ok());
 }

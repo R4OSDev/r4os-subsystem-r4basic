@@ -1,7 +1,7 @@
 const std = @import("std");
 const frontend = @import("frontend.zig");
 
-pub const contract_version = "2.9.0";
+pub const contract_version = "2.10.0";
 pub const invalid_index: u32 = std.math.maxInt(u32);
 pub const unknown_dimensions: u8 = std.math.maxInt(u8);
 
@@ -546,7 +546,7 @@ pub const Diagnostic = struct {
             .expected_identifier => "expected BASIC identifier",
             .expected_expression => "expected BASIC expression",
             .unexpected_token => "unexpected token in core-language compiler",
-            .unsupported_core_feature => "QuickBASIC target is not implemented yet",
+            .unsupported_core_feature => "source form is outside the R4Basic interpreter contract",
             .duplicate_symbol => "symbol is already defined in this scope",
             .symbol_kind_conflict => "name conflicts with another symbol kind",
             .constant_assignment => "constant cannot be assigned",
@@ -555,7 +555,7 @@ pub const Diagnostic = struct {
             .unknown_procedure => "procedure or function is not declared",
             .wrong_argument_count => "procedure or function has the wrong number of arguments",
             .invalid_byref_argument => "ByRef argument must be a compatible scalar variable",
-            .invalid_number => "numeric literal is outside the v1 value range",
+            .invalid_number => "numeric literal is outside the interpreter value range",
             .invalid_array_bounds => "array bounds are invalid",
             .wrong_dimension_count => "array reference has the wrong number of dimensions",
             .unknown_type => "user-defined type is not declared",
@@ -568,7 +568,7 @@ pub const Diagnostic = struct {
             .block_mismatch => "block terminator does not match the active block",
             .block_not_closed => "block is not closed before end of source",
             .expression_too_deep => "BASIC expression nesting exceeds the deterministic compiler limit",
-            .capacity_exceeded => "compiled program exceeds a deterministic v1 capacity",
+            .capacity_exceeded => "compiled program exceeds a deterministic interpreter capacity",
         };
     }
 };

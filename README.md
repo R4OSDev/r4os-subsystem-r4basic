@@ -4,7 +4,7 @@ R4BASIC is the QBasic-compatible subsystem host for R4OS. It is a normal GUI
 R4X module with the subsystem identity `r4os.basic` and the guest format
 `basic.qbasic-source`.
 
-The installed R4X is the productive R4BASIC v2 foundation. Explorer passes one
+The installed R4X is the complete productive R4BASIC v2 interpreter. Explorer passes one
 absolute `.BAS` path through `R4SUBSYS1`; R4BASIC loads it through the storage
 facade, compiles it once, and runs an isolated VM in a movable, resizable, and
 maximizable window. The logical QuickBASIC `SCREEN` modes 0, 1, 2, and 7
@@ -28,7 +28,7 @@ guest time, input, events, or graphics.
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.27`
+- Module version: `1.2.28`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -182,6 +182,13 @@ buffers without blocking host I/O. `LPRINT`, `LPRINT USING`, `LPOS`, and all
 channel. Device faults update `ERDEV`/`ERDEV$`; all 43 Appendix-B numbers
 round-trip through `ERROR`, `ERR`, `ERL`, `ON ERROR`, and `RESUME`.
 
+R4BASIC 1.2.28 closes the release proof. The machine-readable gate requires
+all seven Part-1 areas, 193 Part-2 statements/functions, three metacommands,
+and 43 Appendix-B errors to be implemented at every contract layer. The
+general positive/negative corpus, all aggregated VM families, unchanged
+checksum-bound GORILLA full round, lifecycle/performance tests, Full/Test
+images, and one-/four-CPU productive boots form the release acceptance.
+
 R4BASIC 1.2.22 uses a shared 262,144-instruction ceiling with adaptive bounded
 clock blocks and an 8-ms production time boundary. Active work requests a
 scheduler yield at most once per 8-ms interval; input-only waits, pause and
@@ -249,9 +256,9 @@ checkout.
 `COMPATIBILITY.md` is the versioned R4BASIC v2 target contract.
 `src/conformance.zig` assigns stable, test-validated IDs and layer status to
 Part 1, all 193 Part-2 entries, three metacommands, and 43 runtime errors.
-The compiler Builder is the sole parser and binder; unimplemented targets are
-compile diagnostics and never Deferred runtime opcodes. `VM-CONTRACT.md`
-freezes the executable foundation, budgets, isolation, and lifecycle rules.
+Every target is executable and the compiler Builder is the sole parser and
+binder. `VM-CONTRACT.md` freezes the complete runtime, budgets, isolation,
+and lifecycle rules.
 
 Detailed German technical documentation is in `DOCUMENTATION.de.txt`.
 Reference and implementation provenance is recorded in `PROVENANCE.txt`.

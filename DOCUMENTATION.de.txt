@@ -6,7 +6,7 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.70.13
+Stand 0.70.14
 ------------
 
 Diese Ausbaustufe ergaenzt das Vertragsfundament des produktiven R4BASIC-v2-
@@ -67,6 +67,12 @@ LPRINT, LPRINT USING, LPOS und WIDTH verwenden die gemeinsame Formatengine
 auf privatem Spool beziehungsweise virtuellem Kanal. ERDEV/ERDEV$ klassifizieren
 den letzten Geraetefehler; alle 43 Appendix-B-Nummern durchlaufen dasselbe
 ERR-/ERL-/ON-ERROR-/RESUME-Modell.
+0.70.14 schliesst den Gesamtnachweis. Der maschinenlesbare Vertrag 2.10.0
+verlangt fuer alle sieben Part-1-Bereiche, 193 Part-2-Eintraege, drei
+Metakommandos und 43 Fehlercodes in jeder Schicht den Status implementiert.
+Der allgemeine Positiv-/Negativkorpus, alle aggregierten VM-Familien,
+Gorilla-Vollrunde, Lebenszyklus-/Performanceproben, Full-/Testimages und
+produktive Ein-/Vier-CPU-Starts bilden gemeinsam die Freigabe.
 Explorer uebergibt eine absolute BAS-Datei ueber `R4SUBSYS1`; das R4X liest
 sie und relative `$INCLUDE`-Quellen durch die Storage-Fassade jeweils exakt
 einmal, baut daraus einen begrenzten Quellgraphen und fuehrt eine getrennte VM in
@@ -858,13 +864,14 @@ vom Git-Push ausgeschlossenen `Artifacts/Distribution/Injection`-Baum fuer
 Entwicklung und Abnahme gelesen. Ein Upload eines neuen `Release.zip` ist
 nicht Teil der 0.70.X-Roadmap.
 
-Noch offene v2-Bereiche
------------------------
+Erreichter Produktumfang
+------------------------
 
-Der Interpretervertrag zielt auf die vollstaendige QuickBASIC-4.5-Sprache
-und -Laufzeit. Nach 0.70.10 folgen insbesondere die noch fehlenden
-Grafikprimitive und Bildaktionen, Audio/Ereignisse sowie die private sichere
-Abbildung historischer Geraete- und Fremdcodeoberflaechen. IDE, Debugger,
-nativer Compiler, Linker und Editor sind
-getrennte Produkte; Notepad bleibt fuer BAS-Dateien ueber `Open With` als
-separater Editor verfuegbar.
+Der Interpretervertrag umfasst die vollstaendige QuickBASIC-4.5-Sprache und
+-Laufzeit des katalogisierten Ziels. Historische DOS-, Geraete- und
+Fremdcodeoberflaechen besitzen sichere private Gastsemantik oder typisierte
+R4OS-Fassaden; keine BASIC-Zahl wird zu einem Hostpointer und kein Gast greift
+direkt auf Kernel oder Hardware zu. IDE, interaktiver Debugger, nativer
+Compiler, Linker, Librarian und Editor sind getrennte moegliche Produkte;
+Notepad bleibt fuer BAS-Dateien ueber `Open With` als separater Editor
+verfuegbar.

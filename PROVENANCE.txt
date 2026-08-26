@@ -38,6 +38,16 @@ Primaere Sprachreferenz:
   STRIG- und UEVENT-Steuerung, PEN/STICK/STRIG-Funktionen, die vollstaendige
   PLAY-Makrosprache, SOUND und BEEP unmittelbar aus der lokalen Microsoft-
   QuickBASIC-4.5-Language-Reference ausgewertet.
+- Fuer VM-Vertrag 2.9 wurden DEF SEG, PEEK/POKE, SADD, VARPTR/VARSEG/VARPTR$,
+  FRE, SETMEM, CLEAR-Speicherparameter, CALL/CALLS/DECLARE fuer Non-BASIC,
+  CALL ABSOLUTE, INT86-/INTERRUPT-Familien, INP/OUT/WAIT, OPEN COM,
+  IOCTL/IOCTL$, LPRINT/LPOS/WIDTH, ERDEV/ERDEV$ und die Appendix-B-
+  Geraetefehler unmittelbar aus denselben lokalen Microsoft-Referenzen
+  ausgewertet. Die R4OS-Abbildung ist eigenstaendige private Gast- und
+  virtuelle Geraetesemantik.
+- Vertrag 2.10 schliesst den Katalog gegen die Implementierung und den
+  permanenten allgemeinen Referenzkorpus. Es wurde kein weiterer fremder
+  Quell- oder Beispielcode aufgenommen.
 - Daraus uebernommen wurden ausschliesslich Sprachsemantik und Grenzen;
   Parser-, Speicher-, Alias-, Bytecode- und Fehlerflusscode sind eine neue
   eigenstaendige R4OS-Implementierung.

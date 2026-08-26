@@ -431,10 +431,17 @@ test "R4BASIC v2 conformance catalog is complete stable and machine readable" {
 
     var identifiers = std.StringHashMap(void).init(std.testing.allocator);
     defer identifiers.deinit();
-    for (core.conformance.part1_targets) |target| try validateCatalogTarget(&identifiers, target);
-    for (core.conformance.metacommand_targets) |target| try validateCatalogTarget(&identifiers, target);
+    for (core.conformance.part1_targets) |target| {
+        try validateCatalogTarget(&identifiers, target);
+        try expectTargetImplemented(target);
+    }
+    for (core.conformance.metacommand_targets) |target| {
+        try validateCatalogTarget(&identifiers, target);
+        try expectTargetImplemented(target);
+    }
     for (core.conformance.part2_targets, 1..) |target, number| {
         try validateCatalogTarget(&identifiers, target);
+        try expectTargetImplemented(target);
         var expected_storage: [16]u8 = undefined;
         const expected = try std.fmt.bufPrint(&expected_storage, "QB45-P2-{d:0>3}", .{number});
         try std.testing.expectEqualStrings(expected, target.id);
@@ -450,32 +457,14 @@ test "R4BASIC v2 conformance catalog is complete stable and machine readable" {
         var expected_storage: [16]u8 = undefined;
         const expected = try std.fmt.bufPrint(&expected_storage, "QB45-ERR-{d:0>3}", .{target.number});
         try std.testing.expectEqualStrings(expected, target.id);
+        try std.testing.expectEqual(core.conformance.Status.implemented, target.status);
     }
-    try std.testing.expectEqual(core.conformance.Status.implemented, core.conformance.runtime_error_targets[1].status);
-    try std.testing.expectEqual(core.conformance.Status.implemented, core.conformance.runtime_error_targets[12].status);
-    try std.testing.expectEqual(core.conformance.Status.implemented, core.conformance.runtime_error_targets[13].status);
 
     try std.testing.expectEqual(
         core.conformance.part1_count + core.conformance.part2_count +
             core.conformance.metacommand_count + core.conformance.runtime_error_count,
         identifiers.count(),
     );
-    try expectTargetImplemented(core.conformance.part1_targets[0]);
-    try expectTargetImplemented(core.conformance.part1_targets[1]);
-    try expectTargetImplemented(core.conformance.part1_targets[3]);
-    try expectTargetImplemented(core.conformance.part1_targets[5]);
-    try expectTargetImplemented(core.conformance.metacommand_targets[0]);
-    try expectTargetImplemented(core.conformance.metacommand_targets[1]);
-    try expectTargetImplemented(core.conformance.metacommand_targets[2]);
-    for ([_]usize{
-        0,   1,   2,   6,   11,  15,  17,  18,  26,  27,  28,  29,  30,  34,  36,  38,  39,  40,  46,  48,
-        49,  50,  51,  55,  56,  59,  62,  64,  65,  66,  68,  69,  71,  72,  78,  79,  80,  81,  84,  87,
-        90,  94,  95,  96,  97,  99,  101, 102, 104, 108, 122, 124, 125, 130, 132, 136, 137, 138, 140, 142,
-        145, 149, 151, 152, 154, 157, 158, 159, 160, 162, 163, 166, 167, 168, 170, 171, 176, 177, 178, 179,
-        182, 186, 188, 191,
-    }) |index| {
-        try expectTargetImplemented(core.conformance.part2_targets[index]);
-    }
 }
 
 test "ERROR has crossed the catalog boundary into executable bytecode" {

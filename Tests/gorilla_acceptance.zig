@@ -230,6 +230,28 @@ test "canonical local GORILLA.BAS completes a deterministic round with victory" 
     try std.testing.expectEqual(@as(u32, 2), machine.audioStats().beep_statements);
     try std.testing.expect(accepted_audio_frames != 0);
     try std.testing.expectEqual(machine.audioStats().scheduled_frames, machine.audioStats().resolved_frames);
+
+    // The same productive VM must also survive a complete Reset and return
+    // to the unchanged intro without retaining player or audio state. The
+    // final cancellation followed by the deferred deinit exercises the same
+    // close path used by the subsystem window host.
+    try machine.reset();
+    try expectString(&machine, "Name1$", "");
+    var reset_intro = false;
+    for (0..20_000) |_| {
+        machine.setGuestTime(guest_ns);
+        const slice = machine.runSlice(256);
+        guest_ns +|= 10 * std.time.ns_per_ms;
+        _ = try acceptAudioTransport(&machine, &audio_scratch);
+        if (slice.status == .runtime_error) return error.UnexpectedGorillaRuntimeErrorAfterReset;
+        if (screenContains(&machine, "Press any key to continue")) {
+            reset_intro = true;
+            break;
+        }
+    }
+    try std.testing.expect(reset_intro);
+    machine.requestCancel();
+    try std.testing.expectEqual(core.vm.Status.cancelled, machine.runSlice(0).status);
 }
 
 fn acceptAudioTransport(machine: *core.vm.Vm, scratch: []u8) !u64 {

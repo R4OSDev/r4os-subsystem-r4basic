@@ -1,10 +1,10 @@
-﻿# R4BASIC v2 execution foundation
+﻿# R4BASIC v2 execution contract
 
-Contract version: `2.9.0`
+Contract version: `2.10.0`
 
-This document freezes the executable R4BASIC foundation and its non-regression
-invariants while the complete v2 target in `COMPATIBILITY.md` and
-`src/conformance.zig` is implemented.
+This document freezes the complete executable R4BASIC runtime and its
+non-regression invariants. `COMPATIBILITY.md` defines the language surface;
+`src/conformance.zig` proves every catalog layer implemented.
 
 ## Compilation model
 
@@ -23,13 +23,13 @@ invariants while the complete v2 target in `COMPATIBILITY.md` and
   index; branch operands are resolved instruction indices, not source labels
   or text offsets.
 - A program with any compile diagnostic cannot initialize a VM.
-- Deferred statement and built-in opcodes do not exist. A catalog target that
-  lacks executable semantics is rejected during compilation and cannot enter
-  a generic runtime HostFailure path.
+- Every catalogued statement and built-in emits typed executable semantics.
+  Invalid syntax is rejected during compilation and cannot enter a generic
+  runtime failure path.
 
 ## Cross-package invariants
 
-Every subsequent v2 package must retain the 0.69.X execution properties:
+The complete interpreter retains the 0.69.X execution properties:
 
 - one bounded guest slice per host cycle and event-based waits rather than
   busy polling;
@@ -805,7 +805,7 @@ change another instance.
 ## Runtime diagnostics
 
 The failing instruction supplies the unchanged file name and exact byte,
-line, and column span. The stable v1 mappings are:
+line, and column span. The Appendix-B mappings are:
 
 | Appendix-B identity | Number |
 | --- | ---: |
