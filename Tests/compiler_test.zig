@@ -421,6 +421,9 @@ test "R4BASIC v2 conformance catalog is complete stable and machine readable" {
         const expected = try std.fmt.bufPrint(&expected_storage, "QB45-ERR-{d:0>3}", .{target.number});
         try std.testing.expectEqualStrings(expected, target.id);
     }
+    try std.testing.expectEqual(core.conformance.Status.implemented, core.conformance.runtime_error_targets[1].status);
+    try std.testing.expectEqual(core.conformance.Status.implemented, core.conformance.runtime_error_targets[12].status);
+    try std.testing.expectEqual(core.conformance.Status.implemented, core.conformance.runtime_error_targets[13].status);
 
     try std.testing.expectEqual(
         core.conformance.part1_count + core.conformance.part2_count +
@@ -435,27 +438,348 @@ test "R4BASIC v2 conformance catalog is complete stable and machine readable" {
     try expectTargetImplemented(core.conformance.metacommand_targets[1]);
     try expectTargetImplemented(core.conformance.metacommand_targets[2]);
     for ([_]usize{
-        0,   1,   2,   11,  15,  17,  18,  26,  27,  28,  29,  30,  38,  39,  46,  51,  55,  64,  66,  68,
-        69,  71,  72,  78,  79,  80,  81,  84,  87,  90,  94,  95,  96,  97,  99,  101, 108, 122, 124, 125,
-        130, 132, 138, 140, 142, 145, 151, 152, 154, 157, 158, 159, 163, 166, 168, 170, 171, 177, 178, 179,
+        0,   1,   2,   6,   11,  15,  17,  18,  26,  27,  28,  29,  30,  34,  36,  38,  39,  40,  46,  48,
+        49,  50,  51,  55,  56,  59,  62,  64,  65,  66,  68,  69,  71,  72,  78,  79,  80,  81,  84,  87,
+        90,  94,  95,  96,  97,  99,  101, 102, 104, 108, 122, 124, 125, 130, 132, 136, 137, 138, 140, 142,
+        145, 149, 151, 152, 154, 157, 158, 159, 160, 162, 163, 166, 167, 168, 170, 171, 176, 177, 178, 179,
         182, 186, 188, 191,
     }) |index| {
         try expectTargetImplemented(core.conformance.part2_targets[index]);
     }
 }
 
-test "unimplemented statements stop at catalog-addressed compile diagnostics" {
-    const cases = [_]struct { source: []const u8, id: []const u8 }{
-        .{ .source = "ERROR 5\nEND\n", .id = "QB45-P2-050" },
+test "ERROR has crossed the catalog boundary into executable bytecode" {
+    var program = try core.compiler.compile(std.testing.allocator, "error.bas", "ERROR 5\nEND\n");
+    defer program.deinit();
+    try std.testing.expect(program.ok());
+    var found = false;
+    for (program.instructions) |instruction| if (instruction.op == .raise_error) {
+        found = true;
+        break;
     };
-    for (cases) |case| {
-        var program = try core.compiler.compile(std.testing.allocator, "not-yet.bas", case.source);
-        defer program.deinit();
-        try std.testing.expect(!program.ok());
-        try std.testing.expect(program.diagnostics.len != 0);
-        try std.testing.expectEqual(core.bytecode.DiagnosticCode.unsupported_core_feature, program.diagnostics[0].code);
-        try std.testing.expectEqualStrings(case.id, program.diagnostics[0].catalog_id);
-    }
+    try std.testing.expect(found);
+}
+
+test "procedure signatures preserve BASIC ByRef arrays records fixed strings and recursion" {
+    const source =
+        \\DEFINT A-Z
+        \\TYPE Pair
+        \\  A AS INTEGER
+        \\  B AS INTEGER
+        \\END TYPE
+        \\DECLARE SUB Touch(ByRef X AS INTEGER, ByVal Y AS INTEGER, A(2) AS ANY, P AS Pair, S AS STRING)
+        \\DECLARE SUB Bump(X AS INTEGER)
+        \\DECLARE SUB Loose
+        \\DECLARE FUNCTION Fact%(ByVal N AS INTEGER)
+        \\DIM Matrix(1, 1) AS INTEGER
+        \\DIM Rec AS Pair
+        \\DIM Fixed AS STRING * 4
+        \\X = 2
+        \\Fixed = "AB"
+        \\CALL Touch(X, 3, Matrix(), Rec, Fixed)
+        \\RecordA = Rec.A
+        \\Original = 10
+        \\CALL Bump((Original))
+        \\Bump Original
+        \\Loose Original, 4
+        \\Result = Fact%(5)
+        \\END
+        \\SUB Touch(ByRef X AS INTEGER, ByVal Y AS INTEGER, A() AS INTEGER, P AS Pair, S AS STRING)
+        \\  X = X + Y
+        \\  A(1, 1) = X
+        \\  P.A = X + 1
+        \\  S = S + "Z"
+        \\END SUB
+        \\SUB Bump(X AS INTEGER)
+        \\  X = X + 1
+        \\END SUB
+        \\SUB Loose(X AS INTEGER, Y AS INTEGER)
+        \\  X = X + Y
+        \\END SUB
+        \\FUNCTION Fact%(ByVal N AS INTEGER)
+        \\  IF N <= 1 THEN Fact% = 1: EXIT FUNCTION
+        \\  Fact% = N * Fact%(N - 1)
+        \\END FUNCTION
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "procedures-0707.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(512, 32));
+    try expectInteger(&machine, "X", 5);
+    try std.testing.expectEqual(@as(i16, 5), machine.globalArrayElement("Matrix", &.{ 1, 1 }).?.integer);
+    try expectInteger(&machine, "RecordA", 6);
+    try expectString(&machine, "Fixed", "AB  ");
+    try expectInteger(&machine, "Original", 15);
+    try expectInteger(&machine, "Result", 120);
+    try std.testing.expectEqual(@as(usize, 0), machine.valueStackDepth());
+    try std.testing.expectEqual(@as(usize, 0), machine.callDepth());
+
+    const wrong_dimensions =
+        \\DEFINT A-Z
+        \\DECLARE SUB NeedsTwo(A(2) AS INTEGER)
+        \\DIM One(3) AS INTEGER
+        \\CALL NeedsTwo(One())
+        \\END
+        \\SUB NeedsTwo(A() AS INTEGER)
+        \\END SUB
+    ;
+    var invalid = try core.compiler.compile(std.testing.allocator, "wrong-dimensions.bas", wrong_dimensions);
+    defer invalid.deinit();
+    try std.testing.expect(!invalid.ok());
+    try std.testing.expect(containsCompileDiagnostic(invalid.diagnostics, .wrong_dimension_count));
+
+    const explicit_empty_signature =
+        \\DECLARE SUB Empty()
+        \\END
+        \\SUB Empty(X AS INTEGER)
+        \\END SUB
+    ;
+    var mismatched = try core.compiler.compile(std.testing.allocator, "explicit-empty-signature.bas", explicit_empty_signature);
+    defer mismatched.deinit();
+    try std.testing.expect(!mismatched.ok());
+    try std.testing.expect(containsCompileDiagnostic(mismatched.diagnostics, .wrong_argument_count));
+}
+
+test "multiline DEF FN shares module scope supports STATIC EXIT DEF and zero argument calls" {
+    const source =
+        \\DEFINT A-Z
+        \\BaseValue = 4
+        \\DEF FNBlock(X) STATIC
+        \\  STATIC Counter
+        \\  Counter = Counter + 1
+        \\  IF X < 0 THEN EXIT DEF
+        \\  FNBlock = BaseValue + X + Counter
+        \\END DEF
+        \\DEF FNOne(X) = X * 2
+        \\DEF FNZero = 7
+        \\First = FNBlock(2)
+        \\Second = FNBlock(3)
+        \\Exited = FNBlock(-1)
+        \\OneLine = FNOne(4)
+        \\Zero = FNZero
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "def-fn-0707.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(256, 32));
+    try expectInteger(&machine, "First", 7);
+    try expectInteger(&machine, "Second", 9);
+    try expectInteger(&machine, "Exited", 0);
+    try expectInteger(&machine, "OneLine", 8);
+    try expectInteger(&machine, "Zero", 7);
+
+    const recursive =
+        \\DEFINT A-Z
+        \\DEF FNLoop(X)
+        \\  FNLoop = FNLoop(X)
+        \\END DEF
+        \\END
+    ;
+    var invalid = try core.compiler.compile(std.testing.allocator, "recursive-def-fn.bas", recursive);
+    defer invalid.deinit();
+    try std.testing.expect(!invalid.ok());
+    try std.testing.expect(containsCompileDiagnostic(invalid.diagnostics, .symbol_kind_conflict));
+}
+
+test "control flow covers multi NEXT CASE IS inline arms and ON GOTO GOSUB" {
+    const source =
+        \\DEFINT A-Z
+        \\FOR I = 1 TO 2
+        \\  FOR J = 1 TO 3
+        \\    Total = Total + 1
+        \\NEXT J, I
+        \\X = 5
+        \\SELECT CASE X
+        \\CASE IS < 3
+        \\  Selected = 1
+        \\CASE IS >= 5
+        \\  Selected = 2
+        \\CASE ELSE
+        \\  Selected = 3
+        \\END SELECT
+        \\IF 0 THEN Inline = 1: Inline = 2 ELSE Inline = 3: Inline = Inline + 1
+        \\Choice = 2
+        \\ON Choice GOSUB AddOne, AddTwo, AddThree
+        \\AfterGosub = 1
+        \\ON 3 GOTO BadOne, BadTwo, Good
+        \\BadOne:
+        \\Branch = -1
+        \\GOTO Finished
+        \\BadTwo:
+        \\Branch = -2
+        \\GOTO Finished
+        \\Good:
+        \\Branch = 3
+        \\GOTO Finished
+        \\AddOne:
+        \\Added = 1
+        \\RETURN
+        \\AddTwo:
+        \\Added = 2
+        \\RETURN
+        \\AddThree:
+        \\Added = 3
+        \\RETURN
+        \\Finished:
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "flow-0707.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(512, 32));
+    try expectInteger(&machine, "Total", 6);
+    try expectInteger(&machine, "Selected", 2);
+    try expectInteger(&machine, "Inline", 4);
+    try expectInteger(&machine, "Added", 2);
+    try expectInteger(&machine, "AfterGosub", 1);
+    try expectInteger(&machine, "Branch", 3);
+    try std.testing.expectEqual(@as(usize, 0), machine.gosubDepth());
+}
+
+test "runtime errors preserve ERR ERL nested propagation RESUME and atomic stacks" {
+    const source =
+        \\10 DEFINT A-Z
+        \\20 DECLARE SUB Child()
+        \\30 ChildErr = 0
+        \\40 ON ERROR GOTO 80
+        \\50 CALL Child
+        \\60 AfterChild = 1
+        \\70 GOTO 120
+        \\80 OuterErr = ERR
+        \\90 OuterLine = ERL
+        \\100 RESUME NEXT
+        \\120 END
+        \\140 SUB Child
+        \\150 SHARED ChildErr
+        \\160 ON ERROR GOTO 190
+        \\170 ERROR 42
+        \\180 EXIT SUB
+        \\190 ChildErr = ERR
+        \\200 ERROR 43
+        \\220 END SUB
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "errors-0707.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(512, 32));
+    try expectInteger(&machine, "ChildErr", 42);
+    try expectInteger(&machine, "OuterErr", 43);
+    try expectInteger(&machine, "OuterLine", 200);
+    try expectInteger(&machine, "AfterChild", 1);
+    try std.testing.expectEqual(@as(usize, 0), machine.valueStackDepth());
+    try std.testing.expectEqual(@as(usize, 0), machine.callDepth());
+
+    const return_without_gosub =
+        \\DEFINT A-Z
+        \\ON ERROR GOTO Handler
+        \\RETURN
+        \\After = 1
+        \\END
+        \\Handler:
+        \\Number = ERR
+        \\RESUME NEXT
+    ;
+    var return_program = try core.compiler.compile(std.testing.allocator, "return-error.bas", return_without_gosub);
+    defer return_program.deinit();
+    try expectProgramOk(&return_program);
+    var return_machine = try core.vm.Vm.init(std.testing.allocator, &return_program, .{});
+    defer return_machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, return_machine.runToCompletion(128, 16));
+    try expectInteger(&return_machine, "Number", 3);
+    try expectInteger(&return_machine, "After", 1);
+
+    const no_resume =
+        \\DECLARE SUB Bad()
+        \\CALL Bad
+        \\END
+        \\SUB Bad
+        \\  ON ERROR GOTO Handler
+        \\  ERROR 5
+        \\Handler:
+        \\  Seen = ERR
+        \\END SUB
+    ;
+    var no_resume_program = try core.compiler.compile(std.testing.allocator, "no-resume.bas", no_resume);
+    defer no_resume_program.deinit();
+    try expectProgramOk(&no_resume_program);
+    var no_resume_machine = try core.vm.Vm.init(std.testing.allocator, &no_resume_program, .{});
+    defer no_resume_machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.runtime_error, no_resume_machine.runToCompletion(128, 16));
+    try std.testing.expectEqual(@as(i32, 19), no_resume_machine.runtime_diagnostic.?.qbasicErrorNumber());
+}
+
+test "STOP and bounded trace remain cooperative resumable resettable and cancellable" {
+    const source =
+        \\5 DEFINT A-Z
+        \\10 TRON
+        \\20 A = 1
+        \\30 A = A + 1
+        \\40 TROFF
+        \\50 B = 3
+        \\60 STOP
+        \\70 C = 4
+        \\80 END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "stop-trace-0707.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runSlice(256).status);
+    try std.testing.expect(machine.isStopped());
+    try expectInteger(&machine, "A", 2);
+    try expectInteger(&machine, "B", 3);
+    try expectInteger(&machine, "C", 0);
+    try std.testing.expectEqual(@as(usize, 3), machine.traceCount());
+    try std.testing.expectEqual(@as(u16, 20), machine.traceEntry(0).?.basic_line);
+    try std.testing.expectEqual(@as(u16, 40), machine.traceEntry(2).?.basic_line);
+    try std.testing.expect(screenContainsText(&machine, "[20][30][40]"));
+    try std.testing.expect(machine.continueStopped());
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(256, 8));
+    try expectInteger(&machine, "C", 4);
+
+    try machine.reset();
+    try std.testing.expectEqual(@as(usize, 0), machine.traceCount());
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runSlice(256).status);
+    var adapter = core.runtime_adapter.Adapter.init(&machine);
+    const continued = adapter.handleInput(.{ .text = .{ .codepoint = 'X', .modifiers = 0, .tick = 1, .sequence = 1 } });
+    try std.testing.expectEqual(core.runtime_adapter.InputDeliveryStatus.control, continued.status);
+    try std.testing.expect(!machine.isStopped());
+    try std.testing.expectEqual(@as(usize, 0), machine.queuedInputBytes());
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(256, 8));
+
+    try machine.reset();
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runSlice(256).status);
+    machine.requestCancel();
+    try std.testing.expectEqual(core.vm.Status.cancelled, machine.runSlice(0).status);
+
+    const bounded =
+        \\DEFINT A-Z
+        \\TRON
+        \\FOR I = 1 TO 400
+        \\  Count = Count + 1
+        \\NEXT I
+        \\TROFF
+        \\END
+    ;
+    var bounded_program = try core.compiler.compile(std.testing.allocator, "bounded-trace.bas", bounded);
+    defer bounded_program.deinit();
+    try expectProgramOk(&bounded_program);
+    var bounded_machine = try core.vm.Vm.init(std.testing.allocator, &bounded_program, .{});
+    defer bounded_machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, bounded_machine.runToCompletion(1024, 16));
+    try expectInteger(&bounded_machine, "Count", 400);
+    try std.testing.expectEqual(core.vm.maximum_trace_entries, bounded_machine.traceCount());
+    try std.testing.expect(bounded_machine.traceDropped() != 0);
 }
 
 test "compiler indices scale across symbols records procedures and label fixups" {

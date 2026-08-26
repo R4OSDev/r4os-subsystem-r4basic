@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 QuickBASIC 4.5 target contract
 
-Contract version: `2.2.0`
+Contract version: `2.3.0`
 
 R4BASIC v2 targets the complete Microsoft QuickBASIC 4.5 interpreter language
 and runtime. The target is not limited by GORILLA.BAS or by the historical v1
@@ -114,12 +114,13 @@ the same grammar family. All fixture paths are below `Tests/Fixtures/`.
 | DECL-01 | `CONST`, all five `DEFtype` forms, `OPTION BASE`, implicit arrays, `DIM`/`DIM SHARED`, `REDIM PRESERVE`, `ERASE`, `LBOUND`/`UBOUND`, fixed strings and up to 60 dimensions | yes | `positive_declarations.bas` plus inline declaration, allocation, preservation and failure-atomicity vectors | `negative_structure.bas` plus inline declaration diagnostics |
 | DECL-02 | Nested `TYPE` blocks with canonical guest-byte layouts, elementary and fixed-string fields, record assignment, `LEN`, `LSET`/`RSET`, `SWAP`, `AS ANY`, and empty array parameter dimensions | yes | `positive_declarations.bas` plus inline record ownership and byte-layout vectors | `negative_structure.bas` plus inline type diagnostics |
 | SCOPE-01 | automatic and static procedure locals, procedure-level and standalone `STATIC`, standalone `SHARED`, `DIM`/`REDIM SHARED`, and blank or named `COMMON` metadata | yes | inline recursive, reset, two-VM, shared and COMMON-layout vectors | `negative_structure.bas` plus inline scope diagnostics |
-| PROC-01 | `DECLARE SUB`, `DECLARE FUNCTION`, `SUB`, `FUNCTION`, `STATIC`, `EXIT`, explicit `CALL`, and implicit calls | yes | `positive_declarations.bas` | `negative_structure.bas`, `negative_statements.bas` |
-| PROC-02 | One-line `DEF FN` and the selected `DEF SEG` compatibility form | yes | `positive_declarations.bas`, `positive_io_graphics.bas` | `negative_structure.bas` |
+| PROC-01 | Full BASIC signatures for `DECLARE SUB`, `DECLARE FUNCTION`, `SUB`, `FUNCTION`, `STATIC`, `EXIT`, explicit `CALL`, implicit calls, recursion, dimensioned arrays, records, fixed-string temporaries, and `AS ANY` | yes | `positive_declarations.bas` plus inline 0.70.7 signature and recursion vectors | `negative_structure.bas`, `negative_statements.bas` plus inline dimension diagnostics |
+| PROC-02 | One-line and multiline `DEF FN` with parameters, module scope, `STATIC`, `EXIT DEF`, `END DEF`, zero-argument calls, and the selected `DEF SEG` compatibility form | yes | `positive_declarations.bas`, `positive_io_graphics.bas`, plus inline 0.70.7 vectors | `negative_structure.bas` plus the recursive-DEF diagnostic vector |
 | DATA-01 | Numeric/string `DATA`, named data labels, `READ`, and `RESTORE` | yes | `positive_declarations.bas` | `negative_expressions.bas` |
-| FLOW-01 | Named labels, `GOTO`, `GOSUB`, `RETURN`, `ON ERROR GOTO`, `RESUME`, and `RESUME NEXT` | yes | `positive_control_flow.bas` | `negative_structure.bas` |
-| FLOW-02 | Block and single-line `IF`, `ELSEIF`, `ELSE`, `SELECT CASE`, ranges, and `CASE ELSE` | yes | `positive_control_flow.bas` | `negative_structure.bas` |
-| FLOW-03 | `FOR`/`NEXT`, `WHILE`/`WEND`, `DO`/`LOOP`, leading conditions, trailing conditions, and `EXIT FOR`/`EXIT DO` | yes | `positive_control_flow.bas` | `negative_structure.bas`, `negative_statements.bas` |
+| FLOW-01 | Numeric/named `GOTO`, `GOSUB`, `RETURN`, indexed `ON GOTO`/`ON GOSUB`, `ON ERROR GOTO`, every `RESUME` form, and exact errors 3/19/20 | yes | `positive_control_flow.bas` plus inline 0.70.7 branch/error vectors | `negative_structure.bas` |
+| FLOW-02 | Block and multi-statement single-line `IF`, `ELSEIF`, `ELSE`, `SELECT CASE`, value/range lists, `CASE IS`, and `CASE ELSE` | yes | `positive_control_flow.bas` plus inline 0.70.7 vectors | `negative_structure.bas` |
+| FLOW-03 | `FOR`/`NEXT` including variable lists, `WHILE`/`WEND`, every leading/trailing `DO`/`LOOP` condition, and `EXIT FOR`/`EXIT DO` | yes | `positive_control_flow.bas` plus inline multi-NEXT vectors | `negative_structure.bas`, `negative_statements.bas` |
+| DEBUG-01 | Cooperative `STOP`, productive host continuation, and visible bounded `TRON`/`TROFF` statement tracing | no | inline pause, reset, cancellation, host-input, and 256-entry ring vectors | inline lifecycle vectors |
 | EXPR-01 | Parentheses; unary `+`, `-`, `NOT`; power, multiply, divide, integer divide, `MOD`, add, subtract, comparisons, `AND`, `OR`, `XOR`, `EQV`, and `IMP` with reference precedence and signed-LONG logic | yes | all positive fixtures and inline numeric vectors | `negative_expressions.bas` |
 | EXPR-02 | Numeric conversion, IEEE/MBF byte conversion, math, string, time, graphics and host-query built-ins currently marked implemented in `src/conformance.zig` | yes | `positive_io_graphics.bas` and inline numeric/byte/error vectors | `negative_expressions.bas` |
 | TEXT-01 | Text `SCREEN`, `WIDTH`, `COLOR`, `CLS`, `LOCATE`, `VIEW PRINT`, `PRINT`, `PRINT USING`, `WRITE`, `INPUT`, `LINE INPUT`, and `INPUT$` | yes | `positive_io_graphics.bas` plus inline formatting/input vectors | `negative_statements.bas` |

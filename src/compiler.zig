@@ -13,6 +13,7 @@ pub const maximum_block_depth: usize = 128;
 pub const maximum_array_dimensions: usize = 60;
 pub const maximum_record_types: usize = 4_096;
 pub const maximum_record_fields: usize = 4_096;
+pub const maximum_on_branch_labels: usize = 60;
 pub const maximum_stored_diagnostics: usize = 20;
 
 pub const CompilePhase = enum(u8) {
@@ -438,6 +439,7 @@ const ProcedureBuilder = struct {
     return_type: bytecode.ValueType = .single,
     is_static: bool = false,
     declared: bool = false,
+    declaration_has_signature: bool = false,
     defined: bool = false,
     called: bool = false,
     locals: std.ArrayList(bytecode.Variable) = .empty,
@@ -473,6 +475,12 @@ const LabelFixup = struct {
 const DataFixup = struct {
     name: frontend.Span,
     instruction: u32,
+};
+
+const OnBranchFixup = struct {
+    name: frontend.Span,
+    procedure: u32,
+    target_index: u32,
 };
 
 const BlockKind = enum(u8) {
@@ -605,6 +613,8 @@ const Builder = struct {
     labels: std.ArrayList(Label) = .empty,
     label_fixups: std.ArrayList(LabelFixup) = .empty,
     data_fixups: std.ArrayList(DataFixup) = .empty,
+    on_branch_fixups: std.ArrayList(OnBranchFixup) = .empty,
+    on_branch_targets: std.ArrayList(u32) = .empty,
     blocks: std.ArrayList(Block) = .empty,
     constant_index: ConstantIndex = .{},
     global_names: NameIndex = .{},
@@ -647,6 +657,8 @@ const Builder = struct {
         self.labels.deinit(self.allocator);
         self.label_fixups.deinit(self.allocator);
         self.data_fixups.deinit(self.allocator);
+        self.on_branch_fixups.deinit(self.allocator);
+        self.on_branch_targets.deinit(self.allocator);
         self.blocks.deinit(self.allocator);
         self.constant_index.deinit(self.allocator);
         self.global_names.deinit(self.allocator);
@@ -672,8 +684,10 @@ const Builder = struct {
         try self.labels.ensureTotalCapacityPrecise(self.allocator, hints.labels);
         try self.label_fixups.ensureTotalCapacityPrecise(self.allocator, hints.label_fixups);
         try self.data_fixups.ensureTotalCapacityPrecise(self.allocator, hints.data_fixups);
+        try self.on_branch_fixups.ensureTotalCapacityPrecise(self.allocator, hints.label_fixups);
+        try self.on_branch_targets.ensureTotalCapacityPrecise(self.allocator, hints.label_fixups);
         try self.blocks.ensureTotalCapacityPrecise(self.allocator, hints.blocks);
-        self.stats.list_reservations = 13;
+        self.stats.list_reservations = 15;
         self.stats.initial_list_bytes = @intCast(
             self.instructions.capacity * @sizeOf(bytecode.Instruction) +
                 self.instruction_metadata.capacity * @sizeOf(bytecode.InstructionMetadata) +
@@ -687,6 +701,8 @@ const Builder = struct {
                 self.labels.capacity * @sizeOf(Label) +
                 self.label_fixups.capacity * @sizeOf(LabelFixup) +
                 self.data_fixups.capacity * @sizeOf(DataFixup) +
+                self.on_branch_fixups.capacity * @sizeOf(OnBranchFixup) +
+                self.on_branch_targets.capacity * @sizeOf(u32) +
                 self.blocks.capacity * @sizeOf(Block),
         );
     }
@@ -746,10 +762,11 @@ const Builder = struct {
             _ = try self.emit(.halt, 0, 0, self.current().span);
         }
         if (!self.reportProgress(.binding, self.tokens.len, self.tokens.len)) return error.Cancelled;
-        const fixup_total = self.label_fixups.items.len + self.data_fixups.items.len;
+        const fixup_total = self.label_fixups.items.len + self.data_fixups.items.len + self.on_branch_fixups.items.len;
         if (!self.reportProgress(.resolution, 0, fixup_total)) return error.Cancelled;
         try self.resolveLabels(fixup_total);
         try self.resolveDataFixups(fixup_total);
+        try self.resolveOnBranchFixups(fixup_total);
         if (!self.reportProgress(.resolution, fixup_total, fixup_total)) return error.Cancelled;
         for (self.procedures.items) |procedure| {
             if (procedure.called and !procedure.defined) try self.addDiagnostic(.unknown_procedure, procedure.name);
@@ -772,7 +789,7 @@ const Builder = struct {
     fn statementStartsExecutableCode(self: *Builder) bool {
         if (!self.at(.keyword)) return true;
         return switch (self.current().keyword) {
-            .common, .const_, .data, .declare, .defint, .deflng, .defsng, .defdbl, .defstr, .dim, .option, .type => false,
+            .common, .const_, .data, .declare, .def, .defint, .deflng, .defsng, .defdbl, .defstr, .dim, .option, .type => false,
             .sub, .function => false,
             else => true,
         };
@@ -824,8 +841,12 @@ const Builder = struct {
             .loop => self.parseLoop(),
             .goto_ => self.parseBranch(.jump),
             .gosub => self.parseBranch(.gosub),
-            .on => self.parseOnError(),
+            .on => self.parseOn(),
+            .error_ => self.parseError(),
             .resume_ => self.parseResume(),
+            .stop => self.parseSimpleOp(.stop),
+            .tron => self.parseSimpleOp(.trace_on),
+            .troff => self.parseSimpleOp(.trace_off),
             .poke => self.parsePoke(),
             .screen => self.parseScreen(),
             .width => self.parseTextWidth(),
@@ -1296,6 +1317,18 @@ const Builder = struct {
             if (index != 0 and index % 256 == 0 and !self.reportProgress(.resolution, base + index, total)) return error.Cancelled;
             if (self.label_names.lookup(self.source, bytecode.invalid_index, fixup.name, &self.stats)) |label_index| {
                 self.instructions.items[fixup.instruction].a = self.labels.items[label_index].data_index;
+            } else {
+                try self.addDiagnostic(.unknown_label, fixup.name);
+            }
+        }
+    }
+
+    fn resolveOnBranchFixups(self: *Builder, total: usize) !void {
+        const base = self.label_fixups.items.len + self.data_fixups.items.len;
+        for (self.on_branch_fixups.items, 0..) |fixup, index| {
+            if (index != 0 and index % 256 == 0 and !self.reportProgress(.resolution, base + index, total)) return error.Cancelled;
+            if (self.label_names.lookup(self.source, fixup.procedure, fixup.name, &self.stats)) |label_index| {
+                self.on_branch_targets.items[fixup.target_index] = self.labels.items[label_index].instruction;
             } else {
                 try self.addDiagnostic(.unknown_label, fixup.name);
             }
@@ -2121,9 +2154,42 @@ const Builder = struct {
         return true;
     }
 
-    fn parseOnError(self: *Builder) !bool {
+    fn parseOn(self: *Builder) !bool {
         const statement = self.advance();
-        if (!try self.expectKeyword(.error_)) return false;
+        if (self.consumeKeyword(.error_)) return self.parseOnErrorSuffix(statement);
+
+        const selector_type = (try self.parseExpression()) orelse return false;
+        if (!selector_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        const op: bytecode.OpCode = if (self.consumeKeyword(.goto_))
+            .on_goto
+        else if (self.consumeKeyword(.gosub))
+            .on_gosub
+        else
+            return self.fail(.expected_token);
+
+        const first_target: u32 = @intCast(self.on_branch_targets.items.len);
+        var count: usize = 0;
+        while (true) {
+            if (count >= maximum_on_branch_labels) {
+                try self.addDiagnostic(.capacity_exceeded, self.current().span);
+                return false;
+            }
+            const label = (try self.expectLabelTarget()) orelse return false;
+            const target_index: u32 = @intCast(self.on_branch_targets.items.len);
+            try self.on_branch_targets.append(self.allocator, bytecode.invalid_index);
+            try self.on_branch_fixups.append(self.allocator, .{
+                .name = label.span,
+                .procedure = self.currentScope(),
+                .target_index = target_index,
+            });
+            count += 1;
+            if (!self.consume(.comma)) break;
+        }
+        _ = try self.emit(op, first_target, @intCast(count), statement.span);
+        return true;
+    }
+
+    fn parseOnErrorSuffix(self: *Builder, statement: frontend.Token) !bool {
         if (!try self.expectKeyword(.goto_)) return false;
         if (self.at(.number)) {
             const target = self.advance();
@@ -2139,6 +2205,20 @@ const Builder = struct {
         const label = (try self.expectIdentifier()) orelse return false;
         const instruction = try self.emit(.set_error_handler, bytecode.invalid_index, 0, statement.span);
         try self.addLabelFixup(label.span, instruction);
+        return true;
+    }
+
+    fn parseError(self: *Builder) !bool {
+        const statement = self.advance();
+        const value_type = (try self.parseExpression()) orelse return false;
+        if (!value_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        _ = try self.emit(.raise_error, 0, 0, statement.span);
+        return true;
+    }
+
+    fn parseSimpleOp(self: *Builder, op: bytecode.OpCode) !bool {
+        const statement = self.advance();
+        _ = try self.emit(op, 0, 0, statement.span);
         return true;
     }
 
@@ -2726,7 +2806,8 @@ const Builder = struct {
         procedure.declared = true;
         if (procedure.kind != kind) try self.addDiagnostic(.symbol_kind_conflict, name.span);
         if (self.at(.left_paren)) {
-            if (!try self.parseParameters(procedure_id, false)) return false;
+            procedure.declaration_has_signature = true;
+            if (!try self.parseParameters(procedure_id, false, true)) return false;
         }
         return true;
     }
@@ -2745,6 +2826,7 @@ const Builder = struct {
 
         const declared_types = try self.copyParameterSignature(procedure.parameters.items);
         defer self.allocator.free(declared_types);
+        const declaration_has_signature = procedure.declaration_has_signature;
         procedure.locals.clearRetainingCapacity();
         procedure.local_names.clearRetainingCapacity();
         procedure.parameters.clearRetainingCapacity();
@@ -2758,9 +2840,9 @@ const Builder = struct {
                 .value_type = procedure.return_type,
             });
         }
-        if (self.at(.left_paren) and !try self.parseParameters(procedure_id, false)) return false;
+        if (self.at(.left_paren) and !try self.parseParameters(procedure_id, false, false)) return false;
         procedure.is_static = self.consumeKeyword(.static);
-        try self.validateDeclaredSignature(name.span, declared_types, procedure.parameters.items);
+        try self.validateDeclaredSignature(name.span, declaration_has_signature, declared_types, procedure.parameters.items);
 
         self.current_procedure_skip = try self.emit(.jump, bytecode.invalid_index, 0, statement.span);
         self.current_procedure = procedure_id;
@@ -2780,6 +2862,10 @@ const Builder = struct {
             }
             return true;
         }
+        if (self.current_procedure != bytecode.invalid_index) {
+            try self.addDiagnostic(.unexpected_token, statement.span);
+            return false;
+        }
         _ = self.consumeKeyword(.fn_);
         const name = (try self.expectIdentifier()) orelse return false;
         if (self.findProcedure(name.span) != null) {
@@ -2794,27 +2880,37 @@ const Builder = struct {
             .name = name.span,
             .value_type = procedure.return_type,
         });
-        if (!try self.parseParameters(procedure_id, true)) return false;
-        if (!try self.expect(.equal)) return false;
+        if (self.at(.left_paren) and !try self.parseParameters(procedure_id, true, false)) return false;
+        procedure.is_static = self.consumeKeyword(.static);
+        for (procedure.parameters.items) |parameter| {
+            if (parameter.is_array or parameter.record_type != bytecode.invalid_index) {
+                try self.addDiagnostic(.type_mismatch, name.span);
+                return false;
+            }
+        }
 
         const skip = try self.emit(.jump, bytecode.invalid_index, 0, statement.span);
-        const previous_procedure = self.current_procedure;
         self.current_procedure = procedure_id;
         self.procedures.items[procedure_id].entry_ip = self.currentIp();
+        if (!self.consume(.equal)) {
+            self.current_procedure_skip = skip;
+            return true;
+        }
         const expression_type = (try self.parseExpression()) orelse {
-            self.current_procedure = previous_procedure;
+            self.current_procedure = bytecode.invalid_index;
+            self.patchJump(skip, self.currentIp());
             return false;
         };
         if (!typesCompatible(procedure.return_type, expression_type)) try self.addDiagnostic(.type_mismatch, name.span);
         try self.emitStore(self.variableReference(.local, procedure.return_local), false, name.span);
         _ = try self.emit(.return_procedure, 0, 0, statement.span);
         self.procedures.items[procedure_id].end_ip = self.currentIp();
-        self.current_procedure = previous_procedure;
+        self.current_procedure = bytecode.invalid_index;
         self.patchJump(skip, self.currentIp());
         return true;
     }
 
-    fn parseParameters(self: *Builder, procedure_id: u32, force_by_value: bool) !bool {
+    fn parseParameters(self: *Builder, procedure_id: u32, force_by_value: bool, allow_dimension_count: bool) !bool {
         if (!try self.expect(.left_paren)) return false;
         if (self.consume(.right_paren)) return true;
         while (true) {
@@ -2822,9 +2918,21 @@ const Builder = struct {
             if (self.consumeKeyword(.byval)) mode = .by_value else if (self.consumeKeyword(.byref)) mode = .by_ref;
             const name = (try self.expectIdentifier()) orelse return false;
             var is_array = false;
+            var dimensions: u8 = 0;
             if (self.consume(.left_paren)) {
                 is_array = true;
-                if (!try self.expect(.right_paren)) return false;
+                dimensions = bytecode.unknown_dimensions;
+                if (!self.consume(.right_paren)) {
+                    if (!allow_dimension_count or !self.at(.number)) return self.fail(.invalid_array_argument);
+                    const dimension_token = self.advance();
+                    const dimension_count = std.fmt.parseInt(u8, self.tokenText(dimension_token), 10) catch 0;
+                    if (dimension_count == 0 or dimension_count > maximum_array_dimensions) {
+                        try self.addDiagnostic(.wrong_dimension_count, dimension_token.span);
+                    } else {
+                        dimensions = dimension_count;
+                    }
+                    if (!try self.expect(.right_paren)) return false;
+                }
             }
             var bound_type = BoundType{ .value_type = self.inferredType(name.span) };
             if (self.consumeKeyword(.as)) bound_type = (try self.parseBoundType()) orelse return false;
@@ -2840,7 +2948,7 @@ const Builder = struct {
                 .name = name.span,
                 .value_type = bound_type.value_type,
                 .record_type = bound_type.record_type,
-                .dimensions = if (is_array) bytecode.unknown_dimensions else 0,
+                .dimensions = dimensions,
                 .is_parameter = true,
             });
             try self.procedures.items[procedure_id].parameters.append(self.allocator, .{
@@ -2848,6 +2956,7 @@ const Builder = struct {
                 .value_type = bound_type.value_type,
                 .record_type = bound_type.record_type,
                 .is_array = is_array,
+                .dimensions = dimensions,
                 .accepts_any = bound_type.accepts_any,
                 .passing_mode = mode,
             });
@@ -2863,21 +2972,25 @@ const Builder = struct {
     fn validateDeclaredSignature(
         self: *Builder,
         span: frontend.Span,
+        has_signature: bool,
         declared: []const bytecode.Parameter,
-        defined: []const bytecode.Parameter,
+        defined: []bytecode.Parameter,
     ) !void {
-        if (declared.len == 0) return;
+        if (!has_signature) return;
         if (declared.len != defined.len) {
             try self.addDiagnostic(.wrong_argument_count, span);
             return;
         }
-        for (declared, defined) |first, second| {
+        for (declared, defined) |first, *second| {
             const type_matches = first.accepts_any or
                 (first.value_type == second.value_type and first.record_type == second.record_type);
-            if (!type_matches or first.is_array != second.is_array or first.passing_mode != second.passing_mode) {
+            const dimensions_match = !first.is_array or first.dimensions == bytecode.unknown_dimensions or
+                second.dimensions == bytecode.unknown_dimensions or first.dimensions == second.dimensions;
+            if (!type_matches or first.is_array != second.is_array or !dimensions_match or first.passing_mode != second.passing_mode) {
                 try self.addDiagnostic(.type_mismatch, span);
                 return;
             }
+            if (first.is_array and first.dimensions != bytecode.unknown_dimensions) second.dimensions = first.dimensions;
         }
     }
 
@@ -3020,8 +3133,11 @@ const Builder = struct {
             try self.addDiagnostic(.unknown_procedure, name.span);
             return false;
         };
+        if (self.procedures.items[procedure_id].kind != .sub) {
+            try self.addDiagnostic(.symbol_kind_conflict, name.span);
+            return false;
+        }
         if (!try self.emitProcedureCall(procedure_id, self.at(.left_paren), statement.span, false)) return false;
-        if (self.procedures.items[procedure_id].kind != .sub) _ = try self.emit(.pop, 0, 0, statement.span);
         return true;
     }
 
@@ -3034,6 +3150,10 @@ const Builder = struct {
     ) !bool {
         const procedure = &self.procedures.items[procedure_id];
         procedure.called = true;
+        if (procedure.kind == .def_fn and self.current_procedure == procedure_id) {
+            try self.addDiagnostic(.symbol_kind_conflict, span);
+            return false;
+        }
         if (value_required and procedure.kind == .sub) {
             try self.addDiagnostic(.symbol_kind_conflict, span);
             return false;
@@ -3041,6 +3161,9 @@ const Builder = struct {
         if (!value_required and procedure.kind != .sub and !parenthesized) {
             try self.addDiagnostic(.symbol_kind_conflict, span);
             return false;
+        }
+        if (!procedure.defined and !procedure.declaration_has_signature) {
+            return self.emitUncheckedProcedureCall(procedure_id, parenthesized, span);
         }
 
         if (parenthesized) _ = self.advance();
@@ -3068,6 +3191,11 @@ const Builder = struct {
                         {
                             try self.addDiagnostic(.invalid_array_argument, argument.span);
                         }
+                        if (parameter.dimensions != 0 and parameter.dimensions != bytecode.unknown_dimensions and
+                            target.dimensions != bytecode.unknown_dimensions and target.dimensions != parameter.dimensions)
+                        {
+                            try self.addDiagnostic(.wrong_dimension_count, argument.span);
+                        }
                     } else if (self.canAliasScalarArgument()) |alias| {
                         const argument = self.advance();
                         const variable = alias.reference orelse (try self.resolveVariable(argument.span, true)).?;
@@ -3077,6 +3205,9 @@ const Builder = struct {
                             target.value_type != parameter.value_type)
                         {
                             try self.addDiagnostic(.invalid_byref_argument, argument.span);
+                        }
+                        if (target.fixed_string_length != 0 and target.value_type == .string) {
+                            _ = try self.emit(.load_reference, 0, 0, argument.span);
                         }
                     } else {
                         const argument_type = (try self.parseExpression()) orelse return false;
@@ -3100,6 +3231,34 @@ const Builder = struct {
         if (argument_count != procedure.parameters.items.len) {
             try self.addDiagnostic(.wrong_argument_count, span);
         }
+        _ = try self.emit(.call, procedure_id, @intCast(argument_count), span);
+        return true;
+    }
+
+    fn emitUncheckedProcedureCall(
+        self: *Builder,
+        procedure_id: u32,
+        parenthesized: bool,
+        span: frontend.Span,
+    ) !bool {
+        if (parenthesized) _ = self.advance();
+        var argument_count: usize = 0;
+        const empty = parenthesized and self.consume(.right_paren);
+        if (!empty and !(self.atBoundary() or self.atKeyword(.else_))) {
+            while (true) {
+                if (self.canAliasScalarArgument()) |alias| {
+                    const argument = self.advance();
+                    const variable = alias.reference orelse (try self.resolveVariable(argument.span, true)).?;
+                    self.stats.reused_statement_bindings +%= 1;
+                    _ = (try self.parseLvalueReferenceResolved(argument, variable)) orelse return false;
+                } else {
+                    _ = (try self.parseExpression()) orelse return false;
+                }
+                argument_count += 1;
+                if (!self.consume(.comma)) break;
+            }
+        }
+        if (parenthesized and !empty and !try self.expect(.right_paren)) return false;
         _ = try self.emit(.call, procedure_id, @intCast(argument_count), span);
         return true;
     }
@@ -3348,6 +3507,13 @@ const Builder = struct {
                     return self.procedures.items[procedure_id].return_type;
                 }
             }
+            if (self.findProcedure(name.span)) |procedure_id| {
+                const procedure = self.procedures.items[procedure_id];
+                if (procedure.kind != .sub and procedure.parameters.items.len == 0) {
+                    if (!try self.emitProcedureCall(procedure_id, false, name.span, true)) return null;
+                    return procedure.return_type;
+                }
+            }
             const target = (try self.parseLvalueReference(name, true)) orelse return null;
             if (target.is_whole_array or target.record_type != bytecode.invalid_index) {
                 try self.addDiagnostic(.invalid_record_access, name.span);
@@ -3508,7 +3674,7 @@ const Builder = struct {
         const function_token = self.advance();
         var argument_types: [3]bytecode.ValueType = undefined;
         var argument_count: usize = 0;
-        const allows_bare = builtin == .inkey_string or builtin == .timer or builtin == .rnd or builtin == .erl or builtin == .csrlin;
+        const allows_bare = builtin == .inkey_string or builtin == .timer or builtin == .rnd or builtin == .err or builtin == .erl or builtin == .csrlin;
         if (self.consume(.left_paren)) {
             if (!self.consume(.right_paren)) {
                 while (true) {
@@ -3544,7 +3710,7 @@ const Builder = struct {
             .instr, .mid_string => 2,
             .left_string, .right_string, .string_string, .screen => 2,
             .point => 2,
-            .rnd, .inkey_string, .timer, .erl, .csrlin => 0,
+            .rnd, .inkey_string, .timer, .err, .erl, .csrlin => 0,
             else => 1,
         };
         const expected_max: usize = switch (builtin) {
@@ -3587,7 +3753,7 @@ const Builder = struct {
             .ucase_string,
             => .string,
             .inkey_string => .string,
-            .asc, .cint, .cvi, .csrlin, .instr, .len, .eof, .peek, .point, .pos, .screen, .sgn => .integer,
+            .asc, .cint, .cvi, .csrlin, .err, .instr, .len, .eof, .peek, .point, .pos, .screen, .sgn => .integer,
             .erl => .long,
             .fix, .int => arguments[0],
             .val => .double,
@@ -3648,7 +3814,7 @@ const Builder = struct {
                 }
             },
             .rnd => if (arguments.len == 1 and !arguments[0].isNumeric()) try self.addDiagnostic(.type_mismatch, span),
-            .inkey_string, .timer, .erl, .csrlin => {},
+            .inkey_string, .timer, .err, .erl, .csrlin => {},
         }
         return result;
     }
@@ -3699,11 +3865,11 @@ const Builder = struct {
             return true;
         }
 
-        if (!try self.parseIfArm()) return false;
+        if (!try self.parseInlineIfArm()) return false;
         if (self.consumeKeyword(.else_)) {
             const end_jump = try self.emit(.jump, bytecode.invalid_index, 0, statement.span);
             self.patchJump(false_jump, self.currentIp());
-            if (!try self.parseIfArm()) return false;
+            if (!try self.parseInlineIfArm()) return false;
             self.patchJump(end_jump, self.currentIp());
         } else {
             self.patchJump(false_jump, self.currentIp());
@@ -3717,6 +3883,15 @@ const Builder = struct {
         const label = (try self.expectLabelTarget()) orelse return false;
         const instruction = try self.emit(.jump, bytecode.invalid_index, 0, label.span);
         try self.addLabelFixup(label.span, instruction);
+        return true;
+    }
+
+    fn parseInlineIfArm(self: *Builder) !bool {
+        if (!try self.parseIfArm()) return false;
+        while (self.consume(.colon)) {
+            if (self.atKeyword(.else_) or self.atBoundary()) break;
+            if (!try self.parseBoundStatement(true)) return false;
+        }
         return true;
     }
 
@@ -3799,6 +3974,26 @@ const Builder = struct {
         while (true) {
             const selector = block.control.?;
             try self.emitLoad(selector, statement.span);
+            if (self.consumeKeyword(.is)) {
+                const operator = self.current();
+                const op = comparisonOp(operator.kind) orelse {
+                    try self.addDiagnostic(.expected_token, operator.span);
+                    return false;
+                };
+                _ = self.advance();
+                const comparison_type = (try self.parseExpression()) orelse return false;
+                if (!typesCompatible(selector.value_type, comparison_type)) try self.addDiagnostic(.type_mismatch, statement.span);
+                _ = try self.emit(
+                    op,
+                    bytecode.encodeValueType(comparisonValueType(selector.value_type, comparison_type)),
+                    0,
+                    statement.span,
+                );
+                if (!first_condition) _ = try self.emit(.logical_or, bytecode.encodeValueType(.long), 0, statement.span);
+                first_condition = false;
+                if (!self.consume(.comma)) break;
+                continue;
+            }
             const lower_type = (try self.parseExpression()) orelse return false;
             if (!typesCompatible(selector.value_type, lower_type)) try self.addDiagnostic(.type_mismatch, statement.span);
             if (self.consumeKeyword(.to)) {
@@ -3900,18 +4095,25 @@ const Builder = struct {
 
     fn parseNext(self: *Builder) !bool {
         const statement = self.advance();
-        var block = (try self.popBlock(.for_block, statement.span)) orelse return false;
-        defer block.deinit(self.allocator);
-        if (self.at(.identifier)) {
+        if (!self.at(.identifier)) return self.closeFor(statement.span, null);
+        while (true) {
             const name = self.advance();
-            if (!self.namesEqual(name.span, block.control.?.name)) try self.addDiagnostic(.block_mismatch, name.span);
-            if (self.consume(.comma)) try self.addDiagnostic(.unsupported_core_feature, name.span);
+            if (!try self.closeFor(statement.span, name.span)) return false;
+            if (!self.consume(.comma)) break;
+            if (!self.at(.identifier)) return self.fail(.expected_identifier);
         }
-        try self.emitLoad(block.control.?, statement.span);
-        try self.emitLoad(block.step.?, statement.span);
-        _ = try self.emit(.add, bytecode.encodeValueType(block.control.?.value_type), 0, statement.span);
-        try self.emitStore(block.control.?, false, statement.span);
-        _ = try self.emit(.jump, block.start_ip, 0, statement.span);
+        return true;
+    }
+
+    fn closeFor(self: *Builder, span: frontend.Span, name: ?frontend.Span) !bool {
+        var block = (try self.popBlock(.for_block, span)) orelse return false;
+        defer block.deinit(self.allocator);
+        if (name) |actual| if (!self.namesEqual(actual, block.control.?.name)) try self.addDiagnostic(.block_mismatch, actual);
+        try self.emitLoad(block.control.?, span);
+        try self.emitLoad(block.step.?, span);
+        _ = try self.emit(.add, bytecode.encodeValueType(block.control.?.value_type), 0, span);
+        try self.emitStore(block.control.?, false, span);
+        _ = try self.emit(.jump, block.start_ip, 0, span);
         for (block.exit_jumps.items) |jump| self.patchJump(jump, self.currentIp());
         for (block.end_jumps.items) |jump| self.patchJump(jump, self.currentIp());
         return true;
@@ -4004,6 +4206,14 @@ const Builder = struct {
 
     fn parseExit(self: *Builder) !bool {
         const statement = self.advance();
+        if (self.consumeKeyword(.def)) {
+            if (self.current_procedure == bytecode.invalid_index or self.procedures.items[self.current_procedure].kind != .def_fn) {
+                try self.addDiagnostic(.block_mismatch, statement.span);
+                return false;
+            }
+            _ = try self.emit(.return_procedure, 0, 0, statement.span);
+            return true;
+        }
         if (self.consumeKeyword(.sub)) {
             if (self.current_procedure == bytecode.invalid_index or self.procedures.items[self.current_procedure].kind != .sub) {
                 try self.addDiagnostic(.block_mismatch, statement.span);
@@ -4044,6 +4254,7 @@ const Builder = struct {
         if (self.consumeKeyword(.select)) return self.closeSelect(statement.span);
         if (self.consumeKeyword(.sub)) return self.closeProcedure(.sub, statement.span);
         if (self.consumeKeyword(.function)) return self.closeProcedure(.function, statement.span);
+        if (self.consumeKeyword(.def)) return self.closeProcedure(.def_fn, statement.span);
         _ = try self.emit(.halt, 0, 0, statement.span);
         return true;
     }
@@ -4213,12 +4424,16 @@ const Builder = struct {
         }
         const data_items = try self.data_items.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(data_items);
+        const on_branch_targets = try self.on_branch_targets.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(on_branch_targets);
         const diagnostics = try self.diagnostics.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(diagnostics);
 
         self.labels.deinit(self.allocator);
         self.label_fixups.deinit(self.allocator);
         self.data_fixups.deinit(self.allocator);
+        self.on_branch_fixups.deinit(self.allocator);
+        self.on_branch_targets.deinit(self.allocator);
         self.blocks.deinit(self.allocator);
         self.procedures.deinit(self.allocator);
         self.record_types.deinit(self.allocator);
@@ -4242,6 +4457,7 @@ const Builder = struct {
             .record_types = record_types,
             .common_blocks = common_blocks,
             .data_items = data_items,
+            .on_branch_targets = on_branch_targets,
             .diagnostics = diagnostics,
             .diagnostics_total = self.diagnostics_total,
             .diagnostics_truncated = self.diagnostics_truncated,
@@ -4679,6 +4895,7 @@ fn builtinForKeyword(keyword: frontend.Keyword) ?bytecode.Builtin {
         .ucase_string => .ucase_string,
         .val => .val,
         .eof => .eof,
+        .err => .err,
         .erl => .erl,
         .inkey_string => .inkey_string,
         .point => .point,

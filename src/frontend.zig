@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const contract_version = "2.1.0";
+pub const contract_version = "2.2.0";
 pub const maximum_source_bytes: usize = 256 * 1024;
 pub const maximum_identifier_bytes: usize = 40;
 pub const maximum_expression_depth: usize = 128;
@@ -145,6 +145,7 @@ pub const Keyword = enum(u8) {
     eqv,
     eof,
     erase,
+    err,
     erl,
     error_,
     exit,
@@ -166,6 +167,7 @@ pub const Keyword = enum(u8) {
     instr,
     int,
     integer,
+    is,
     left_string,
     lcase_string,
     lbound,
@@ -229,6 +231,7 @@ pub const Keyword = enum(u8) {
     sqr,
     static,
     step,
+    stop,
     str_string,
     string,
     string_string,
@@ -238,6 +241,8 @@ pub const Keyword = enum(u8) {
     then,
     timer,
     to,
+    troff,
+    tron,
     type,
     ubound,
     ucase_string,
@@ -872,6 +877,7 @@ pub const supported_keyword_entries = [_]KeywordEntry{
     .{ .text = "EQV", .keyword = .eqv },
     .{ .text = "EOF", .keyword = .eof },
     .{ .text = "ERASE", .keyword = .erase },
+    .{ .text = "ERR", .keyword = .err },
     .{ .text = "ERL", .keyword = .erl },
     .{ .text = "ERROR", .keyword = .error_ },
     .{ .text = "EXIT", .keyword = .exit },
@@ -892,6 +898,7 @@ pub const supported_keyword_entries = [_]KeywordEntry{
     .{ .text = "INSTR", .keyword = .instr },
     .{ .text = "INT", .keyword = .int },
     .{ .text = "INTEGER", .keyword = .integer },
+    .{ .text = "IS", .keyword = .is },
     .{ .text = "LEFT$", .keyword = .left_string },
     .{ .text = "LCASE$", .keyword = .lcase_string },
     .{ .text = "LBOUND", .keyword = .lbound },
@@ -955,6 +962,7 @@ pub const supported_keyword_entries = [_]KeywordEntry{
     .{ .text = "SQR", .keyword = .sqr },
     .{ .text = "STATIC", .keyword = .static },
     .{ .text = "STEP", .keyword = .step },
+    .{ .text = "STOP", .keyword = .stop },
     .{ .text = "STR$", .keyword = .str_string },
     .{ .text = "STRING", .keyword = .string },
     .{ .text = "STRING$", .keyword = .string_string },
@@ -964,6 +972,8 @@ pub const supported_keyword_entries = [_]KeywordEntry{
     .{ .text = "THEN", .keyword = .then },
     .{ .text = "TIMER", .keyword = .timer },
     .{ .text = "TO", .keyword = .to },
+    .{ .text = "TROFF", .keyword = .troff },
+    .{ .text = "TRON", .keyword = .tron },
     .{ .text = "TYPE", .keyword = .type },
     .{ .text = "UBOUND", .keyword = .ubound },
     .{ .text = "UCASE$", .keyword = .ucase_string },
@@ -983,15 +993,15 @@ pub const unsupported_keyword_words = [_][]const u8{
     "ACCESS", "ALIAS",    "BINARY",   "BLOAD",   "BSAVE",    "CALLS",
     "CDECL",  "CHAIN",    "CHDIR",    "CHDRIVE", "COM",      "COMMAND$",
     "DATE$",  "DRAW",
-    "ENDIF",  "ENVIRON",  "ENVIRON$", "ERDEV",   "ERDEV$",   "ERR",
+    "ENDIF",  "ENVIRON",  "ENVIRON$", "ERDEV",   "ERDEV$",
     "FIELD",  "FILEATTR", "FILES",    "FRE",     "FREEFILE", "INP",    "IOCTL",
-    "IOCTL$", "IS",       "KEY",      "KILL",    "LIST",     "LOAD",
+    "IOCTL$", "KEY",      "KILL",     "LIST",    "LOAD",
     "LOCAL",  "LOC",      "LOCK",     "LOF",     "LPOS",     "LPRINT",
     "MKDIR",  "NAME",     "OFF",      "OUT",     "PCOPY",    "PEN",
     "PMAP",   "PRESET",   "RANDOM",   "RESET",   "RMDIR",
     "RUN",    "SADD",     "SAVE",     "SEEK",    "SETMEM",   "SHELL",  "SIGNAL",
-    "SOUND",  "STICK",    "STOP",     "STRIG",   "SYSTEM",   "TIME$",
-    "TROFF",  "TRON",     "UEVENT",   "UNLOCK",  "VARPTR",   "VARPTR$",
+    "SOUND",  "STICK",    "STRIG",    "SYSTEM",  "TIME$",
+    "UEVENT", "UNLOCK",   "VARPTR",   "VARPTR$",
     "VARSEG", "WAIT",     "WINDOW",
 };
 

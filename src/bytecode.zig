@@ -1,7 +1,7 @@
 const std = @import("std");
 const frontend = @import("frontend.zig");
 
-pub const contract_version = "2.1.0";
+pub const contract_version = "2.2.0";
 pub const invalid_index: u32 = std.math.maxInt(u32);
 pub const unknown_dimensions: u8 = std.math.maxInt(u8);
 
@@ -79,6 +79,7 @@ pub const Parameter = struct {
     value_type: ValueType,
     record_type: u32 = invalid_index,
     is_array: bool = false,
+    dimensions: u8 = 0,
     accepts_any: bool = false,
     passing_mode: PassingMode,
 };
@@ -187,6 +188,7 @@ pub const OpCode = enum(u8) {
     read_data,
     restore_data,
     set_error_handler,
+    raise_error,
     resume_error,
     resume_next,
     resume_label,
@@ -259,7 +261,12 @@ pub const OpCode = enum(u8) {
     jump_if_false,
     jump_if_true,
     gosub,
+    on_goto,
+    on_gosub,
     return_gosub,
+    trace_on,
+    trace_off,
+    stop,
     pop,
     halt,
 };
@@ -311,6 +318,7 @@ pub const Builtin = enum(u8) {
     ucase_string,
     val,
     eof,
+    err,
     erl,
     inkey_string,
     point,
@@ -457,6 +465,7 @@ pub const Program = struct {
     record_types: []RecordType,
     common_blocks: []CommonBlock,
     data_items: []DataItem,
+    on_branch_targets: []u32 = &.{},
     diagnostics: []Diagnostic,
     diagnostics_total: u32 = 0,
     diagnostics_truncated: bool = false,
@@ -489,6 +498,7 @@ pub const Program = struct {
         self.allocator.free(self.common_blocks);
         self.allocator.free(self.record_types);
         self.allocator.free(self.data_items);
+        self.allocator.free(self.on_branch_targets);
         self.allocator.free(self.procedures);
         self.allocator.free(self.globals);
         self.allocator.free(self.constants);

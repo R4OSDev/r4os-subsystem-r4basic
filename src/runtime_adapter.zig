@@ -177,8 +177,20 @@ pub const Adapter = struct {
                 self.machine.noteInputControl(stamp);
                 break :blk self.makeDelivery(.control, .none, stamp);
             },
-            .key_down => |key| self.deliveryFromVm(self.machine.acceptKeyCode(key.code, stamp), stamp),
-            .text => |text_event| self.deliveryFromVm(self.machine.acceptTextCodepoint(text_event.codepoint, stamp), stamp),
+            .key_down => |key| blk: {
+                if (self.machine.continueStopped()) {
+                    self.machine.noteInputControl(stamp);
+                    break :blk self.makeDelivery(.control, .none, stamp);
+                }
+                break :blk self.deliveryFromVm(self.machine.acceptKeyCode(key.code, stamp), stamp);
+            },
+            .text => |text_event| blk: {
+                if (self.machine.continueStopped()) {
+                    self.machine.noteInputControl(stamp);
+                    break :blk self.makeDelivery(.control, .none, stamp);
+                }
+                break :blk self.deliveryFromVm(self.machine.acceptTextCodepoint(text_event.codepoint, stamp), stamp);
+            },
             .resize => blk: {
                 self.machine.noteInputControl(stamp);
                 break :blk self.makeDelivery(.control, .none, stamp);

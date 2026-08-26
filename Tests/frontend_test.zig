@@ -214,9 +214,9 @@ test "all known keywords use bounded case-insensitive lexical lookup" {
 test "remaining QuickBASIC appendix-E words are reserved" {
     const reference_words = [_][]const u8{
         "SEEK",   "ACCESS",   "ALIAS",   "ENDIF",  "SETMEM",   "SIGNAL",
-        "ERDEV",  "ERDEV$",   "BINARY",  "CALLS",  "FILEATTR", "OFF",    "STOP",
-        "CDECL",  "FREEFILE", "PEN",     "COM",    "PMAP",     "TROFF",
-        "TRON",   "UEVENT",   "VARPTR$", "RESET",  "LIST",     "LOCAL",
+        "ERDEV",  "ERDEV$",   "BINARY",  "CALLS",  "FILEATTR", "OFF",
+        "CDECL",  "FREEFILE", "PEN",     "COM",    "PMAP",
+        "UEVENT", "VARPTR$",  "RESET",   "LIST",   "LOCAL",
         "WINDOW",
     };
     for (reference_words) |word| {
@@ -306,16 +306,14 @@ test "bounded caller storage fails visibly in the lexer" {
     try std.testing.expect(containsLexicalCode(source_result, .source_too_large));
 }
 
-test "lexical success cannot bypass catalog-addressed compiler rejection" {
+test "ERROR is accepted through the sole lexer compiler and binder" {
     const source = "ERROR 5\nEND\n";
     const lexed = frontend.tokenizeNamed("deferred.bas", source, tokens[0..], diagnostics[0..]);
     try std.testing.expect(lexed.ok());
 
     var program = try core.compiler.compile(std.testing.allocator, "deferred.bas", source);
     defer program.deinit();
-    try std.testing.expect(!program.ok());
-    try std.testing.expectEqual(core.bytecode.DiagnosticCode.unsupported_core_feature, program.diagnostics[0].code);
-    try std.testing.expectEqualStrings("QB45-P2-050", program.diagnostics[0].catalog_id);
+    try std.testing.expect(program.ok());
 }
 
 fn containsLexicalDiagnostic(result: frontend.LexResult, expected: ExpectedLexicalDiagnostic) bool {

@@ -6,7 +6,7 @@ const graphics_screen = @import("graphics_screen.zig");
 const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "2.1.0";
+pub const contract_version = "2.2.0";
 pub const default_instruction_budget: u32 = 262_144;
 pub const timer_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
@@ -24,6 +24,7 @@ pub const maximum_file_number: usize = 255;
 pub const random_mask: u32 = 0x00FF_FFFF;
 pub const default_random_seed: u32 = 0x0005_0000;
 pub const numeric_format_buffer_bytes: usize = 128;
+pub const maximum_trace_entries: usize = 256;
 
 pub const MathOperation = enum(u8) {
     atn,
@@ -83,6 +84,8 @@ pub const RuntimeCode = enum(u8) {
     stack_underflow,
     call_depth_exceeded,
     gosub_without_return,
+    raised_error,
+    no_resume,
     invalid_instruction,
     host_failure,
     subscript_out_of_range,
@@ -105,8 +108,10 @@ pub const RuntimeDiagnostic = struct {
     file_name: []const u8,
     span: frontend.Span,
     instruction: u32,
+    error_number: u8 = 0,
 
     pub fn qbasicErrorNumber(self: RuntimeDiagnostic) i32 {
+        if (self.error_number != 0) return self.error_number;
         return switch (self.code) {
             .illegal_function_call, .restricted_memory => 5,
             .overflow => 6,
@@ -116,6 +121,8 @@ pub const RuntimeDiagnostic = struct {
             .subscript_out_of_range => 9,
             .array_already_dimensioned => 10,
             .out_of_data => 4,
+            .gosub_without_return => 3,
+            .no_resume => 19,
             .resume_without_error => 20,
             .bad_file_number => 52,
             .file_not_found => 53,
@@ -125,9 +132,15 @@ pub const RuntimeDiagnostic = struct {
             .bad_file_name => 64,
             .permission_denied => 70,
             .path_file_access => 75,
-            .stack_overflow, .stack_underflow, .call_depth_exceeded, .gosub_without_return, .invalid_instruction, .host_failure => 70,
+            .raised_error => 5,
+            .stack_overflow, .stack_underflow, .call_depth_exceeded, .invalid_instruction, .host_failure => 70,
         };
     }
+};
+
+pub const TraceEntry = struct {
+    instruction: u32 = bytecode.invalid_index,
+    basic_line: u16 = 0,
 };
 
 pub const Status = enum(u8) {
@@ -283,6 +296,8 @@ const ExecutionError = values.Fault || error{
     ArrayAlreadyDimensioned,
     OutOfData,
     ResumeWithoutError,
+    RaisedError,
+    NoResume,
     RestrictedMemory,
     Rethrow,
     WouldBlock,
@@ -734,6 +749,13 @@ pub const Vm = struct {
     statement_stack_base: usize = 0,
     current_statement_start: u32 = bytecode.invalid_index,
     current_statement_next: u32 = bytecode.invalid_index,
+    raised_error_number: u8 = 0,
+    stopped: bool = false,
+    trace_enabled: bool = false,
+    trace_entries: [maximum_trace_entries]TraceEntry = [_]TraceEntry{.{}} ** maximum_trace_entries,
+    trace_head: usize = 0,
+    trace_count: usize = 0,
+    trace_dropped: u64 = 0,
     cancel_requested: bool = false,
 
     pub fn init(
@@ -782,6 +804,31 @@ pub const Vm = struct {
 
     pub fn requestCancel(self: *Vm) void {
         self.cancel_requested = true;
+    }
+
+    pub fn isStopped(self: *const Vm) bool {
+        return self.stopped;
+    }
+
+    pub fn continueStopped(self: *Vm) bool {
+        if (!self.stopped) return false;
+        self.stopped = false;
+        if (self.status == .waiting) self.status = .ready;
+        return true;
+    }
+
+    pub fn traceCount(self: *const Vm) usize {
+        return self.trace_count;
+    }
+
+    pub fn traceDropped(self: *const Vm) u64 {
+        return self.trace_dropped;
+    }
+
+    pub fn traceEntry(self: *const Vm, chronological_index: usize) ?TraceEntry {
+        if (chronological_index >= self.trace_count) return null;
+        const oldest = (self.trace_head + maximum_trace_entries - self.trace_count) % maximum_trace_entries;
+        return self.trace_entries[(oldest + chronological_index) % maximum_trace_entries];
     }
 
     pub fn enableCooperativeTimerPacing(self: *Vm) void {
@@ -1102,6 +1149,13 @@ pub const Vm = struct {
         self.statement_stack_base = 0;
         self.current_statement_start = bytecode.invalid_index;
         self.current_statement_next = bytecode.invalid_index;
+        self.raised_error_number = 0;
+        self.stopped = false;
+        self.trace_enabled = false;
+        self.trace_entries = [_]TraceEntry{.{}} ** maximum_trace_entries;
+        self.trace_head = 0;
+        self.trace_count = 0;
+        self.trace_dropped = 0;
         self.cancel_requested = false;
     }
 
@@ -1120,6 +1174,10 @@ pub const Vm = struct {
             self.status = .cancelled;
             self.exit_code = 130;
             return .{ .status = self.status, .instructions = 0 };
+        }
+        if (self.stopped) {
+            self.status = .waiting;
+            return .{ .status = .waiting, .instructions = 0 };
         }
         self.status = .ready;
         self.wait_wake_ns = 0;
@@ -1150,11 +1208,16 @@ pub const Vm = struct {
                         .wake_guest_ns = self.wait_wake_ns,
                     };
                 }
-                const code = if (fault == error.Rethrow and self.active_error != null)
-                    self.active_error.?.diagnostic.code
+                const diagnostic = if (fault == error.Rethrow and self.active_error != null)
+                    self.active_error.?.diagnostic
                 else
-                    runtimeCode(fault);
-                if (fault != error.Rethrow and self.trapError(code, instruction_index)) {
+                    self.makeDiagnosticNumber(
+                        runtimeCode(fault),
+                        instruction_index,
+                        if (fault == error.RaisedError) self.raised_error_number else 0,
+                    );
+                self.raised_error_number = 0;
+                if (fault != error.Rethrow and self.trapError(diagnostic, instruction_index)) {
                     const group = self.recordOperation(instruction.op);
                     if (group == .text) {
                         self.host_display_requested = true;
@@ -1164,11 +1227,7 @@ pub const Vm = struct {
                     self.total_instructions += 1;
                     continue;
                 }
-                if (fault == error.Rethrow and self.active_error != null) {
-                    self.recordDiagnostic(self.active_error.?.diagnostic);
-                } else {
-                    self.recordError(code, instruction_index);
-                }
+                self.recordDiagnostic(diagnostic);
                 return .{ .status = self.status, .instructions = executed };
             };
             const group = self.recordOperation(instruction.op);
@@ -1179,6 +1238,10 @@ pub const Vm = struct {
             executed += 1;
             self.total_instructions += 1;
             if (self.status == .halted) return .{ .status = .halted, .instructions = executed };
+            if (self.stopped) {
+                self.status = .waiting;
+                return .{ .status = .waiting, .instructions = executed };
+            }
         }
         self.status = .yielded;
         return .{ .status = .yielded, .instructions = executed };
@@ -1391,10 +1454,31 @@ pub const Vm = struct {
             instruction_index +| 1
         else
             metadata.statement_next;
+        if (self.trace_enabled) self.recordTrace(
+            .{
+                .instruction = self.current_statement_start,
+                .basic_line = metadata.basic_line,
+            },
+            if (metadata.basic_line != 0) metadata.basic_line else metadata.span.line,
+        );
         self.statement_stack_base = self.stack.items.len;
         self.active_print_file = null;
         self.print_using_cursor = 0;
         self.write_item_count = 0;
+    }
+
+    fn recordTrace(self: *Vm, entry: TraceEntry, display_line: u32) void {
+        self.trace_entries[self.trace_head] = entry;
+        self.trace_head = (self.trace_head + 1) % maximum_trace_entries;
+        if (self.trace_count < maximum_trace_entries) {
+            self.trace_count += 1;
+        } else {
+            self.trace_dropped +%= 1;
+        }
+        var storage: [16]u8 = undefined;
+        const marker = std.fmt.bufPrint(&storage, "[{d}]", .{display_line}) catch return;
+        self.text.write(marker);
+        self.host_display_requested = true;
     }
 
     fn readInstructionMetadata(self: *Vm, instruction_index: u32) bytecode.InstructionMetadata {
@@ -1455,6 +1539,7 @@ pub const Vm = struct {
             .logical_imp,
             => .arithmetic,
             .set_error_handler,
+            .raise_error,
             .resume_error,
             .resume_next,
             .resume_label,
@@ -1464,7 +1549,12 @@ pub const Vm = struct {
             .jump_if_false,
             .jump_if_true,
             .gosub,
+            .on_goto,
+            .on_gosub,
             .return_gosub,
+            .trace_on,
+            .trace_off,
+            .stop,
             .halt,
             => .control,
             .screen_mode_probe,
@@ -1544,6 +1634,7 @@ pub const Vm = struct {
             .read_data => try self.readData(bytecode.decodeValueType(instruction.a)),
             .restore_data => self.data_pointer = instruction.a,
             .set_error_handler => try self.setErrorHandler(instruction.a),
+            .raise_error => try self.raiseError(),
             .resume_error => try self.resumeError(.retry, 0),
             .resume_next => try self.resumeError(.next, 0),
             .resume_label => try self.resumeError(.label, instruction.a),
@@ -1620,12 +1711,18 @@ pub const Vm = struct {
                 if (try self.popCondition()) self.instruction_pointer = instruction.a;
             },
             .gosub => try self.gosub(instruction.a),
+            .on_goto => try self.onBranch(instruction.a, instruction.b, false),
+            .on_gosub => try self.onBranch(instruction.a, instruction.b, true),
             .return_gosub => try self.returnGosub(instruction.a),
+            .trace_on => self.trace_enabled = true,
+            .trace_off => self.trace_enabled = false,
+            .stop => self.stopped = true,
             .pop => {
                 var item = self.stack.pop() orelse return error.StackUnderflow;
                 item.deinit(self.allocator);
             },
             .halt => {
+                if (self.active_error != null and self.active_error.?.handler_frame == module_frame) return error.NoResume;
                 try self.closeAllFiles();
                 self.status = .halted;
                 self.exit_code = 0;
@@ -2205,6 +2302,15 @@ pub const Vm = struct {
         }
     }
 
+    fn raiseError(self: *Vm) ExecutionError!void {
+        var value = try self.popValue();
+        defer value.deinit(self.allocator);
+        const number = try values.asLong(value);
+        if (number < 1 or number > 255) return error.IllegalFunctionCall;
+        self.raised_error_number = @intCast(number);
+        return error.RaisedError;
+    }
+
     fn resumeError(self: *Vm, mode: ResumeMode, label: u32) ExecutionError!void {
         const active = self.active_error orelse return error.ResumeWithoutError;
         if (active.handler_frame == module_frame) {
@@ -2225,8 +2331,8 @@ pub const Vm = struct {
         self.statement_stack_base = self.stack.items.len;
     }
 
-    fn trapError(self: *Vm, code: RuntimeCode, instruction_index: u32) bool {
-        if (!isCatchable(code)) return false;
+    fn trapError(self: *Vm, diagnostic: RuntimeDiagnostic, instruction_index: u32) bool {
+        if (!isCatchable(diagnostic.code)) return false;
         var handler_frame: u32 = module_frame;
         var handler_ip: u32 = bytecode.invalid_index;
         var search = self.frames.items.len;
@@ -2266,7 +2372,6 @@ pub const Vm = struct {
             _ = self.gosub_stack.pop();
         }
 
-        const diagnostic = self.makeDiagnostic(code, instruction_index);
         self.trapped_diagnostic = diagnostic;
         self.active_error = .{
             .diagnostic = diagnostic,
@@ -3627,6 +3732,9 @@ pub const Vm = struct {
     fn returnProcedure(self: *Vm) ExecutionError!void {
         if (self.frames.items.len == 0) return error.InvalidInstruction;
         const frame_depth = self.frames.items.len;
+        if (self.active_error) |active| {
+            if (active.handler_frame == @as(u32, @intCast(frame_depth - 1))) return error.NoResume;
+        }
         const procedure = self.program.procedures[self.frames.items[frame_depth - 1].procedure_id];
         var return_value: ?values.Value = null;
         if (procedure.returnsValue()) {
@@ -3779,9 +3887,25 @@ pub const Vm = struct {
         self.instruction_pointer = target;
     }
 
+    fn onBranch(self: *Vm, first_target: u32, count: u32, use_gosub: bool) ExecutionError!void {
+        var value = try self.popValue();
+        defer value.deinit(self.allocator);
+        const selection = try values.asLong(value);
+        if (selection < 0 or selection > 255) return error.IllegalFunctionCall;
+        if (selection == 0 or selection > count) return;
+        const target_index = @as(usize, first_target) + @as(usize, @intCast(selection - 1));
+        if (target_index >= self.program.on_branch_targets.len) return error.InvalidInstruction;
+        const target = self.program.on_branch_targets[target_index];
+        if (target >= self.program.instructions.len) return error.InvalidInstruction;
+        if (use_gosub) return self.gosub(target);
+        self.instruction_pointer = target;
+    }
+
     fn returnGosub(self: *Vm, target: u32) ExecutionError!void {
-        const entry = self.gosub_stack.pop() orelse return error.GosubWithoutReturn;
+        if (self.gosub_stack.items.len == 0) return error.GosubWithoutReturn;
+        const entry = self.gosub_stack.items[self.gosub_stack.items.len - 1];
         if (entry.frame_depth != self.frames.items.len) return error.GosubWithoutReturn;
+        _ = self.gosub_stack.pop();
         self.instruction_pointer = if (target == bytecode.invalid_index) entry.return_ip else target;
     }
 
@@ -3862,6 +3986,7 @@ pub const Vm = struct {
             .ucase_string => self.upperString(arguments[0]),
             .val => self.val(arguments[0]),
             .eof => self.endOfFile(arguments[0]),
+            .err => self.errorNumber(),
             .erl => self.errorLine(),
             .inkey_string => self.inkeyString(),
             .rnd => self.randomNumber(arguments),
@@ -3889,6 +4014,11 @@ pub const Vm = struct {
         const diagnostic = self.trapped_diagnostic orelse return .{ .long = 0 };
         if (diagnostic.instruction >= self.program.instruction_metadata.len) return .{ .long = 0 };
         return .{ .long = self.program.instruction_metadata[diagnostic.instruction].basic_line };
+    }
+
+    fn errorNumber(self: *const Vm) values.Value {
+        const diagnostic = self.trapped_diagnostic orelse return .{ .integer = 0 };
+        return .{ .integer = @intCast(diagnostic.qbasicErrorNumber()) };
     }
 
     fn inkeyString(self: *Vm) ExecutionError!values.Value {
@@ -4336,11 +4466,21 @@ pub const Vm = struct {
     }
 
     fn makeDiagnostic(self: *Vm, code: RuntimeCode, instruction: u32) RuntimeDiagnostic {
+        return self.makeDiagnosticNumber(code, instruction, 0);
+    }
+
+    fn makeDiagnosticNumber(self: *Vm, code: RuntimeCode, instruction: u32, error_number: u8) RuntimeDiagnostic {
         const span: frontend.Span = if (instruction < self.program.instructions.len)
             self.readInstructionMetadata(instruction).span
         else
             .{ .start = 0, .end = 0, .line = 1, .column = 1 };
-        return .{ .code = code, .file_name = self.program.fileNameForSpan(span), .span = span, .instruction = instruction };
+        return .{
+            .code = code,
+            .file_name = self.program.fileNameForSpan(span),
+            .span = span,
+            .instruction = instruction,
+            .error_number = error_number,
+        };
     }
 };
 
@@ -4994,6 +5134,8 @@ fn runtimeCode(fault: ExecutionError) RuntimeCode {
         error.ArrayAlreadyDimensioned => .array_already_dimensioned,
         error.OutOfData => .out_of_data,
         error.ResumeWithoutError => .resume_without_error,
+        error.RaisedError => .raised_error,
+        error.NoResume => .no_resume,
         error.RestrictedMemory => .restricted_memory,
         error.BadFileNumber => .bad_file_number,
         error.FileNotFound => .file_not_found,
@@ -5010,8 +5152,8 @@ fn runtimeCode(fault: ExecutionError) RuntimeCode {
 
 fn isCatchable(code: RuntimeCode) bool {
     return switch (code) {
-        .overflow, .division_by_zero, .type_mismatch, .illegal_function_call, .out_of_memory, .subscript_out_of_range, .array_already_dimensioned, .out_of_data, .restricted_memory, .bad_file_number, .file_not_found, .bad_file_mode, .file_already_open, .input_past_end, .bad_file_name, .permission_denied, .path_file_access => true,
-        .stack_overflow, .stack_underflow, .call_depth_exceeded, .gosub_without_return, .invalid_instruction, .host_failure, .resume_without_error => false,
+        .overflow, .division_by_zero, .type_mismatch, .illegal_function_call, .out_of_memory, .gosub_without_return, .raised_error, .subscript_out_of_range, .array_already_dimensioned, .out_of_data, .restricted_memory, .bad_file_number, .file_not_found, .bad_file_mode, .file_already_open, .input_past_end, .bad_file_name, .permission_denied, .path_file_access => true,
+        .stack_overflow, .stack_underflow, .call_depth_exceeded, .invalid_instruction, .host_failure, .no_resume, .resume_without_error => false,
     };
 }
 

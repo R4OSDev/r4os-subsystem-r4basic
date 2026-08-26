@@ -6,7 +6,7 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.70.6
+Stand 0.70.7
 ------------
 
 Diese Ausbaustufe ergaenzt das Vertragsfundament des produktiven R4BASIC-v2-
@@ -19,6 +19,10 @@ gemeinsame QuickBASIC-Formatengine fuer Bildschirm und sequentielle Dateien.
 DEF-Typklassen, OPTION BASE, impliziten/statischen/dynamischen Arrays,
 atomarem REDIM PRESERVE, automatischen/statischen/geteilten Scopes, COMMON
 sowie kanonischen pointerfreien Recordlayouts.
+0.70.7 vervollstaendigt BASIC-Prozedursignaturen, mehrzeiliges DEF FN,
+Multi-NEXT, CASE IS, ON GOTO/GOSUB und die gemeinsame Fehleridentitaet von
+ERROR, ERR, ERL, ON ERROR und RESUME. STOP sowie die begrenzte sichtbare
+TRON/TROFF-Ausgabe sind kooperative Interpreterzustaende.
 Explorer uebergibt eine absolute BAS-Datei ueber `R4SUBSYS1`; das R4X liest
 sie und relative `$INCLUDE`-Quellen durch die Storage-Fassade jeweils exakt
 einmal, baut daraus einen begrenzten Quellgraphen und fuehrt eine getrennte VM in
@@ -167,13 +171,15 @@ Konstanten, Ausdruecke und Vergleiche. IF/ELSEIF/ELSE, SELECT CASE,
 FOR/NEXT, WHILE/WEND, alle vor- und nachgeprueften DO/LOOP-Formen,
 GOTO sowie GOSUB/RETURN besitzen gebundene numerische und benannte Spruenge.
 
-DECLARE, SUB, FUNCTION, explizite und implizite Aufrufe, skalare und
-zusammengesetzte ByRef- sowie skalare ByVal-Parameter und einzeilige
+DECLARE, SUB, FUNCTION, explizite und implizite Aufrufe, dimensionierte
+Array-, Record-, String- und AS-ANY-Signaturen, skalare und zusammengesetzte
+ByRef- sowie skalare ByVal-Parameter und ein- oder mehrzeilige
 DEF-FN-Funktionen verwenden getrennte
 Aufrufrahmen. ByRef-Zellen sind echte Aliase; DEF FN erhaelt eigene
 ByVal-Parameter und sieht entsprechend der vereinbarten BASIC-Semantik die
-Modulvariablen. Rekursive Funktionen behalten lokale Werte und Rueckgaben je
-Rahmen getrennt.
+Modulvariablen. DEF FN unterstuetzt STATIC, EXIT DEF und END DEF, bleibt aber
+wie die Referenz nicht rekursiv. Normale rekursive Funktionen behalten lokale
+Werte und Rueckgaben je Rahmen getrennt.
 
 Automatische Prozedurlokale entstehen fuer jeden Aufruf neu. Ein abschliessendes
 STATIC an SUB/FUNCTION, eine eigenstaendige STATIC-Deklaration oder die
@@ -252,13 +258,23 @@ dabei keine Gleitkommakonvertierung.
 Fehlerfluss und privates Kompatibilitaetsgeraet
 -----------------------------------------------
 
-ON ERROR GOTO, ON ERROR GOTO 0, RESUME und RESUME NEXT besitzen
+ERROR, ERR, ERL, ON ERROR GOTO, ON ERROR GOTO 0, RESUME, RESUME NEXT und
+RESUME zu numerischen oder benannten Zielen besitzen
 instanzlokalen Zustand. Jede Bytecode-Instruktion kennt Anfang und Nachfolger
 ihres BASIC-Statements sowie die letzte numerische Programmzeile. ERL liest
 diese unveraenderliche Identitaet aus dem zuletzt gefangenen Fehler. RESUME
 baut deshalb auch bei mehreren
 Operandeninstruktionen das ganze fehlerhafte Statement neu auf; RESUME NEXT
-springt exakt dahinter. Ein unbehandelter Fehler beendet nur seine VM.
+springt exakt dahinter. Zweite Fehler ueberspringen aktive Handler und
+propagieren ueber Aufrufrahmen. Fehler 3, 19 und 20 sind explizit und alle
+Pruefungen geschehen vor Stapelmutation. Ein unbehandelter Fehler beendet nur
+seine VM.
+
+STOP setzt die VM ereignisbasiert auf waiting. Die erste produktive
+Tasten-/Texteingabe wird als Fortsetzungssteuerung verbraucht; Close und
+Cancellation behalten Vorrang. TRON schreibt sichtbare Zeilenmarker und
+haelt parallel hoechstens 256 Statementidentitaeten in einem Ring, TROFF
+beendet beides. Reset leert Pause und Trace.
 
 Die SCREEN-Modusabfrage ist als injizierbarer Hostaufruf vorhanden. Ein nicht
 verfuegbarer Modus erzeugt BASIC-Fehler 5, ohne den bisherigen Bildschirm zu
@@ -565,6 +581,11 @@ Nichtenddimensionen und erzwungenes Allocator-OOM lassen die alte Belegung
 unveraendert. Rekursion, wiederholte Aufrufe, Reset und zwei gleichzeitige VMs
 belegen automatische, statische, SHARED- und COMMON-Lebenszeiten; verschachtelte
 TYPEs und LSET werden gegen exakte Gastbytes abgenommen.
+Die 0.70.7-Vektoren pruefen vollstaendige BASIC-Signaturen, ByRef-Klammern,
+dimensionierte Arrays, Records, feste Stringtemporaere, Rekursion, STATIC und
+mehrzeiliges DEF FN. Hinzu kommen Multi-NEXT, CASE IS, Inline-IF-Arme,
+ON-GOTO/GOSUB, verschachtelte Fehler 3/19/20/42/43 sowie kooperatives
+STOP/Trace mit Hostfortsetzung, Reset, Cancellation und Ringbegrenzung.
 Zusaetzlich werden exakte Laufzeitpositionen und Fehlernummern, Rekursion,
 verschachteltes ByRef, Hostfehler, Reset, Nullbudget-Abbruch, Fokus- und
 Instanztrennung, pausierte Wartezeit, Fensterereignisse waehrend SLEEP,
@@ -627,8 +648,7 @@ Noch offene v2-Bereiche
 -----------------------
 
 Der Interpretervertrag zielt auf die vollstaendige QuickBASIC-4.5-Sprache
-und -Laufzeit. Nach 0.70.6 folgen insbesondere Prozedur-/Fehlerfluss,
-Random-/Binary-Dateien,
+und -Laufzeit. Nach 0.70.7 folgen insbesondere Random-/Binary-Dateien,
 Plattformoperationen, weitere Grafikmodi und -primitive, Audio/Ereignisse
 sowie die private sichere Abbildung historischer Geraete- und
 Fremdcodeoberflaechen. IDE, Debugger, nativer Compiler, Linker und Editor sind

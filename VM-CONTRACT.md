@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 execution foundation
 
-Contract version: `2.2.0`
+Contract version: `2.3.0`
 
 This document freezes the executable R4BASIC foundation and its non-regression
 invariants while the complete v2 target in `COMPATIBILITY.md` and
@@ -184,16 +184,20 @@ The VM executes:
   or declaration-level `STATIC`/`SHARED`, `COMMON`, `REDIM [PRESERVE]`,
   `ERASE`, `TYPE`, qualified and whole-record assignment, `LSET`, `RSET`,
   `SWAP`, `CLEAR`, `DATA`, `READ`, and `RESTORE`;
-- block and single-line `IF`, `ELSEIF`, and `ELSE`;
-- `SELECT CASE`, comma alternatives, inclusive `TO` ranges, and `CASE ELSE`;
-- positive, negative, and zero-step `FOR`/`NEXT`, including `EXIT FOR`;
+- block and multi-statement single-line `IF`, `ELSEIF`, and `ELSE`;
+- `SELECT CASE`, comma alternatives, inclusive `TO` ranges, `CASE IS`, and `CASE ELSE`;
+- positive, negative, and zero-step `FOR`/`NEXT`, including variable lists and `EXIT FOR`;
 - `WHILE`/`WEND`;
 - unconditional, leading-`WHILE`, leading-`UNTIL`, trailing-`WHILE`, and
   trailing-`UNTIL` `DO`/`LOOP`, including `EXIT DO`;
 - numeric or named `GOTO`/`GOSUB`, plain `RETURN`, and `RETURN` to a numeric
   or named label;
+- indexed `ON GOTO` and `ON GOSUB` with at most 60 compile-resolved numeric
+  or named targets;
 - numeric or named `ON ERROR GOTO`, `ON ERROR GOTO 0`, `RESUME`, `RESUME
-  NEXT`, and `RESUME` to a numeric or named label;
+  NEXT`, and `RESUME` to a numeric or named label; `ERROR` raises an exact
+  number from 1 through 255 through the same handler path;
+- cooperative `STOP` plus `TRON` and `TROFF`;
 - the restricted `DEF SEG`, `PEEK`, and `POKE` compatibility device;
 - `SCREEN 0`, 80-column `WIDTH`, `COLOR`, `CLS`, `LOCATE`, and
   `VIEW PRINT` on the private text screen;
@@ -221,7 +225,8 @@ partially changing the queue or persistent music settings.
   storage; an expression uses a converted temporary as QuickBASIC does.
   `BYVAL` always copies and converts a scalar value.
 - Whole arrays use the required empty-parentheses call syntax and are passed
-  ByRef. Declaration-side `AS ANY` suppresses only the element-type check;
+  ByRef. A declaration may fix their expected dimension count.
+  Declaration-side `AS ANY` suppresses only the element-type check;
   the concrete SUB or FUNCTION definition still fixes the runtime type.
   Records and scalar array elements are real aliases rather than copies.
 - Every call owns a separate frame, local values, return address, and stack
@@ -236,8 +241,10 @@ partially changing the queue or persistent music settings.
 - Functions own a typed return cell addressed by their function name.
   `EXIT SUB` and `EXIT FUNCTION` return immediately through the same frame
   teardown path as the matching terminator.
-- One-line `DEF FN` parameters are always ByVal. The body can read module
-  variables and returns the declared or inferred function type.
+- One-line and multiline `DEF FN` parameters are always ByVal. The body can
+  read module variables, may own static locals, supports `EXIT DEF`/`END DEF`,
+  and returns the declared or inferred function type. DEF-FN recursion is a
+  compile diagnostic.
 - GOSUB return addresses use a separate, frame-aware stack with a maximum
   depth of 1,024.
 
@@ -245,14 +252,14 @@ partially changing the queue or persistent music settings.
 
 The executable built-ins include `ABS`, `ASC`, `ATN`, `CDBL`, `CHR$`,
 `CINT`, `CLNG`, `COS`, `CSNG`, `CSRLIN`, all IEEE/MBF `CV*` and `MK*`
-conversions, `EOF`, `ERL`, `EXP`, `FIX`, `HEX$`, `INKEY$`, `INPUT$`,
+conversions, `EOF`, `ERR`, `ERL`, `EXP`, `FIX`, `HEX$`, `INKEY$`, `INPUT$`,
 `INSTR`, `INT`, `LCASE$`, `LEFT$`, `LEN`, `LOG`, `LTRIM$`, `MID$`, `OCT$`,
 coordinate `POINT`, `POS`, `RIGHT$`, `RND`, `RTRIM$`, text-query `SCREEN`,
 `SGN`, `SIN`, `SPACE$`, `SQR`, `STR$`, `STRING$`, `TAN`, `TIMER`, `UCASE$`,
 and `VAL` with the arities and type categories defined by the source
 contract.
 
-`ERL` returns the latest numbered line preceding the trapped instruction, or
+`ERR` returns the exact trapped QuickBASIC number. `ERL` returns the latest numbered line preceding the trapped instruction, or
 zero when no numbered line precedes it. Its identity comes from immutable
 instruction metadata and therefore also survives nested `$INCLUDE` sources.
 
@@ -506,6 +513,10 @@ guest address can become an R4OS or host pointer.
 - A handler is inactive until `ON ERROR GOTO` executes and cannot catch a
   second error while it is already handling one. `ON ERROR GOTO 0` disables
   it; inside the active handler it rethrows the original fault.
+- A second error skips an already active handler and propagates through parent
+  call frames. Returning from an active handler without `RESUME` is error 19;
+  `RETURN` without a matching frame is catchable error 3 and `RESUME` without
+  an active error is error 20. Validation precedes stack/frame mutation.
 - The trapped source diagnostic remains observable for tests, but only an
   unhandled fault changes the VM to terminal `runtime_error`.
 
@@ -515,6 +526,12 @@ guest address can become an R4OS or host pointer.
   returns `yielded` when work remains. Scheduled execution combines adaptive
   bounded VM chunks into one GuestDriver step until the shared budget, the
   8-ms limit, a guest wait, cancellation, or a terminal state is reached.
+- `STOP` returns an event-only `waiting` state without consuming more guest
+  instructions. The first productive key/text event continues execution and
+  is consumed as a host control event; Close/cancellation still wins. Reset
+  clears the pause. `TRON` writes visible line markers and records statement
+  identities in a fixed 256-entry ring with an overwrite/drop counter;
+  `TROFF` disables both paths without changing slice accounting.
 - The directly set cancellation flag is checked before the first instruction
   and between every instruction, including for a zero budget. The injected
   host callback is checked once at each `runSlice`/adaptive-block boundary.
