@@ -159,6 +159,50 @@ test "keyword matching preserves the original source spelling" {
     try std.testing.expectEqualStrings("DeFiNt", tokens[0].text(source));
 }
 
+test "all supported and unsupported keywords use bounded case-insensitive lookup" {
+    const allocator = std.testing.allocator;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(allocator);
+
+    for (frontend.supported_keyword_entries, 0..) |entry, entry_index| {
+        for (entry.text, 0..) |byte, byte_index| {
+            const mixed = if ((entry_index + byte_index) % 2 == 0) std.ascii.toLower(byte) else std.ascii.toUpper(byte);
+            try source.append(allocator, mixed);
+        }
+        try source.append(allocator, ' ');
+    }
+    for (frontend.unsupported_keyword_words, 0..) |word, entry_index| {
+        for (word, 0..) |byte, byte_index| {
+            const mixed = if ((entry_index + byte_index) % 2 == 0) std.ascii.toUpper(byte) else std.ascii.toLower(byte);
+            try source.append(allocator, mixed);
+        }
+        try source.append(allocator, ' ');
+    }
+    try source.appendSlice(allocator, "NotAKeyword123\n");
+
+    const result = frontend.tokenizeNamed("keywords.bas", source.items, tokens[0..], diagnostics[0..]);
+    try std.testing.expect(!result.cancelled);
+    try std.testing.expectEqual(
+        @as(u64, frontend.supported_keyword_entries.len + frontend.unsupported_keyword_words.len + 1),
+        result.keyword_lookups,
+    );
+    try std.testing.expect(result.keyword_max_probe <= frontend.keyword_lookup_probe_bound);
+    try std.testing.expect(result.keyword_probes <= result.keyword_lookups * frontend.keyword_lookup_probe_bound);
+
+    var token_index: usize = 0;
+    for (frontend.supported_keyword_entries) |entry| {
+        try std.testing.expectEqual(frontend.TokenKind.keyword, tokens[token_index].kind);
+        try std.testing.expectEqual(entry.keyword, tokens[token_index].keyword);
+        token_index += 1;
+    }
+    for (frontend.unsupported_keyword_words) |_| {
+        try std.testing.expectEqual(frontend.TokenKind.keyword, tokens[token_index].kind);
+        try std.testing.expectEqual(frontend.Keyword.unsupported, tokens[token_index].keyword);
+        token_index += 1;
+    }
+    try std.testing.expectEqual(frontend.TokenKind.identifier, tokens[token_index].kind);
+}
+
 test "diagnostics retain exact file line column and byte span" {
     const source = "PRINT @\r\nPRINT 1\r\n";
     const result = frontend.analyzeNamed("position.bas", source, tokens[0..], diagnostics[0..]);

@@ -12,6 +12,27 @@ pub const maximum_array_dimensions: usize = 60;
 pub const maximum_record_types: usize = 4_096;
 pub const maximum_record_fields: usize = 4_096;
 
+pub const CompilePhase = enum(u8) {
+    lexical,
+    binding,
+    resolution,
+};
+
+pub const CompileProgress = struct {
+    phase: CompilePhase,
+    completed: usize,
+    total: usize,
+};
+
+pub const CompileObserver = struct {
+    context: *anyopaque,
+    update_fn: *const fn (context: *anyopaque, progress: CompileProgress) bool,
+
+    fn update(self: CompileObserver, progress: CompileProgress) bool {
+        return self.update_fn(self.context, progress);
+    }
+};
+
 const ScopeStorage = enum(u8) {
     global,
     local,
@@ -26,6 +47,15 @@ const VariableReference = struct {
     is_dynamic: bool,
     is_constant: bool,
     name: frontend.Span,
+};
+
+const VariableLookup = struct {
+    reference: ?VariableReference = null,
+    visible: bool = false,
+};
+
+const ScalarAlias = struct {
+    reference: ?VariableReference = null,
 };
 
 const BoundType = struct {
@@ -46,11 +76,142 @@ const BoundLvalue = struct {
     is_constant: bool = false,
 };
 
+const NameIndex = struct {
+    const Slot = struct {
+        hash: u64 = 0,
+        scope: u32 = 0,
+        name: frontend.Span = .{ .start = 0, .end = 0, .line = 0, .column = 0 },
+        value: u32 = 0,
+        occupied: bool = false,
+    };
+
+    slots: []Slot = &.{},
+    count: usize = 0,
+
+    fn deinit(self: *NameIndex, allocator: std.mem.Allocator) void {
+        if (self.slots.len != 0) allocator.free(self.slots);
+        self.* = .{};
+    }
+
+    fn clearRetainingCapacity(self: *NameIndex) void {
+        @memset(self.slots, .{});
+        self.count = 0;
+    }
+
+    fn lookup(
+        self: *const NameIndex,
+        source: []const u8,
+        scope: u32,
+        name: frontend.Span,
+        stats: *bytecode.CompileStats,
+    ) ?u32 {
+        stats.name_lookups +%= 1;
+        if (self.slots.len == 0) return null;
+        const hash = nameHash(source, scope, name);
+        var slot_index: usize = @intCast(hash & (self.slots.len - 1));
+        var probe: usize = 1;
+        while (probe <= self.slots.len) : (probe += 1) {
+            recordNameProbe(stats, probe);
+            const slot = self.slots[slot_index];
+            if (!slot.occupied) return null;
+            if (slot.hash == hash and slot.scope == scope and namesEqualIn(source, slot.name, name)) return slot.value;
+            slot_index = (slot_index + 1) & (self.slots.len - 1);
+        }
+        return null;
+    }
+
+    fn insert(
+        self: *NameIndex,
+        allocator: std.mem.Allocator,
+        source: []const u8,
+        scope: u32,
+        name: frontend.Span,
+        value: u32,
+        stats: *bytecode.CompileStats,
+    ) !void {
+        try self.ensureCapacity(allocator, stats);
+        stats.name_insertions +%= 1;
+        const hash = nameHash(source, scope, name);
+        var slot_index: usize = @intCast(hash & (self.slots.len - 1));
+        var probe: usize = 1;
+        while (probe <= self.slots.len) : (probe += 1) {
+            recordNameProbe(stats, probe);
+            const slot = &self.slots[slot_index];
+            if (!slot.occupied) {
+                slot.* = .{ .hash = hash, .scope = scope, .name = name, .value = value, .occupied = true };
+                self.count += 1;
+                return;
+            }
+            if (slot.hash == hash and slot.scope == scope and namesEqualIn(source, slot.name, name)) return;
+            slot_index = (slot_index + 1) & (self.slots.len - 1);
+        }
+        unreachable;
+    }
+
+    fn remove(self: *NameIndex, source: []const u8, scope: u32, name: frontend.Span) void {
+        if (self.slots.len == 0) return;
+        const hash = nameHash(source, scope, name);
+        var slot_index: usize = @intCast(hash & (self.slots.len - 1));
+        while (self.slots[slot_index].occupied) : (slot_index = (slot_index + 1) & (self.slots.len - 1)) {
+            const slot = self.slots[slot_index];
+            if (slot.hash != hash or slot.scope != scope or !namesEqualIn(source, slot.name, name)) continue;
+            self.slots[slot_index] = .{};
+            self.count -= 1;
+            var next = (slot_index + 1) & (self.slots.len - 1);
+            while (self.slots[next].occupied) : (next = (next + 1) & (self.slots.len - 1)) {
+                const displaced = self.slots[next];
+                self.slots[next] = .{};
+                self.count -= 1;
+                insertRehashed(self.slots, displaced);
+                self.count += 1;
+            }
+            return;
+        }
+    }
+
+    fn ensureCapacity(self: *NameIndex, allocator: std.mem.Allocator, stats: *bytecode.CompileStats) !void {
+        if (self.slots.len != 0 and (self.count + 1) * 10 <= self.slots.len * 7) return;
+        const new_capacity: usize = if (self.slots.len == 0) 16 else self.slots.len * 2;
+        const replacement = try allocator.alloc(Slot, new_capacity);
+        @memset(replacement, .{});
+        for (self.slots) |slot| if (slot.occupied) insertRehashed(replacement, slot);
+        if (self.slots.len != 0) allocator.free(self.slots);
+        self.slots = replacement;
+        stats.index_rebuilds +%= 1;
+    }
+
+    fn insertRehashed(slots: []Slot, entry: Slot) void {
+        var slot_index: usize = @intCast(entry.hash & (slots.len - 1));
+        while (slots[slot_index].occupied) slot_index = (slot_index + 1) & (slots.len - 1);
+        slots[slot_index] = entry;
+    }
+};
+
+fn nameHash(source: []const u8, scope: u32, name: frontend.Span) u64 {
+    var hash: u64 = 14_695_981_039_346_656_037 ^ @as(u64, scope);
+    for (name.bytes(source)) |byte| {
+        hash ^= std.ascii.toUpper(byte);
+        hash *%= 1_099_511_628_211;
+    }
+    return hash;
+}
+
+fn namesEqualIn(source: []const u8, first: frontend.Span, second: frontend.Span) bool {
+    return std.ascii.eqlIgnoreCase(first.bytes(source), second.bytes(source));
+}
+
+fn recordNameProbe(stats: *bytecode.CompileStats, probe: usize) void {
+    stats.name_probes +%= 1;
+    stats.name_max_probe = @max(stats.name_max_probe, @as(u16, @intCast(@min(probe, std.math.maxInt(u16)))));
+}
+
 const RecordTypeBuilder = struct {
     name: frontend.Span,
     fields: std.ArrayList(bytecode.RecordField) = .empty,
+    field_names: NameIndex = .{},
 
     fn deinit(self: *RecordTypeBuilder, allocator: std.mem.Allocator) void {
+        self.field_names.deinit(allocator);
         self.fields.deinit(allocator);
     }
 };
@@ -67,8 +228,10 @@ const ProcedureBuilder = struct {
     called: bool = false,
     locals: std.ArrayList(bytecode.Variable) = .empty,
     parameters: std.ArrayList(bytecode.Parameter) = .empty,
+    local_names: NameIndex = .{},
 
     fn deinit(self: *ProcedureBuilder, allocator: std.mem.Allocator) void {
+        self.local_names.deinit(allocator);
         self.locals.deinit(allocator);
         self.parameters.deinit(allocator);
     }
@@ -139,6 +302,14 @@ const Builder = struct {
     label_fixups: std.ArrayList(LabelFixup) = .empty,
     data_fixups: std.ArrayList(DataFixup) = .empty,
     blocks: std.ArrayList(Block) = .empty,
+    global_names: NameIndex = .{},
+    procedure_names: NameIndex = .{},
+    record_names: NameIndex = .{},
+    label_names: NameIndex = .{},
+    stats: bytecode.CompileStats = .{},
+    observer: ?CompileObserver = null,
+    next_binding_progress: usize = 0,
+    cancelled: bool = false,
     default_types: [26]bytecode.ValueType = [_]bytecode.ValueType{.single} ** 26,
     current_procedure: u32 = bytecode.invalid_index,
     current_procedure_skip: u32 = bytecode.invalid_index,
@@ -160,11 +331,16 @@ const Builder = struct {
         self.label_fixups.deinit(self.allocator);
         self.data_fixups.deinit(self.allocator);
         self.blocks.deinit(self.allocator);
+        self.global_names.deinit(self.allocator);
+        self.procedure_names.deinit(self.allocator);
+        self.record_names.deinit(self.allocator);
+        self.label_names.deinit(self.allocator);
         self.allocator.free(self.source);
         self.allocator.free(self.file_name);
     }
 
     fn parse(self: *Builder) !void {
+        if (!self.reportProgress(.binding, 0, self.tokens.len)) return error.Cancelled;
         while (!self.at(.eof) and !self.stopped) {
             if (self.consume(.newline) or self.consume(.colon)) continue;
             if (self.at(.metacommand)) {
@@ -186,6 +362,7 @@ const Builder = struct {
                 try self.addDiagnostic(.unexpected_token, self.current().span);
                 self.synchronize();
             }
+            if (self.cancelled) return error.Cancelled;
         }
 
         if (self.current_procedure != bytecode.invalid_index) {
@@ -199,8 +376,12 @@ const Builder = struct {
         if (self.instructions.items.len == 0 or self.instructions.items[self.instructions.items.len - 1].op != .halt) {
             _ = try self.emit(.halt, 0, 0, self.current().span);
         }
-        try self.resolveLabels();
-        try self.resolveDataFixups();
+        if (!self.reportProgress(.binding, self.tokens.len, self.tokens.len)) return error.Cancelled;
+        const fixup_total = self.label_fixups.items.len + self.data_fixups.items.len;
+        if (!self.reportProgress(.resolution, 0, fixup_total)) return error.Cancelled;
+        try self.resolveLabels(fixup_total);
+        try self.resolveDataFixups(fixup_total);
+        if (!self.reportProgress(.resolution, fixup_total, fixup_total)) return error.Cancelled;
         for (self.procedures.items) |procedure| {
             if (procedure.called and !procedure.defined) try self.addDiagnostic(.unknown_procedure, procedure.name);
         }
@@ -288,7 +469,7 @@ const Builder = struct {
     }
 
     fn namesEqual(self: Builder, first: frontend.Span, second: frontend.Span) bool {
-        return std.ascii.eqlIgnoreCase(first.bytes(self.source), second.bytes(self.source));
+        return namesEqualIn(self.source, first, second);
     }
 
     fn suffixType(self: Builder, span: frontend.Span) ?bytecode.ValueType {
@@ -340,34 +521,22 @@ const Builder = struct {
         return result;
     }
 
-    fn findRecordType(self: Builder, name: frontend.Span) ?u32 {
-        for (self.record_types.items, 0..) |record_type, index| {
-            if (self.namesEqual(record_type.name, name)) return @intCast(index);
-        }
-        return null;
+    fn findRecordType(self: *Builder, name: frontend.Span) ?u32 {
+        return self.record_names.lookup(self.source, 0, name, &self.stats);
     }
 
-    fn findRecordField(self: Builder, record_type: u32, name: frontend.Span) ?u32 {
+    fn findRecordField(self: *Builder, record_type: u32, name: frontend.Span) ?u32 {
         if (record_type >= self.record_types.items.len) return null;
-        for (self.record_types.items[record_type].fields.items, 0..) |field, index| {
-            if (self.namesEqual(field.name, name)) return @intCast(index);
-        }
-        return null;
+        return self.record_types.items[record_type].field_names.lookup(self.source, 0, name, &self.stats);
     }
 
-    fn findGlobal(self: Builder, name: frontend.Span) ?u32 {
-        for (self.globals.items, 0..) |variable, index| {
-            if (!variable.hidden and self.namesEqual(variable.name, name)) return @intCast(index);
-        }
-        return null;
+    fn findGlobal(self: *Builder, name: frontend.Span) ?u32 {
+        return self.global_names.lookup(self.source, 0, name, &self.stats);
     }
 
-    fn findLocal(self: Builder, procedure_id: u32, name: frontend.Span) ?u32 {
+    fn findLocal(self: *Builder, procedure_id: u32, name: frontend.Span) ?u32 {
         if (procedure_id == bytecode.invalid_index) return null;
-        for (self.procedures.items[procedure_id].locals.items, 0..) |variable, index| {
-            if (!variable.hidden and self.namesEqual(variable.name, name)) return @intCast(index);
-        }
-        return null;
+        return self.procedures.items[procedure_id].local_names.lookup(self.source, 0, name, &self.stats);
     }
 
     fn variableReference(self: Builder, storage: ScopeStorage, index: u32) VariableReference {
@@ -410,6 +579,26 @@ const Builder = struct {
         return self.variableReference(.global, global_index);
     }
 
+    fn inspectVariable(self: *Builder, name: frontend.Span) VariableLookup {
+        var local_index: ?u32 = null;
+        if (self.current_procedure != bytecode.invalid_index) local_index = self.findLocal(self.current_procedure, name);
+        const global_index = self.findGlobal(name);
+        if (local_index) |index| return .{ .reference = self.variableReference(.local, index), .visible = true };
+        if (global_index) |index| {
+            if (self.current_procedure == bytecode.invalid_index) return .{ .reference = self.variableReference(.global, index), .visible = true };
+            const global = self.globals.items[index];
+            const procedure = self.procedures.items[self.current_procedure];
+            return .{
+                .reference = if (procedure.kind == .def_fn or global.is_shared or global.is_constant)
+                    self.variableReference(.global, index)
+                else
+                    null,
+                .visible = true,
+            };
+        }
+        return .{};
+    }
+
     fn addGlobal(self: *Builder, variable: bytecode.Variable) !u32 {
         if (self.globals.items.len >= maximum_variables_per_scope) {
             try self.addDiagnostic(.capacity_exceeded, variable.name);
@@ -418,6 +607,7 @@ const Builder = struct {
         }
         const index: u32 = @intCast(self.globals.items.len);
         try self.globals.append(self.allocator, variable);
+        if (!variable.hidden) try self.global_names.insert(self.allocator, self.source, 0, variable.name, index, &self.stats);
         return index;
     }
 
@@ -430,6 +620,7 @@ const Builder = struct {
         }
         const index: u32 = @intCast(procedure.locals.items.len);
         try procedure.locals.append(self.allocator, variable);
+        if (!variable.hidden) try procedure.local_names.insert(self.allocator, self.source, 0, variable.name, index, &self.stats);
         return index;
     }
 
@@ -464,11 +655,8 @@ const Builder = struct {
         _ = try self.emit(if (variable.storage == .global) .push_global_reference else .push_local_reference, variable.index, 0, span);
     }
 
-    fn findProcedure(self: Builder, name: frontend.Span) ?u32 {
-        for (self.procedures.items, 0..) |procedure, index| {
-            if (self.namesEqual(procedure.name, name)) return @intCast(index);
-        }
-        return null;
+    fn findProcedure(self: *Builder, name: frontend.Span) ?u32 {
+        return self.procedure_names.lookup(self.source, 0, name, &self.stats);
     }
 
     fn addProcedure(self: *Builder, name: frontend.Span, kind: bytecode.ProcedureKind) !u32 {
@@ -483,24 +671,26 @@ const Builder = struct {
             .kind = kind,
             .return_type = if (kind == .sub) .single else self.inferredType(name),
         });
+        try self.procedure_names.insert(self.allocator, self.source, 0, name, index, &self.stats);
         return index;
     }
 
     fn defineLabel(self: *Builder) !void {
         const name = self.advance().span;
         _ = self.advance();
-        for (self.labels.items) |label| {
-            if (label.procedure == self.currentScope() and self.namesEqual(label.name, name)) {
-                try self.addDiagnostic(.duplicate_symbol, name);
-                return;
-            }
+        const scope = self.currentScope();
+        if (self.label_names.lookup(self.source, scope, name, &self.stats) != null) {
+            try self.addDiagnostic(.duplicate_symbol, name);
+            return;
         }
+        const label_index: u32 = @intCast(self.labels.items.len);
         try self.labels.append(self.allocator, .{
             .name = name,
-            .procedure = self.currentScope(),
+            .procedure = scope,
             .instruction = self.currentIp(),
             .data_index = @intCast(self.data_items.items.len),
         });
+        try self.label_names.insert(self.allocator, self.source, scope, name, label_index, &self.stats);
     }
 
     fn addLabelFixup(self: *Builder, name: frontend.Span, instruction: u32) !void {
@@ -511,34 +701,23 @@ const Builder = struct {
         });
     }
 
-    fn resolveLabels(self: *Builder) !void {
-        for (self.label_fixups.items) |fixup| {
-            var target: ?u32 = null;
-            for (self.labels.items) |label| {
-                if (label.procedure == fixup.procedure and self.namesEqual(label.name, fixup.name)) {
-                    target = label.instruction;
-                    break;
-                }
-            }
-            if (target) |instruction| {
-                self.patchJump(fixup.instruction, instruction);
+    fn resolveLabels(self: *Builder, total: usize) !void {
+        for (self.label_fixups.items, 0..) |fixup, index| {
+            if (index != 0 and index % 256 == 0 and !self.reportProgress(.resolution, index, total)) return error.Cancelled;
+            if (self.label_names.lookup(self.source, fixup.procedure, fixup.name, &self.stats)) |label_index| {
+                self.patchJump(fixup.instruction, self.labels.items[label_index].instruction);
             } else {
                 try self.addDiagnostic(.unknown_label, fixup.name);
             }
         }
     }
 
-    fn resolveDataFixups(self: *Builder) !void {
-        for (self.data_fixups.items) |fixup| {
-            var target: ?u32 = null;
-            for (self.labels.items) |label| {
-                if (label.procedure == bytecode.invalid_index and self.namesEqual(label.name, fixup.name)) {
-                    target = label.data_index;
-                    break;
-                }
-            }
-            if (target) |data_index| {
-                self.instructions.items[fixup.instruction].a = data_index;
+    fn resolveDataFixups(self: *Builder, total: usize) !void {
+        const base = self.label_fixups.items.len;
+        for (self.data_fixups.items, 0..) |fixup, index| {
+            if (index != 0 and index % 256 == 0 and !self.reportProgress(.resolution, base + index, total)) return error.Cancelled;
+            if (self.label_names.lookup(self.source, bytecode.invalid_index, fixup.name, &self.stats)) |label_index| {
+                self.instructions.items[fixup.instruction].a = self.labels.items[label_index].data_index;
             } else {
                 try self.addDiagnostic(.unknown_label, fixup.name);
             }
@@ -763,7 +942,9 @@ const Builder = struct {
         }
         const record_index: u32 = @intCast(self.record_types.items.len);
         try self.record_types.append(self.allocator, .{ .name = name.span });
+        try self.record_names.insert(self.allocator, self.source, 0, name.span, record_index, &self.stats);
         errdefer {
+            self.record_names.remove(self.source, 0, name.span);
             var record_type = self.record_types.pop().?;
             record_type.deinit(self.allocator);
         }
@@ -787,13 +968,11 @@ const Builder = struct {
                 try self.addDiagnostic(.capacity_exceeded, field_name.span);
                 return false;
             }
-            for (record_type.fields.items) |field| {
-                if (self.namesEqual(field.name, field_name.span)) {
-                    try self.addDiagnostic(.duplicate_symbol, field_name.span);
-                    break;
-                }
-            }
+            if (record_type.field_names.lookup(self.source, 0, field_name.span, &self.stats) != null)
+                try self.addDiagnostic(.duplicate_symbol, field_name.span);
+            const field_index: u32 = @intCast(record_type.fields.items.len);
             try record_type.fields.append(self.allocator, .{ .name = field_name.span, .value_type = field_type.value_type });
+            try record_type.field_names.insert(self.allocator, self.source, 0, field_name.span, field_index, &self.stats);
             if (!self.atBoundary()) return self.fail(.unexpected_token);
             while (self.consume(.newline) or self.consume(.colon)) {}
         }
@@ -1392,6 +1571,7 @@ const Builder = struct {
         const declared_types = try self.copyParameterSignature(procedure.parameters.items);
         defer self.allocator.free(declared_types);
         procedure.locals.clearRetainingCapacity();
+        procedure.local_names.clearRetainingCapacity();
         procedure.parameters.clearRetainingCapacity();
         procedure.name = name.span;
         procedure.defined = true;
@@ -1524,10 +1704,16 @@ const Builder = struct {
 
     fn parseAssignmentOrImplicitCall(self: *Builder) !bool {
         const name = self.advance();
-        if (self.at(.equal) or self.findGlobal(name.span) != null or
-            (self.current_procedure != bytecode.invalid_index and self.findLocal(self.current_procedure, name.span) != null))
-        {
+        if (self.at(.equal)) {
             const target = (try self.parseLvalueReference(name, true)) orelse return false;
+            if (!try self.expect(.equal)) return false;
+            return self.parseAssignment(name, target);
+        }
+        const lookup = self.inspectVariable(name.span);
+        if (lookup.visible) {
+            const variable = lookup.reference orelse (try self.resolveVariable(name.span, true)).?;
+            self.stats.reused_statement_bindings +%= 1;
+            const target = (try self.parseLvalueReferenceResolved(name, variable)) orelse return false;
             if (!try self.expect(.equal)) return false;
             return self.parseAssignment(name, target);
         }
@@ -1535,7 +1721,8 @@ const Builder = struct {
             if (self.procedures.items[procedure_id].kind != .sub) return self.fail(.unexpected_token);
             return self.emitProcedureCall(procedure_id, false, name.span, false);
         }
-        const target = (try self.parseLvalueReference(name, true)) orelse return false;
+        const variable = (try self.resolveVariable(name.span, true)).?;
+        const target = (try self.parseLvalueReferenceResolved(name, variable)) orelse return false;
         if (!try self.expect(.equal)) return false;
         return self.parseAssignment(name, target);
     }
@@ -1567,6 +1754,10 @@ const Builder = struct {
             try self.addDiagnostic(.expected_identifier, name.span);
             return null;
         };
+        return self.parseLvalueReferenceResolved(name, variable);
+    }
+
+    fn parseLvalueReferenceResolved(self: *Builder, name: frontend.Token, variable: VariableReference) !?BoundLvalue {
         try self.emitReference(variable, name.span);
         var result = BoundLvalue{
             .value_type = variable.value_type,
@@ -1686,9 +1877,11 @@ const Builder = struct {
                         {
                             try self.addDiagnostic(.invalid_array_argument, argument.span);
                         }
-                    } else if (self.canAliasScalarArgument()) {
+                    } else if (self.canAliasScalarArgument()) |alias| {
                         const argument = self.advance();
-                        const target = (try self.parseLvalueReference(argument, true)) orelse return false;
+                        const variable = alias.reference orelse (try self.resolveVariable(argument.span, true)).?;
+                        self.stats.reused_statement_bindings +%= 1;
+                        const target = (try self.parseLvalueReferenceResolved(argument, variable)) orelse return false;
                         if (target.is_whole_array or target.record_type != parameter.record_type or
                             target.value_type != parameter.value_type)
                         {
@@ -1720,30 +1913,23 @@ const Builder = struct {
         return true;
     }
 
-    fn canAliasScalarArgument(self: Builder) bool {
-        if (!self.at(.identifier)) return false;
+    fn canAliasScalarArgument(self: *Builder) ?ScalarAlias {
+        if (!self.at(.identifier)) return null;
         const name = self.current();
-        if (self.current_procedure != bytecode.invalid_index) {
-            if (self.findLocal(self.current_procedure, name.span)) |index| {
-                if (self.procedures.items[self.current_procedure].locals.items[index].is_constant) return false;
-            }
-        }
-        if (self.findGlobal(name.span)) |index| {
-            if (self.globals.items[index].is_constant) return false;
-        }
+        const lookup = self.inspectVariable(name.span);
+        if (lookup.reference) |reference| if (reference.is_constant) return null;
         const next = self.peek(1);
-        if (next.kind == .dot) return true;
+        if (next.kind == .dot) return .{ .reference = lookup.reference };
         if (next.kind == .left_paren) {
-            if (self.current_procedure != bytecode.invalid_index) {
-                if (self.findLocal(self.current_procedure, name.span)) |index| {
-                    return self.procedures.items[self.current_procedure].locals.items[index].isArray();
-                }
-            }
-            if (self.findGlobal(name.span)) |index| return self.globals.items[index].isArray();
-            return false;
+            const reference = lookup.reference orelse return null;
+            return if (reference.dimensions != 0) .{ .reference = reference } else null;
         }
-        return next.kind == .comma or next.kind == .right_paren or next.kind == .newline or
-            next.kind == .colon or next.kind == .eof or (next.kind == .keyword and next.keyword == .else_);
+        if (next.kind == .comma or next.kind == .right_paren or next.kind == .newline or
+            next.kind == .colon or next.kind == .eof or (next.kind == .keyword and next.keyword == .else_))
+        {
+            return .{ .reference = lookup.reference };
+        }
+        return null;
     }
 
     fn parseExpression(self: *Builder) std.mem.Allocator.Error!?bytecode.ValueType {
@@ -2463,6 +2649,8 @@ const Builder = struct {
     }
 
     fn finish(self: *Builder) !bytecode.Program {
+        self.stats.label_fixups = @intCast(self.label_fixups.items.len);
+        self.stats.data_fixups = @intCast(self.data_fixups.items.len);
         var owned_procedures: std.ArrayList(bytecode.Procedure) = .empty;
         var owned_record_types: std.ArrayList(bytecode.RecordType) = .empty;
         errdefer {
@@ -2482,6 +2670,7 @@ const Builder = struct {
             errdefer self.allocator.free(locals);
             const parameters = try procedure.parameters.toOwnedSlice(self.allocator);
             errdefer self.allocator.free(parameters);
+            procedure.local_names.deinit(self.allocator);
             try owned_procedures.append(self.allocator, .{
                 .name = procedure.name,
                 .kind = procedure.kind,
@@ -2497,6 +2686,7 @@ const Builder = struct {
         for (self.record_types.items) |*record_type| {
             const fields = try record_type.fields.toOwnedSlice(self.allocator);
             errdefer self.allocator.free(fields);
+            record_type.field_names.deinit(self.allocator);
             try owned_record_types.append(self.allocator, .{ .name = record_type.name, .fields = fields });
         }
 
@@ -2530,6 +2720,10 @@ const Builder = struct {
         self.blocks.deinit(self.allocator);
         self.procedures.deinit(self.allocator);
         self.record_types.deinit(self.allocator);
+        self.global_names.deinit(self.allocator);
+        self.procedure_names.deinit(self.allocator);
+        self.record_names.deinit(self.allocator);
+        self.label_names.deinit(self.allocator);
 
         return .{
             .allocator = self.allocator,
@@ -2543,6 +2737,7 @@ const Builder = struct {
             .data_items = data_items,
             .diagnostics = diagnostics,
             .module_entry = 0,
+            .compile_stats = self.stats,
         };
     }
 
@@ -2594,10 +2789,14 @@ const Builder = struct {
     fn advance(self: *Builder) frontend.Token {
         const token = self.current();
         if (self.index + 1 < self.tokens.len) self.index += 1;
+        if (self.observer != null and self.index >= self.next_binding_progress) {
+            _ = self.reportProgress(.binding, self.index, self.tokens.len);
+        }
         return token;
     }
 
     fn at(self: Builder, kind: frontend.TokenKind) bool {
+        if (self.cancelled) return kind == .eof;
         return self.current().kind == kind;
     }
 
@@ -2642,13 +2841,42 @@ const Builder = struct {
     fn synchronize(self: *Builder) void {
         while (!self.atBoundary()) _ = self.advance();
     }
+
+    fn reportProgress(self: *Builder, phase: CompilePhase, completed: usize, total: usize) bool {
+        const observer = self.observer orelse return true;
+        if (phase == .binding) self.next_binding_progress = @min(total, completed + 256);
+        self.stats.progress_updates +%= 1;
+        if (observer.update(.{ .phase = phase, .completed = completed, .total = total })) return true;
+        self.cancelled = true;
+        self.stopped = true;
+        return false;
+    }
+};
+
+const FrontendObserverBridge = struct {
+    observer: CompileObserver,
+
+    fn update(context: *anyopaque, completed: usize, total: usize) bool {
+        const self: *FrontendObserverBridge = @ptrCast(@alignCast(context));
+        return self.observer.update(.{ .phase = .lexical, .completed = completed, .total = total });
+    }
 };
 
 pub fn compile(allocator: std.mem.Allocator, file_name: []const u8, source: []const u8) !bytecode.Program {
+    return compileObserved(allocator, file_name, source, null);
+}
+
+pub fn compileObserved(
+    allocator: std.mem.Allocator,
+    file_name: []const u8,
+    source: []const u8,
+    observer: ?CompileObserver,
+) !bytecode.Program {
     const owned_file_name = try allocator.dupe(u8, file_name);
-    errdefer allocator.free(owned_file_name);
+    var builder_owns_source = false;
+    errdefer if (!builder_owns_source) allocator.free(owned_file_name);
     const owned_source = try allocator.dupe(u8, source);
-    errdefer allocator.free(owned_source);
+    errdefer if (!builder_owns_source) allocator.free(owned_source);
 
     const token_capacity = @max(@as(usize, 1), owned_source.len + 1);
     const tokens = try allocator.alloc(frontend.Token, token_capacity);
@@ -2656,13 +2884,29 @@ pub fn compile(allocator: std.mem.Allocator, file_name: []const u8, source: []co
     const lexical_diagnostics = try allocator.alloc(frontend.Diagnostic, frontend.recommended_diagnostic_capacity);
     defer allocator.free(lexical_diagnostics);
 
-    const lexed = frontend.tokenizeNamed(owned_file_name, owned_source, tokens, lexical_diagnostics);
+    var bridge: FrontendObserverBridge = undefined;
+    const frontend_observer: ?frontend.TokenizeObserver = if (observer) |value| blk: {
+        bridge = .{ .observer = value };
+        break :blk .{ .context = &bridge, .update_fn = FrontendObserverBridge.update };
+    } else null;
+    const lexed = frontend.tokenizeNamedObserved(owned_file_name, owned_source, tokens, lexical_diagnostics, frontend_observer);
+    if (lexed.cancelled) return error.Cancelled;
     var builder = Builder{
         .allocator = allocator,
         .file_name = owned_file_name,
         .source = owned_source,
         .tokens = tokens[0..lexed.token_count],
+        .observer = observer,
+        .stats = .{
+            .source_bytes = @intCast(owned_source.len),
+            .tokens = @intCast(lexed.token_count),
+            .keyword_lookups = lexed.keyword_lookups,
+            .keyword_probes = lexed.keyword_probes,
+            .keyword_max_probe = lexed.keyword_max_probe,
+            .progress_updates = lexed.progress_updates,
+        },
     };
+    builder_owns_source = true;
     errdefer builder.deinit();
 
     for (lexical_diagnostics[0..lexed.diagnostic_count]) |diagnostic| {

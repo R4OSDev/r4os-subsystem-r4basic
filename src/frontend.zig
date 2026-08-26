@@ -245,9 +245,23 @@ pub const LexResult = struct {
     token_count: usize,
     diagnostic_count: usize,
     diagnostics_truncated: bool,
+    cancelled: bool = false,
+    keyword_lookups: u64 = 0,
+    keyword_probes: u64 = 0,
+    keyword_max_probe: u16 = 0,
+    progress_updates: u32 = 0,
 
     pub fn ok(self: LexResult) bool {
         return self.diagnostic_count == 0 and !self.diagnostics_truncated;
+    }
+};
+
+pub const TokenizeObserver = struct {
+    context: *anyopaque,
+    update_fn: *const fn (context: *anyopaque, completed: usize, total: usize) bool,
+
+    fn update(self: TokenizeObserver, completed: usize, total: usize) bool {
+        return self.update_fn(self.context, completed, total);
     }
 };
 
@@ -302,6 +316,16 @@ pub fn tokenize(source: []const u8, tokens: []Token, diagnostics: []Diagnostic) 
 }
 
 pub fn tokenizeNamed(file_name: []const u8, source: []const u8, tokens: []Token, diagnostics: []Diagnostic) LexResult {
+    return tokenizeNamedObserved(file_name, source, tokens, diagnostics, null);
+}
+
+pub fn tokenizeNamedObserved(
+    file_name: []const u8,
+    source: []const u8,
+    tokens: []Token,
+    diagnostics: []Diagnostic,
+    observer: ?TokenizeObserver,
+) LexResult {
     var sink = DiagnosticSink{ .storage = diagnostics, .file_name = file_name };
     if (source.len > maximum_source_bytes) {
         sink.add(.source_too_large, .{ .start = 0, .end = 0, .line = 1, .column = 1 });
@@ -316,14 +340,31 @@ pub fn tokenizeNamed(file_name: []const u8, source: []const u8, tokens: []Token,
         .source = source,
         .tokens = tokens,
         .diagnostics = &sink,
+        .observer = observer,
     };
     lexer.run();
     return .{
         .token_count = lexer.count,
         .diagnostic_count = sink.count,
         .diagnostics_truncated = sink.truncated,
+        .cancelled = lexer.cancelled,
+        .keyword_lookups = lexer.keyword_stats.lookups,
+        .keyword_probes = lexer.keyword_stats.probes,
+        .keyword_max_probe = lexer.keyword_stats.maximum_probe,
+        .progress_updates = lexer.progress_updates,
     };
 }
+
+const KeywordLookupStats = struct {
+    lookups: u64 = 0,
+    probes: u64 = 0,
+    maximum_probe: u16 = 0,
+
+    fn record(self: *KeywordLookupStats, probe: usize) void {
+        self.probes +%= 1;
+        self.maximum_probe = @max(self.maximum_probe, @as(u16, @intCast(probe)));
+    }
+};
 
 const Lexer = struct {
     source: []const u8,
@@ -335,6 +376,11 @@ const Lexer = struct {
     count: usize = 0,
     statement_start: bool = true,
     capacity_reported: bool = false,
+    observer: ?TokenizeObserver = null,
+    next_progress: usize = 0,
+    progress_updates: u32 = 0,
+    cancelled: bool = false,
+    keyword_stats: KeywordLookupStats = .{},
 
     fn run(self: *Lexer) void {
         if (self.tokens.len == 0) {
@@ -342,7 +388,9 @@ const Lexer = struct {
             return;
         }
 
+        if (!self.reportProgress()) return;
         while (self.index < self.source.len) {
+            if (self.index >= self.next_progress and !self.reportProgress()) return;
             const byte = self.source[self.index];
             switch (byte) {
                 ' ', '\t', 0x0B, 0x0C => self.advanceByte(),
@@ -383,6 +431,16 @@ const Lexer = struct {
         if (self.count == self.tokens.len and self.tokens[self.count - 1].kind != .eof) {
             self.tokens[self.count - 1] = .{ .kind = .eof, .span = self.pointSpan() };
         }
+        _ = self.reportProgress();
+    }
+
+    fn reportProgress(self: *Lexer) bool {
+        const observer = self.observer orelse return true;
+        self.next_progress = @min(self.source.len, self.index + 2048);
+        self.progress_updates +%= 1;
+        if (observer.update(self.index, self.source.len)) return true;
+        self.cancelled = true;
+        return false;
     }
 
     fn lexNewline(self: *Lexer) void {
@@ -441,7 +499,7 @@ const Lexer = struct {
             return;
         }
 
-        const keyword = keywordFor(text);
+        const keyword = keywordFor(text, &self.keyword_stats);
         self.emit(if (keyword == .none) .identifier else .keyword, keyword, self.makeSpan(start, self.index, line, column));
         self.statement_start = false;
     }
@@ -587,130 +645,186 @@ fn metacommandKeyword(text: []const u8) Keyword {
     return .none;
 }
 
-fn keywordFor(text: []const u8) Keyword {
-    const Entry = struct { text: []const u8, keyword: Keyword };
-    const entries = [_]Entry{
-        .{ .text = "ABS", .keyword = .abs },
-        .{ .text = "AND", .keyword = .and_ },
-        .{ .text = "ANY", .keyword = .any },
-        .{ .text = "APPEND", .keyword = .append },
-        .{ .text = "AS", .keyword = .as },
-        .{ .text = "ATN", .keyword = .atn },
-        .{ .text = "BEEP", .keyword = .beep },
-        .{ .text = "BYREF", .keyword = .byref },
-        .{ .text = "BYVAL", .keyword = .byval },
-        .{ .text = "CALL", .keyword = .call },
-        .{ .text = "CASE", .keyword = .case },
-        .{ .text = "CHR$", .keyword = .chr_string },
-        .{ .text = "CINT", .keyword = .cint },
-        .{ .text = "CIRCLE", .keyword = .circle },
-        .{ .text = "CLOSE", .keyword = .close },
-        .{ .text = "CLS", .keyword = .cls },
-        .{ .text = "COLOR", .keyword = .color },
-        .{ .text = "CONST", .keyword = .const_ },
-        .{ .text = "COS", .keyword = .cos },
-        .{ .text = "DATA", .keyword = .data },
-        .{ .text = "DECLARE", .keyword = .declare },
-        .{ .text = "DEF", .keyword = .def },
-        .{ .text = "DEFINT", .keyword = .defint },
-        .{ .text = "DIM", .keyword = .dim },
-        .{ .text = "DO", .keyword = .do_ },
-        .{ .text = "DOUBLE", .keyword = .double },
-        .{ .text = "ELSE", .keyword = .else_ },
-        .{ .text = "ELSEIF", .keyword = .elseif },
-        .{ .text = "END", .keyword = .end },
-        .{ .text = "EOF", .keyword = .eof },
-        .{ .text = "ERROR", .keyword = .error_ },
-        .{ .text = "EXIT", .keyword = .exit },
-        .{ .text = "FN", .keyword = .fn_ },
-        .{ .text = "FOR", .keyword = .for_ },
-        .{ .text = "FUNCTION", .keyword = .function },
-        .{ .text = "GET", .keyword = .get },
-        .{ .text = "GOSUB", .keyword = .gosub },
-        .{ .text = "GOTO", .keyword = .goto_ },
-        .{ .text = "IF", .keyword = .if_ },
-        .{ .text = "INKEY$", .keyword = .inkey_string },
-        .{ .text = "INPUT", .keyword = .input },
-        .{ .text = "INSTR", .keyword = .instr },
-        .{ .text = "INT", .keyword = .int },
-        .{ .text = "INTEGER", .keyword = .integer },
-        .{ .text = "LEFT$", .keyword = .left_string },
-        .{ .text = "LEN", .keyword = .len },
-        .{ .text = "LET", .keyword = .let },
-        .{ .text = "LINE", .keyword = .line },
-        .{ .text = "LOCATE", .keyword = .locate },
-        .{ .text = "LONG", .keyword = .long },
-        .{ .text = "LOOP", .keyword = .loop },
-        .{ .text = "LTRIM$", .keyword = .ltrim_string },
-        .{ .text = "MID$", .keyword = .mid_string },
-        .{ .text = "MOD", .keyword = .mod },
-        .{ .text = "NEXT", .keyword = .next },
-        .{ .text = "NOT", .keyword = .not },
-        .{ .text = "ON", .keyword = .on },
-        .{ .text = "OPEN", .keyword = .open },
-        .{ .text = "OR", .keyword = .or_ },
-        .{ .text = "OUTPUT", .keyword = .output },
-        .{ .text = "PAINT", .keyword = .paint },
-        .{ .text = "PALETTE", .keyword = .palette },
-        .{ .text = "PEEK", .keyword = .peek },
-        .{ .text = "PLAY", .keyword = .play },
-        .{ .text = "POINT", .keyword = .point },
-        .{ .text = "POKE", .keyword = .poke },
-        .{ .text = "PRINT", .keyword = .print },
-        .{ .text = "PSET", .keyword = .pset },
-        .{ .text = "PUT", .keyword = .put },
-        .{ .text = "RANDOMIZE", .keyword = .randomize },
-        .{ .text = "READ", .keyword = .read },
-        .{ .text = "REDIM", .keyword = .redim },
-        .{ .text = "REM", .keyword = .rem },
-        .{ .text = "RESTORE", .keyword = .restore },
-        .{ .text = "RESUME", .keyword = .resume_ },
-        .{ .text = "RETURN", .keyword = .return_ },
-        .{ .text = "RND", .keyword = .rnd },
-        .{ .text = "SCREEN", .keyword = .screen },
-        .{ .text = "SEG", .keyword = .seg },
-        .{ .text = "SELECT", .keyword = .select },
-        .{ .text = "SHARED", .keyword = .shared },
-        .{ .text = "SIN", .keyword = .sin },
-        .{ .text = "SINGLE", .keyword = .single },
-        .{ .text = "SLEEP", .keyword = .sleep },
-        .{ .text = "SPACE$", .keyword = .space_string },
-        .{ .text = "STATIC", .keyword = .static },
-        .{ .text = "STEP", .keyword = .step },
-        .{ .text = "STR$", .keyword = .str_string },
-        .{ .text = "STRING", .keyword = .string },
-        .{ .text = "SUB", .keyword = .sub },
-        .{ .text = "TAB", .keyword = .tab },
-        .{ .text = "THEN", .keyword = .then },
-        .{ .text = "TIMER", .keyword = .timer },
-        .{ .text = "TO", .keyword = .to },
-        .{ .text = "TYPE", .keyword = .type },
-        .{ .text = "UCASE$", .keyword = .ucase_string },
-        .{ .text = "UNTIL", .keyword = .until },
-        .{ .text = "VAL", .keyword = .val },
-        .{ .text = "VIEW", .keyword = .view },
-        .{ .text = "WEND", .keyword = .wend },
-        .{ .text = "WHILE", .keyword = .while_ },
-        .{ .text = "WIDTH", .keyword = .width },
-        .{ .text = "XOR", .keyword = .xor },
-    };
-    for (entries) |entry| if (std.ascii.eqlIgnoreCase(text, entry.text)) return entry.keyword;
+pub const KeywordEntry = struct { text: []const u8, keyword: Keyword };
 
-    const unsupported = [_][]const u8{
-        "ASC",     "BASE",   "BLOAD",    "BSAVE",  "CDBL",    "CHAIN",    "CHDIR",
-        "CHDRIVE", "CLNG",   "COMMAND$", "COMMON", "CSNG",    "CVD",      "CVI",
-        "CVL",     "CVS",    "DATE$",    "DRAW",   "ENVIRON", "ENVIRON$", "EQV",
-        "ERASE",   "ERL",    "ERR",      "EXP",    "FIELD",   "FILES",    "FIX",
-        "FRE",     "HEX$",   "IMP",      "INP",    "INPUT$",  "IOCTL",    "IOCTL$",
-        "IS",      "KEY",    "KILL",     "LBOUND", "LCASE$",  "LOAD",     "LOC",
-        "LOCK",    "LOF",    "LOG",      "LPOS",   "LPRINT",  "MKD$",     "MKDIR",
-        "MKI$",    "MKL$",   "MKS$",     "NAME",   "OCT$",    "OPTION",   "OUT",
-        "PCOPY",   "POS",    "PRESERVE", "PRESET", "RANDOM",  "RIGHT$",   "RMDIR",
-        "RUN",     "SADD",   "SAVE",     "SGN",    "SHELL",   "SOUND",    "SPC",
-        "SQR",     "STICK",  "STRIG",    "SWAP",   "SYSTEM",  "TAN",      "TIME$",
-        "UBOUND",  "UNLOCK", "USING",    "VARPTR", "VARSEG",  "WAIT",     "WRITE",
-    };
-    for (unsupported) |word| if (std.ascii.eqlIgnoreCase(text, word)) return .unsupported;
+pub const supported_keyword_entries = [_]KeywordEntry{
+    .{ .text = "ABS", .keyword = .abs },
+    .{ .text = "AND", .keyword = .and_ },
+    .{ .text = "ANY", .keyword = .any },
+    .{ .text = "APPEND", .keyword = .append },
+    .{ .text = "AS", .keyword = .as },
+    .{ .text = "ATN", .keyword = .atn },
+    .{ .text = "BEEP", .keyword = .beep },
+    .{ .text = "BYREF", .keyword = .byref },
+    .{ .text = "BYVAL", .keyword = .byval },
+    .{ .text = "CALL", .keyword = .call },
+    .{ .text = "CASE", .keyword = .case },
+    .{ .text = "CHR$", .keyword = .chr_string },
+    .{ .text = "CINT", .keyword = .cint },
+    .{ .text = "CIRCLE", .keyword = .circle },
+    .{ .text = "CLOSE", .keyword = .close },
+    .{ .text = "CLS", .keyword = .cls },
+    .{ .text = "COLOR", .keyword = .color },
+    .{ .text = "CONST", .keyword = .const_ },
+    .{ .text = "COS", .keyword = .cos },
+    .{ .text = "DATA", .keyword = .data },
+    .{ .text = "DECLARE", .keyword = .declare },
+    .{ .text = "DEF", .keyword = .def },
+    .{ .text = "DEFINT", .keyword = .defint },
+    .{ .text = "DIM", .keyword = .dim },
+    .{ .text = "DO", .keyword = .do_ },
+    .{ .text = "DOUBLE", .keyword = .double },
+    .{ .text = "ELSE", .keyword = .else_ },
+    .{ .text = "ELSEIF", .keyword = .elseif },
+    .{ .text = "END", .keyword = .end },
+    .{ .text = "EOF", .keyword = .eof },
+    .{ .text = "ERROR", .keyword = .error_ },
+    .{ .text = "EXIT", .keyword = .exit },
+    .{ .text = "FN", .keyword = .fn_ },
+    .{ .text = "FOR", .keyword = .for_ },
+    .{ .text = "FUNCTION", .keyword = .function },
+    .{ .text = "GET", .keyword = .get },
+    .{ .text = "GOSUB", .keyword = .gosub },
+    .{ .text = "GOTO", .keyword = .goto_ },
+    .{ .text = "IF", .keyword = .if_ },
+    .{ .text = "INKEY$", .keyword = .inkey_string },
+    .{ .text = "INPUT", .keyword = .input },
+    .{ .text = "INSTR", .keyword = .instr },
+    .{ .text = "INT", .keyword = .int },
+    .{ .text = "INTEGER", .keyword = .integer },
+    .{ .text = "LEFT$", .keyword = .left_string },
+    .{ .text = "LEN", .keyword = .len },
+    .{ .text = "LET", .keyword = .let },
+    .{ .text = "LINE", .keyword = .line },
+    .{ .text = "LOCATE", .keyword = .locate },
+    .{ .text = "LONG", .keyword = .long },
+    .{ .text = "LOOP", .keyword = .loop },
+    .{ .text = "LTRIM$", .keyword = .ltrim_string },
+    .{ .text = "MID$", .keyword = .mid_string },
+    .{ .text = "MOD", .keyword = .mod },
+    .{ .text = "NEXT", .keyword = .next },
+    .{ .text = "NOT", .keyword = .not },
+    .{ .text = "ON", .keyword = .on },
+    .{ .text = "OPEN", .keyword = .open },
+    .{ .text = "OR", .keyword = .or_ },
+    .{ .text = "OUTPUT", .keyword = .output },
+    .{ .text = "PAINT", .keyword = .paint },
+    .{ .text = "PALETTE", .keyword = .palette },
+    .{ .text = "PEEK", .keyword = .peek },
+    .{ .text = "PLAY", .keyword = .play },
+    .{ .text = "POINT", .keyword = .point },
+    .{ .text = "POKE", .keyword = .poke },
+    .{ .text = "PRINT", .keyword = .print },
+    .{ .text = "PSET", .keyword = .pset },
+    .{ .text = "PUT", .keyword = .put },
+    .{ .text = "RANDOMIZE", .keyword = .randomize },
+    .{ .text = "READ", .keyword = .read },
+    .{ .text = "REDIM", .keyword = .redim },
+    .{ .text = "REM", .keyword = .rem },
+    .{ .text = "RESTORE", .keyword = .restore },
+    .{ .text = "RESUME", .keyword = .resume_ },
+    .{ .text = "RETURN", .keyword = .return_ },
+    .{ .text = "RND", .keyword = .rnd },
+    .{ .text = "SCREEN", .keyword = .screen },
+    .{ .text = "SEG", .keyword = .seg },
+    .{ .text = "SELECT", .keyword = .select },
+    .{ .text = "SHARED", .keyword = .shared },
+    .{ .text = "SIN", .keyword = .sin },
+    .{ .text = "SINGLE", .keyword = .single },
+    .{ .text = "SLEEP", .keyword = .sleep },
+    .{ .text = "SPACE$", .keyword = .space_string },
+    .{ .text = "STATIC", .keyword = .static },
+    .{ .text = "STEP", .keyword = .step },
+    .{ .text = "STR$", .keyword = .str_string },
+    .{ .text = "STRING", .keyword = .string },
+    .{ .text = "SUB", .keyword = .sub },
+    .{ .text = "TAB", .keyword = .tab },
+    .{ .text = "THEN", .keyword = .then },
+    .{ .text = "TIMER", .keyword = .timer },
+    .{ .text = "TO", .keyword = .to },
+    .{ .text = "TYPE", .keyword = .type },
+    .{ .text = "UCASE$", .keyword = .ucase_string },
+    .{ .text = "UNTIL", .keyword = .until },
+    .{ .text = "VAL", .keyword = .val },
+    .{ .text = "VIEW", .keyword = .view },
+    .{ .text = "WEND", .keyword = .wend },
+    .{ .text = "WHILE", .keyword = .while_ },
+    .{ .text = "WIDTH", .keyword = .width },
+    .{ .text = "XOR", .keyword = .xor },
+};
+
+pub const unsupported_keyword_words = [_][]const u8{
+    "ASC",     "BASE",   "BLOAD",    "BSAVE",  "CDBL",    "CHAIN",    "CHDIR",
+    "CHDRIVE", "CLNG",   "COMMAND$", "COMMON", "CSNG",    "CVD",      "CVI",
+    "CVL",     "CVS",    "DATE$",    "DRAW",   "ENVIRON", "ENVIRON$", "EQV",
+    "ERASE",   "ERL",    "ERR",      "EXP",    "FIELD",   "FILES",    "FIX",
+    "FRE",     "HEX$",   "IMP",      "INP",    "INPUT$",  "IOCTL",    "IOCTL$",
+    "IS",      "KEY",    "KILL",     "LBOUND", "LCASE$",  "LOAD",     "LOC",
+    "LOCK",    "LOF",    "LOG",      "LPOS",   "LPRINT",  "MKD$",     "MKDIR",
+    "MKI$",    "MKL$",   "MKS$",     "NAME",   "OCT$",    "OPTION",   "OUT",
+    "PCOPY",   "POS",    "PRESERVE", "PRESET", "RANDOM",  "RIGHT$",   "RMDIR",
+    "RUN",     "SADD",   "SAVE",     "SGN",    "SHELL",   "SOUND",    "SPC",
+    "SQR",     "STICK",  "STRIG",    "SWAP",   "SYSTEM",  "TAN",      "TIME$",
+    "UBOUND",  "UNLOCK", "USING",    "VARPTR", "VARSEG",  "WAIT",     "WRITE",
+};
+
+const KeywordSlot = struct {
+    text: []const u8 = "",
+    keyword: Keyword = .none,
+};
+
+pub const keyword_table_capacity: usize = 512;
+const keyword_table = buildKeywordTable();
+pub const keyword_lookup_probe_bound: usize = keywordProbeBound(keyword_table);
+
+fn keywordHash(text: []const u8) u64 {
+    var hash: u64 = 14_695_981_039_346_656_037;
+    for (text) |byte| {
+        hash ^= std.ascii.toUpper(byte);
+        hash *%= 1_099_511_628_211;
+    }
+    return hash;
+}
+
+fn buildKeywordTable() [keyword_table_capacity]KeywordSlot {
+    @setEvalBranchQuota(20_000);
+    var table = [_]KeywordSlot{.{}} ** keyword_table_capacity;
+    for (supported_keyword_entries) |entry| insertKeyword(&table, entry.text, entry.keyword);
+    for (unsupported_keyword_words) |word| insertKeyword(&table, word, .unsupported);
+    return table;
+}
+
+fn insertKeyword(table: *[keyword_table_capacity]KeywordSlot, text: []const u8, keyword: Keyword) void {
+    var index: usize = @intCast(keywordHash(text) & (keyword_table_capacity - 1));
+    while (table[index].text.len != 0) index = (index + 1) & (keyword_table_capacity - 1);
+    table[index] = .{ .text = text, .keyword = keyword };
+}
+
+fn keywordProbeBound(table: [keyword_table_capacity]KeywordSlot) usize {
+    @setEvalBranchQuota(20_000);
+    var maximum: usize = 1;
+    for (0..keyword_table_capacity) |start| {
+        var probe: usize = 1;
+        var index = start;
+        while (table[index].text.len != 0 and probe < keyword_table_capacity) : (probe += 1) {
+            index = (index + 1) & (keyword_table_capacity - 1);
+        }
+        maximum = @max(maximum, probe);
+    }
+    return maximum;
+}
+
+fn keywordFor(text: []const u8, stats: *KeywordLookupStats) Keyword {
+    stats.lookups +%= 1;
+    var index: usize = @intCast(keywordHash(text) & (keyword_table_capacity - 1));
+    var probe: usize = 1;
+    while (probe <= keyword_lookup_probe_bound) : (probe += 1) {
+        stats.record(probe);
+        const slot = keyword_table[index];
+        if (slot.text.len == 0) return .none;
+        if (std.ascii.eqlIgnoreCase(text, slot.text)) return slot.keyword;
+        index = (index + 1) & (keyword_table_capacity - 1);
+    }
     return .none;
 }
 

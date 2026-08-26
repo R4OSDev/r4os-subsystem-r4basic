@@ -70,7 +70,42 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     }
 
     timeline.compile_begin_ns = monotonicNow(sys);
-    var program = compiler.compile(allocator, launch.guest_path, source) catch |fault| {
+    var compile_display: graphics_screen.Screen = .{};
+    defer compile_display.deinit(allocator);
+    compile_display.setMode(allocator, 0) catch {
+        if (trace.baseline) return writeBaselineFailure(&files, trace, "compile-display", error_host_video);
+        return error_host_video;
+    };
+    var compile_text: text_screen.Screen = .{};
+    const compile_view = compile_display.view() orelse return error_host_video;
+    const compile_surface = host_api.Surface.initIndexed8(
+        compile_view.pixels,
+        compile_view.palette,
+        compile_view.width,
+        compile_view.height,
+    ) catch return error_host_video;
+    var raster_scratch: [host_api.tile_max_pixels]u32 = undefined;
+    var window_host = host_api.Host.init(desk, draw, compile_surface, raster_scratch[0..]) catch {
+        if (trace.baseline) return writeBaselineFailure(&files, trace, "compile-window", error_host_video);
+        return error_host_video;
+    };
+    _ = window_host.setMinimumSize(320, 200);
+    var compile_progress = CompileProgressView.init(
+        sys,
+        &window_host,
+        &compile_text,
+        &compile_display,
+        baseName(launch.guest_path),
+        &timeline,
+    );
+    var program = compiler.compileObserved(allocator, launch.guest_path, source, compile_progress.observer()) catch |fault| {
+        if (fault == error.Cancelled) {
+            if (compile_progress.failure != 0) {
+                if (trace.baseline) return writeBaselineFailure(&files, trace, "compile-progress", compile_progress.failure);
+                return compile_progress.failure;
+            }
+            return 0;
+        }
         if (trace.baseline) return writeBaselineFailure(&files, trace, @errorName(fault), 68);
         return showStatus(allocator, sys, desk, draw, "R4BASIC - Compilerfehler", &.{
             "Der BASIC-Compiler konnte nicht initialisiert werden.",
@@ -112,9 +147,8 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         if (trace.baseline) return writeBaselineFailure(&files, trace, "display-surface", error_host_video);
         return error_host_video;
     };
-    var raster_scratch: [host_api.tile_max_pixels]u32 = undefined;
-    var window_host = host_api.Host.init(desk, draw, surface, raster_scratch[0..]) catch {
-        if (trace.baseline) return writeBaselineFailure(&files, trace, "window-host", error_host_video);
+    window_host.video.setSurface(surface) catch {
+        if (trace.baseline) return writeBaselineFailure(&files, trace, "window-surface", error_host_video);
         return error_host_video;
     };
     var guest_adapter = runtime_adapter.Adapter.initSystem(&machine, &sys);
@@ -161,6 +195,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         launch.guest_path,
         source.len,
         program.instructions.len,
+        program.compile_stats,
         baseName(launch.guest_path),
     );
     runtime_host.runtime = &runtime;
@@ -352,7 +387,9 @@ const LaunchTimeline = struct {
     source_begin_ns: u64 = 0,
     source_end_ns: u64 = 0,
     compile_begin_ns: u64 = 0,
+    compile_visible_ns: u64 = 0,
     compile_end_ns: u64 = 0,
+    compile_progress_updates: u32 = 0,
     vm_begin_ns: u64 = 0,
     vm_end_ns: u64 = 0,
     host_ready_ns: u64 = 0,
@@ -361,6 +398,114 @@ const LaunchTimeline = struct {
     first_instruction_ns: u64 = 0,
     audio_open_ns: u64 = 0,
     first_frame_ns: u64 = 0,
+};
+
+const CompileProgressView = struct {
+    sys: r4os.r4sys.Context,
+    window: *host_api.Host,
+    text: *text_screen.Screen,
+    display: *graphics_screen.Screen,
+    guest_name: []const u8,
+    timeline: *LaunchTimeline,
+    last_phase: ?compiler.CompilePhase = null,
+    last_percent: u8 = 255,
+    failure: i32 = 0,
+    title: [title_capacity]u8 = [_]u8{0} ** title_capacity,
+
+    fn init(
+        sys: r4os.r4sys.Context,
+        window: *host_api.Host,
+        text: *text_screen.Screen,
+        display: *graphics_screen.Screen,
+        guest_name: []const u8,
+        timeline: *LaunchTimeline,
+    ) CompileProgressView {
+        return .{
+            .sys = sys,
+            .window = window,
+            .text = text,
+            .display = display,
+            .guest_name = guest_name,
+            .timeline = timeline,
+        };
+    }
+
+    fn observer(self: *CompileProgressView) compiler.CompileObserver {
+        return .{ .context = self, .update_fn = update };
+    }
+
+    fn update(context: *anyopaque, progress: compiler.CompileProgress) bool {
+        const self: *CompileProgressView = @ptrCast(@alignCast(context));
+        if (!self.poll()) return false;
+        const percent = progressPercent(progress);
+        if (self.last_phase != progress.phase or self.last_percent != percent) {
+            self.render(progress.phase, percent);
+            if (self.failure != 0) return false;
+            self.last_phase = progress.phase;
+            self.last_percent = percent;
+        }
+        self.sys.taskYield();
+        return !self.sys.programShouldClose();
+    }
+
+    fn poll(self: *CompileProgressView) bool {
+        if (self.sys.programShouldClose()) return false;
+        var remaining: usize = 32;
+        while (remaining != 0) : (remaining -= 1) {
+            const event = self.window.pollInput() orelse break;
+            switch (event) {
+                .close => return false,
+                .resize => self.window.video.invalidateAll(),
+                .key_down => |key| if (key.code == 27) return false,
+                else => {},
+            }
+        }
+        return true;
+    }
+
+    fn render(self: *CompileProgressView, phase: compiler.CompilePhase, percent: u8) void {
+        self.text.reset();
+        self.text.setColor(15, 1) catch {};
+        self.text.locate(null, null, 0, null, null) catch {};
+        self.text.write("R4BASIC\r\n\r\n");
+        self.text.write("Kompiliere: ");
+        self.text.write(self.guest_name);
+        self.text.write("\r\n\r\nPhase: ");
+        self.text.write(switch (phase) {
+            .lexical => "Quelltext und Schluesselwoerter",
+            .binding => "Anweisungen und Symbole",
+            .resolution => "Sprungziele und Datenmarken",
+        });
+        var percent_storage: [48]u8 = undefined;
+        const percent_text = std.fmt.bufPrint(percent_storage[0..], "\r\nFortschritt: {d}%\r\n\r\n[", .{percent}) catch "\r\nFortschritt\r\n\r\n[";
+        self.text.write(percent_text);
+        const filled: usize = @min(50, (@as(usize, percent) * 50) / 100);
+        for (0..50) |index| self.text.writeByte(if (index < filled) 219 else 176);
+        self.text.write("]\r\n\r\nFenster schliessen oder Escape druecken, um abzubrechen.");
+        if (self.text.takeDirty()) |dirty| self.display.renderText(self.text, dirty);
+        self.window.video.invalidateAll();
+        const title = std.fmt.bufPrintZ(self.title[0..], "R4BASIC - Kompiliert {s} ({d}%)", .{ self.guest_name, percent }) catch "R4BASIC - Kompiliert";
+        _ = self.window.setTitle(title.ptr);
+        switch (self.window.present()) {
+            .failure => |raw| self.failure = raw,
+            .presented => {
+                if (self.timeline.compile_visible_ns == 0) self.timeline.compile_visible_ns = monotonicNow(self.sys);
+                self.timeline.compile_progress_updates +%= 1;
+            },
+            .hidden, .unchanged => {},
+        }
+    }
+
+    fn progressPercent(progress: compiler.CompileProgress) u8 {
+        const range = switch (progress.phase) {
+            .lexical => .{ @as(usize, 0), @as(usize, 30) },
+            .binding => .{ @as(usize, 30), @as(usize, 65) },
+            .resolution => .{ @as(usize, 95), @as(usize, 5) },
+        };
+        if (progress.total == 0) return @intCast(range[0] + range[1]);
+        const completed = @min(progress.completed, progress.total);
+        return @intCast(range[0] + (@as(u128, completed) * range[1]) / progress.total);
+    }
 };
 
 fn monotonicNow(sys: r4os.r4sys.Context) u64 {
@@ -396,6 +541,7 @@ const RuntimeHost = struct {
     guest_path: []const u8,
     source_bytes: usize,
     program_instructions: usize,
+    compile_stats: @import("bytecode.zig").CompileStats,
     runtime: ?*runtime_api.Runtime = null,
     title: [title_capacity]u8 = [_]u8{0} ** title_capacity,
     title_len: usize = 0,
@@ -414,6 +560,7 @@ const RuntimeHost = struct {
         guest_path: []const u8,
         source_bytes: usize,
         program_instructions: usize,
+        compile_stats: @import("bytecode.zig").CompileStats,
         guest_name: []const u8,
     ) RuntimeHost {
         var self = RuntimeHost{
@@ -426,6 +573,7 @@ const RuntimeHost = struct {
             .guest_path = guest_path,
             .source_bytes = source_bytes,
             .program_instructions = program_instructions,
+            .compile_stats = compile_stats,
         };
         const value = std.fmt.bufPrintZ(self.title[0..], "R4BASIC - {s}", .{guest_name}) catch "R4BASIC";
         self.title_len = value.len;
@@ -503,7 +651,7 @@ const RuntimeHost = struct {
         self.observeRuntime();
         const runtime = self.runtime orelse return false;
         const presenter = self.window.video.stats;
-        var report_storage: [2048]u8 = undefined;
+        var report_storage: [3072]u8 = undefined;
         var report_len: usize = 0;
         const header = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC {s}: OK id={s} mode={s} guest={s} source_bytes={d} bytecode={d}\r\n", .{
             if (self.trace.baseline) "baseline" else "trace",
@@ -514,7 +662,7 @@ const RuntimeHost = struct {
             self.program_instructions,
         }) catch return false;
         report_len += header.len;
-        const timeline = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC timeline: start_ns={d} probe_ns={d} resolve_ns={d} desktop_ns={d} app_ns={d} source_begin_ns={d} source_end_ns={d} compile_begin_ns={d} compile_end_ns={d} vm_begin_ns={d} vm_end_ns={d} host_ready_ns={d} initial_frame_ns={d} runtime_begin_ns={d} first_instruction_ns={d} audio_open_ns={d} first_frame_ns={d}\r\n", .{
+        const timeline = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC timeline: start_ns={d} probe_ns={d} resolve_ns={d} desktop_ns={d} app_ns={d} source_begin_ns={d} source_end_ns={d} compile_begin_ns={d} compile_visible_ns={d} compile_end_ns={d} compile_updates={d} vm_begin_ns={d} vm_end_ns={d} host_ready_ns={d} initial_frame_ns={d} runtime_begin_ns={d} first_instruction_ns={d} audio_open_ns={d} first_frame_ns={d}\r\n", .{
             self.trace.start_ns,
             self.trace.probe_ns,
             self.trace.resolve_ns,
@@ -523,7 +671,9 @@ const RuntimeHost = struct {
             self.timeline.source_begin_ns,
             self.timeline.source_end_ns,
             self.timeline.compile_begin_ns,
+            self.timeline.compile_visible_ns,
             self.timeline.compile_end_ns,
+            self.timeline.compile_progress_updates,
             self.timeline.vm_begin_ns,
             self.timeline.vm_end_ns,
             self.timeline.host_ready_ns,
@@ -534,6 +684,22 @@ const RuntimeHost = struct {
             self.timeline.first_frame_ns,
         }) catch return false;
         report_len += timeline.len;
+        const compiler_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC compiler: tokens={d} keyword_lookups={d} keyword_probes={d} keyword_max_probe={d} name_lookups={d} name_insertions={d} name_probes={d} name_max_probe={d} index_rebuilds={d} label_fixups={d} data_fixups={d} reused_bindings={d} progress_updates={d}\r\n", .{
+            self.compile_stats.tokens,
+            self.compile_stats.keyword_lookups,
+            self.compile_stats.keyword_probes,
+            self.compile_stats.keyword_max_probe,
+            self.compile_stats.name_lookups,
+            self.compile_stats.name_insertions,
+            self.compile_stats.name_probes,
+            self.compile_stats.name_max_probe,
+            self.compile_stats.index_rebuilds,
+            self.compile_stats.label_fixups,
+            self.compile_stats.data_fixups,
+            self.compile_stats.reused_statement_bindings,
+            self.compile_stats.progress_updates,
+        }) catch return false;
+        report_len += compiler_line.len;
         const runtime_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC runtime: requested_operations={d} executed_operations={d} slices={d} yields={d} sleeps={d} present_attempts={d} presents={d} skipped_presents={d}\r\n", .{
             runtime.stats.requested_operations,
             runtime.stats.executed_operations,

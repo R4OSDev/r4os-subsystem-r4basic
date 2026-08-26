@@ -6,7 +6,7 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.69.54
+Stand 0.69.55
 ------------
 
 Diese Ausbaustufe ist der produktive R4BASIC-v1-Subsystemhost. Explorer
@@ -71,6 +71,23 @@ Kopien von Dateiname und Quellbytes sowie Tabellen fuer Konstanten, globale
 Variablen, Prozeduren und Instruktionen. Jede Instruktion verweist auf ihren
 stabilen Quellspan. Labels werden pro Modul- oder Prozedurscope auf feste
 Instruktionsindizes aufgeloest; unbekannte Ziele sind Compile-Diagnosen.
+
+Die 103 unterstuetzten und 84 bewusst reservierten Schluesselwoerter liegen in
+einer zur Compilezeit erzeugten, case-insensitiven Hashtabelle. Die aktuelle
+Belegung benoetigt hoechstens acht Tabellenproben statt eines linearen Laufs
+ueber beide Wortlisten. Globale und lokale Variablen, Prozeduren, TYPE-Namen,
+Felder sowie gescopte Labels verwenden waehrend des Bindens eigene offene
+Namensindizes. Originalschreibweise und Quellspans bleiben unveraendert;
+Kollisionen werden weiterhin durch den vollstaendigen ASCII-Namensvergleich
+entschieden. Label- und RESTORE-Fixups greifen direkt auf denselben Labelindex
+zu. Bereits fuer die Statemententscheidung gebundene Array-, Record- und
+ByRef-Namen werden an den Lvalue-Pfad weitergereicht und nicht erneut gesucht.
+
+`Program.compile_stats` zaehlt Tokens, Keyword- und Namenslookups, Tabellen-
+proben, maximale Suchtiefe, Indexaufbauten, Fixups, wiederverwendete Bindungen
+und Fortschrittsaufrufe. Damit pruefen Stress- und Gasttests neben der
+Semantik auch die Sucharbeit. Die Grenzen von Quellspans und Diagnosen bleiben
+identisch zum bisherigen QBasic-kompatiblen Vertrag.
 
 Der ausfuehrbare Kern umfasst INTEGER, LONG, SINGLE, DOUBLE und dynamische
 Byte-Strings, DEFINT und Typsuffixe, skalare sowie mehrdimensionale
@@ -280,6 +297,15 @@ Gastpfad, liest hoechstens 256 KiB und zeigt Lade-, Syntax- und Laufzeitfehler
 mit Datei und Quellposition im Fenster. `SCREEN 0` wird als 640x400-Textbild
 sichtbar; SCREEN 1 und 9 verwenden die bisherigen Gastpixelpuffer.
 
+Vor dem Binden wird dasselbe Programmfenster mit Dateiname, Compilephase und
+Prozentbalken sichtbar. Der Lexer meldet spaetestens nach 2 KiB Quellarbeit,
+der Binder und die Fixupaufloesung spaetestens nach 256 Eintraegen. Jeder
+Fortschrittspunkt verarbeitet Close, Escape und den Programmlebenszyklus und
+gibt kooperativ an R4OS ab. Ein Abbruch entfernt alle teilweise aufgebauten
+Tokens, Indizes und Tabellen. Nach erfolgreicher Kompilierung bindet der Host
+die Gastoberflaeche in dasselbe Fenster um; es entsteht keine zweite
+Programminstanz.
+
 `src/runtime_adapter.zig` bildet die VM auf `r4os.subsystem_runtime`, ihre
 Grafik auf `r4os.subsystem_host` und PCM auf dessen Audiopumpe ab. Pro
 Hostzyklus wird hoechstens eine gepacte BASIC-Scheibe ausgefuehrt. Fenster-
@@ -299,6 +325,17 @@ wirklich ausgefuehrten Instruktionen sowie Presentversuche von Publikationen
 und Skips. Im GUI-Modus entsteht einmalig `C:\TEMP\R4BASIC.LAST`; die
 Headless-Abnahme schreibt `C:\TEMP\R4BASIC.BASELINE` und beendet nur diese
 Instanz nach dem ersten produktiven Frame. Es gibt keine Ausgabe pro Frame.
+Der Bericht enthaelt zusaetzlich den ersten sichtbaren Compileframe, die Zahl
+der Fortschrittsframes und die strukturellen Compilerzaehler.
+
+R4BASIC verwendet gezielt `OPTIMIZE=speed`; andere R4X-Module bleiben bei
+ihrer jeweiligen Manifestentscheidung. Der identische Standard-QEMU-Lauf mit
+der kanonischen GORILLA.BAS benoetigte am 26. August 2026 mit `size` 1.129,694
+ms und mit `speed` 510,062 ms fuer die Kompilierung. Start bis zum ersten
+Gastframe sank von 1.274,027 ms auf 637,515 ms. Das R4M0 wuchs dabei von
+373.691 auf 582.723 Byte; seine Loaderzeit stieg von 65,199 auf 81,251 ms.
+Die eingesparten 619,632 ms Compilezeit ueberwiegen die 209.032 zusaetzlichen
+Modulbytes und 16,052 ms Loaderzeit fuer dieses Full-only-Subsystem deutlich.
 
 Tests
 -----
@@ -322,12 +359,22 @@ Grafikhosttest prueft die 15 Bloecke eines Vollframes, Damageframes,
 Unterdrueckung unveraenderter Frames, mindestens 20 Bilder pro Sekunde sowie
 Resize und Letterboxing.
 
+Ein synthetischer Compiler-Stresstest bindet 128 TYPEs mit Feldern, 512
+Arrays, 256 Prozeduren und 1.024 Label-Fixups zweimal bytecodeidentisch. Er
+begrenzt die beobachtete Namenssuche auf hoechstens 64 Proben und prueft die
+Wiederverwendung bereits gebundener Statementnamen. Ein weiterer Test
+kompiliert die maximal erlaubten 256 KiB vollstaendig und weist zuvor nach,
+dass derselbe Quelltext waehrend des Lexens kooperativ und leckfrei
+abgebrochen werden kann. Der Frontendtest klassifiziert jede zugesagte und
+reservierte Keywordschreibweise gemischt gross/klein innerhalb der statischen
+Probegrenze.
+
 Die lokale Realprogrammabnahme lautet:
 
     Build.bat gorilla-test
 
 Sie liest ausschliesslich
-`D:\R4OS\Artifacts\Distribution\Injection\Temp\gorilla.bas`, verlangt
+`Artifacts/Distribution/Injection/Temp/gorilla.bas`, verlangt
 29.434 Byte und die SHA-256-Pruefsumme
 `9926FC1F50C4B489EC4C1B0DA5BD2C497EBF4282B3259C28A835A743E24699F7` und
 uebergibt danach die unveraenderten Bytes an dasselbe Frontend und den
@@ -344,7 +391,7 @@ Referenzen und lokale Abnahme
 -----------------------------
 
 Die lokale Arbeitsreferenz liegt unter
-`D:\R4OS\ExFiles\Reference\Basic\`. Dort sind Herkunft, Revisionen,
+`ExFiles/Reference/Basic/`. Dort sind Herkunft, Revisionen,
 Pruefsummen und Rang der Microsoft-QuickBASIC-Handbuecher sowie der nur zum
 Architekturvergleich beschafften offenen Implementierung dokumentiert.
 

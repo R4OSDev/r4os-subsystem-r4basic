@@ -40,6 +40,127 @@ test "core compiler emits a bound instruction program" {
     try std.testing.expectEqual(@as(usize, 1), program.globals.len);
 }
 
+test "compiler indices scale across symbols records procedures and label fixups" {
+    const allocator = std.testing.allocator;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(allocator);
+    try source.appendSlice(allocator, "DEFINT A-Z\n");
+
+    for (0..128) |record_index| {
+        try appendSource(&source, "TYPE T{d}\n", .{record_index});
+        for (0..8) |field_index| try appendSource(&source, "F{d} AS INTEGER\n", .{field_index});
+        try source.appendSlice(allocator, "END TYPE\n");
+        try appendSource(&source, "DIM R{d} AS T{d}\n", .{ record_index, record_index });
+        try appendSource(&source, "R{d}.F0 = {d}\n", .{ record_index, record_index });
+    }
+    for (0..512) |variable_index| {
+        try appendSource(&source, "DIM A{d}(1) AS INTEGER\n", .{variable_index});
+        try appendSource(&source, "A{d}(0) = {d}\n", .{ variable_index, variable_index });
+        try appendSource(&source, "A{d}(1) = A{d}(0) + 1\n", .{ variable_index, variable_index });
+    }
+    for (0..256) |procedure_index| {
+        try appendSource(&source, "SUB P{d}()\nL{d} = {d}\nEND SUB\n", .{ procedure_index, procedure_index, procedure_index });
+    }
+    for (0..256) |procedure_index| try appendSource(&source, "P{d}\n", .{procedure_index});
+    try source.appendSlice(allocator, "GOTO B0\n");
+    for (0..1024) |label_index| {
+        try appendSource(&source, "B{d}:\n", .{label_index});
+        if (label_index + 1 < 1024) try appendSource(&source, "GOTO B{d}\n", .{label_index + 1});
+    }
+    try source.appendSlice(allocator, "END\n");
+    try std.testing.expect(source.items.len < core.frontend.maximum_source_bytes);
+
+    const Probe = struct {
+        seen: [3]bool = .{ false, false, false },
+        calls: u32 = 0,
+
+        fn update(context: *anyopaque, progress: core.compiler.CompileProgress) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            self.seen[@intFromEnum(progress.phase)] = true;
+            return true;
+        }
+    };
+    var probe: Probe = .{};
+    var program = try core.compiler.compileObserved(allocator, "index-stress.bas", source.items, .{
+        .context = &probe,
+        .update_fn = Probe.update,
+    });
+    defer program.deinit();
+    try expectProgramOk(&program);
+    try std.testing.expect(probe.seen[0] and probe.seen[1] and probe.seen[2]);
+    try std.testing.expect(probe.calls != 0);
+    try std.testing.expectEqual(@as(u32, 1024), program.compile_stats.label_fixups);
+    try std.testing.expect(program.compile_stats.reused_statement_bindings >= 1152);
+    try std.testing.expect(program.compile_stats.keyword_max_probe <= core.frontend.keyword_lookup_probe_bound);
+    try std.testing.expect(program.compile_stats.name_max_probe <= 64);
+    try std.testing.expect(
+        program.compile_stats.name_probes <=
+            (program.compile_stats.name_lookups + program.compile_stats.name_insertions) * 64,
+    );
+
+    var repeated = try core.compiler.compile(allocator, "index-stress.bas", source.items);
+    defer repeated.deinit();
+    try expectProgramOk(&repeated);
+    try std.testing.expectEqualSlices(core.bytecode.Instruction, program.instructions, repeated.instructions);
+    try std.testing.expectEqual(program.compile_stats.name_lookups, repeated.compile_stats.name_lookups);
+    try std.testing.expectEqual(program.compile_stats.name_probes, repeated.compile_stats.name_probes);
+
+    const CancelProbe = struct {
+        phase: core.compiler.CompilePhase,
+        cancelled: bool = false,
+
+        fn update(context: *anyopaque, progress: core.compiler.CompileProgress) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (progress.phase == self.phase and progress.completed >= 256) {
+                self.cancelled = true;
+                return false;
+            }
+            return true;
+        }
+    };
+    for ([_]core.compiler.CompilePhase{ .binding, .resolution }) |phase| {
+        var cancel_probe = CancelProbe{ .phase = phase };
+        try std.testing.expectError(error.Cancelled, core.compiler.compileObserved(allocator, "index-stress.bas", source.items, .{
+            .context = &cancel_probe,
+            .update_fn = CancelProbe.update,
+        }));
+        try std.testing.expect(cancel_probe.cancelled);
+    }
+}
+
+test "maximum source compilation remains cooperatively cancellable" {
+    const allocator = std.testing.allocator;
+    const source = try allocator.alloc(u8, core.frontend.maximum_source_bytes);
+    defer allocator.free(source);
+    @memset(source, ' ');
+    @memcpy(source[0..4], "END\n");
+
+    const Probe = struct {
+        calls: u32 = 0,
+        last_completed: usize = 0,
+
+        fn update(context: *anyopaque, progress: core.compiler.CompileProgress) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            self.last_completed = progress.completed;
+            return progress.phase != .lexical or progress.completed < 4096;
+        }
+    };
+    var probe: Probe = .{};
+    try std.testing.expectError(error.Cancelled, core.compiler.compileObserved(allocator, "maximum.bas", source, .{
+        .context = &probe,
+        .update_fn = Probe.update,
+    }));
+    try std.testing.expect(probe.calls >= 3);
+    try std.testing.expect(probe.last_completed >= 4096);
+
+    var completed = try core.compiler.compile(allocator, "maximum.bas", source);
+    defer completed.deinit();
+    try expectProgramOk(&completed);
+    try std.testing.expectEqual(@as(u32, core.frontend.maximum_source_bytes), completed.compile_stats.source_bytes);
+}
+
 test "core VM executes the prepared instruction program" {
     var program = try core.compiler.compile(std.testing.allocator, "answer.bas", "DEFINT A-Z\nAnswer = 6 * 7\nEND\n");
     defer program.deinit();
@@ -1129,6 +1250,12 @@ fn screenContainsText(machine: *const core.vm.Vm, needle: []const u8) bool {
         if (std.mem.indexOf(u8, &row_bytes, needle) != null) return true;
     }
     return false;
+}
+
+fn appendSource(target: *std.ArrayList(u8), comptime format: []const u8, args: anytype) !void {
+    var storage: [160]u8 = undefined;
+    const text = try std.fmt.bufPrint(storage[0..], format, args);
+    try target.appendSlice(std.testing.allocator, text);
 }
 
 fn compileFixture(path: []const u8) !core.bytecode.Program {

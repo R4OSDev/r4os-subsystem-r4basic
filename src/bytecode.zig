@@ -312,6 +312,23 @@ pub const Diagnostic = struct {
     }
 };
 
+pub const CompileStats = struct {
+    source_bytes: u32 = 0,
+    tokens: u32 = 0,
+    keyword_lookups: u64 = 0,
+    keyword_probes: u64 = 0,
+    keyword_max_probe: u16 = 0,
+    name_lookups: u64 = 0,
+    name_insertions: u64 = 0,
+    name_probes: u64 = 0,
+    name_max_probe: u16 = 0,
+    index_rebuilds: u32 = 0,
+    label_fixups: u32 = 0,
+    data_fixups: u32 = 0,
+    reused_statement_bindings: u32 = 0,
+    progress_updates: u32 = 0,
+};
+
 pub const Program = struct {
     allocator: std.mem.Allocator,
     file_name: []u8,
@@ -326,6 +343,7 @@ pub const Program = struct {
     module_entry: u32,
     parse_passes: u32 = 1,
     bind_passes: u32 = 1,
+    compile_stats: CompileStats = .{},
 
     pub fn ok(self: Program) bool {
         return self.diagnostics.len == 0;
