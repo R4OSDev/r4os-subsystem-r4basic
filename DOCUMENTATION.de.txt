@@ -6,7 +6,7 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.70.5
+Stand 0.70.6
 ------------
 
 Diese Ausbaustufe ergaenzt das Vertragsfundament des produktiven R4BASIC-v2-
@@ -15,6 +15,10 @@ die referenzgenaue Numerik, Mathematik, IEEE-/MBF-Konvertierung und
 Microsoft-Zufallsfolge. Hinzu kommen feste und variable Byte-Strings,
 Textabfragen, erweiterte Tastencodes, exakte Roh- und Zeileneingabe sowie eine
 gemeinsame QuickBASIC-Formatengine fuer Bildschirm und sequentielle Dateien.
+0.70.6 vervollstaendigt die Deklarations- und Speichergrundlage mit allen
+DEF-Typklassen, OPTION BASE, impliziten/statischen/dynamischen Arrays,
+atomarem REDIM PRESERVE, automatischen/statischen/geteilten Scopes, COMMON
+sowie kanonischen pointerfreien Recordlayouts.
 Explorer uebergibt eine absolute BAS-Datei ueber `R4SUBSYS1`; das R4X liest
 sie und relative `$INCLUDE`-Quellen durch die Storage-Fassade jeweils exakt
 einmal, baut daraus einen begrenzten Quellgraphen und fuehrt eine getrennte VM in
@@ -102,7 +106,7 @@ letzte vorangehende numerische BASIC-Zeile. Labels werden pro
 Modul- oder Prozedurscope auf feste Instruktionsindizes aufgeloest; unbekannte
 Ziele sind Compile-Diagnosen.
 
-Die 140 unterstuetzten und 87 bewusst reservierten Schluesselwoerter liegen in
+Die unterstuetzten und bewusst reservierten Schluesselwoerter liegen in
 einer zur Compilezeit erzeugten, case-insensitiven Hashtabelle. Die aktuelle
 Belegung benoetigt hoechstens acht Tabellenproben statt eines linearen Laufs
 ueber beide Wortlisten. Globale und lokale Variablen, Prozeduren, TYPE-Namen,
@@ -157,7 +161,7 @@ GORILLA-Gastmarker verlangt zusaetzlich exakte Tokenkapazitaet, uebernommene
 angeforderte und reale VM-Allocatorwerte.
 
 Der ausfuehrbare Kern umfasst INTEGER, LONG, SINGLE, DOUBLE sowie variable und
-feste Byte-Strings, DEFINT und Typsuffixe, skalare sowie mehrdimensionale
+feste Byte-Strings, alle DEF-Typanweisungen und Typsuffixe, skalare sowie mehrdimensionale
 DIM-/DIM-SHARED-Variablen,
 Konstanten, Ausdruecke und Vergleiche. IF/ELSEIF/ELSE, SELECT CASE,
 FOR/NEXT, WHILE/WEND, alle vor- und nachgeprueften DO/LOOP-Formen,
@@ -171,6 +175,13 @@ ByVal-Parameter und sieht entsprechend der vereinbarten BASIC-Semantik die
 Modulvariablen. Rekursive Funktionen behalten lokale Werte und Rueckgaben je
 Rahmen getrennt.
 
+Automatische Prozedurlokale entstehen fuer jeden Aufruf neu. Ein abschliessendes
+STATIC an SUB/FUNCTION, eine eigenstaendige STATIC-Deklaration oder die
+statische Arrayklasse bindet dagegen eine VM-eigene Rueckseitenzelle, die
+auch rekursive Aufrufe teilen. SHARED, DIM/REDIM SHARED und COMMON benutzen
+explizite Alias- und Layoutmetadaten; ein Reset oder eine zweite VM erbt keine
+dieser Laufzeitwerte.
+
 Die VM besitzt keine globalen Laufzeitvariablen. Jede Instanz haelt eigene
 Werte, Auswertungs- und Aufrufstapel, GOSUB-Stapel, Instruktionszeiger,
 Abbruchmarke, Diagnose und Exitcode. Arithmetik, Konvertierung, Rundung,
@@ -180,27 +191,50 @@ Mathematische Hostfunktionen und Abbruchabfrage werden injiziert.
 Arrays, Datensaetze und DATA
 ----------------------------
 
-DIM und DIM SHARED koennen feste oder dynamische Arrays mit bis zu 60
-Dimensionen und expliziten vorzeichenbehafteten Unter- und Obergrenzen
-anlegen. Ohne Untergrenze gilt null. REDIM behaelt Rang und Elementtyp bei,
-verwirft den alten Inhalt und initialisiert die neue Belegung. Pro Array gilt
+OPTION BASE 0 oder 1 legt einmalig und vor der ersten Arrayverwendung die
+implizite Untergrenze fest. Ein unbekannter subskribierter Name erzeugt ein
+eindimensionales Array bis Index 10. DIM und DIM SHARED koennen statische
+oder dynamische Arrays mit bis zu 60 Dimensionen und expliziten
+vorzeichenbehafteten Unter- und Obergrenzen anlegen. Konstante Grenzen sind
+standardmaessig statisch; variable Grenzen und Arrays normaler Prozeduren
+sind dynamisch. `$STATIC` und `$DYNAMIC` schalten die folgende Klasse um.
+ERASE gibt dynamische Belegungen frei und leert statische Belegungen unter
+Erhalt ihrer Grenzen. LBOUND und UBOUND lesen eine optionale einsbasierte
+Dimension.
+
+REDIM behaelt Rang und Elementtyp bei, verwirft ohne PRESERVE den alten
+Inhalt und initialisiert die neue Belegung. REDIM PRESERVE behaelt die
+ueberlappende Nutzlast; nur die letzte Obergrenze darf sich aendern. Alle
+Untergrenzen und frueheren Obergrenzen muessen gleich bleiben. Pro Array gilt
 vor dem Allokationsversuch eine feste Schutzgrenze von 16.777.216 Elementen.
 INTEGER-, LONG-, SINGLE- und DOUBLE-Arrays speichern ihre Nutzlast typgerecht
 in 2, 4, 4 beziehungsweise 8 Byte pro Element; nur Strings und Datensaetze
 verwenden weiter generische Cells. Ueber alle Arrays einer VM sind 128 MiB
 logische Live-Nutzlast erlaubt. Ein atomarer DIM-/REDIM-Uebergang mit alter
 und neuer Nutzlast sowie beiden Dimensionstabellen ist auf 192 MiB begrenzt.
-Wird eine Grenze oder die reale Allokation nicht erfuellt, bleibt die alte
-Arraybelegung unveraendert und Fehler 7 wird sichtbar.
+Wird eine Form-, Grenze- oder reale Allokationsbedingung nicht erfuellt,
+bleiben alte Grenzen und Nutzlast unveraendert und der passende BASIC-Fehler
+wird sichtbar.
 
-TYPE-Deklarationen werden in unveraenderliche Layouts aus skalaren und festen
-Stringfeldern gebunden. Laufzeitwerte besitzen dagegen pro Instanz eigene
+TYPE-Deklarationen werden in unveraenderliche Layouts aus skalaren, festen
+String- und bereits definierten verschachtelten Recordfeldern gebunden. Jedes
+Feld besitzt einen kanonischen Gastbyteoffset und jeder Typ eine feste
+little-endian Groesse, unabhaengig vom Zig- oder Hostlayout. Laufzeitwerte
+besitzen dagegen pro Instanz eigene
 Feldzellen. Dasselbe gilt fuer Arrays von TYPE-Werten. Ein fester String wird
 mit exakt seiner deklarierten Anzahl Leerzeichen initialisiert, bei Zuweisung
 rechts aufgefuellt oder abgeschnitten und vor dem Austausch vollstaendig neu
 angelegt. Feld- und Arrayzugriffe werden als gebundene Selektoren ausgefuehrt;
 es existiert weder eine rohe Gastadresse noch ein Zahlenwert, der als
 Hostzeiger interpretiert werden koennte.
+
+Recordzuweisung kopiert tief. LEN liefert Recordgroesse, Stringlaenge oder
+numerische Speicherbreite. LSET und RSET richten Strings innerhalb der
+Zielbreite aus; LSET zwischen Records kopiert nur den kanonischen Bytepraefix.
+SWAP tauscht exakt kompatible Zahlen-, String-, Feststring- oder Recordwerte.
+CLEAR schliesst Dateien, leert Skalare, Records, COMMON, statische Lokale und
+Stapel, gibt dynamische Arrays frei und behaelt nur die Grenzen statischer
+Arrays.
 
 ByRef verwendet echte Zellaliase fuer Skalare, Arrayelemente, ganze Arrays
 und Datensaetze. Ein Ausdruck an einem normalen ByRef-Skalarparameter wird
@@ -524,6 +558,13 @@ Mehrziel-Redos, erweiterte Zweibyte-Tasten und exakte INPUT$-Mengen sind mit
 Grenzfaellen belegt. Die Formatabnahme deckt alle QuickBASIC-USING-Masken,
 Bildschirm-/Dateigleichheit und einen WRITE-#/INPUT-#-Roundtrip mit
 eingebetteten Quotes ab.
+Die 0.70.6-Vektoren pruefen alle DEF-Typklassen und ihre Quellposition,
+Suffix-/AS-Konflikte, OPTION BASE, implizite Arrays, alle Speicherklassen,
+ERASE, LBOUND/UBOUND und numerisches, String- sowie Record-PRESERVE. Falsche
+Nichtenddimensionen und erzwungenes Allocator-OOM lassen die alte Belegung
+unveraendert. Rekursion, wiederholte Aufrufe, Reset und zwei gleichzeitige VMs
+belegen automatische, statische, SHARED- und COMMON-Lebenszeiten; verschachtelte
+TYPEs und LSET werden gegen exakte Gastbytes abgenommen.
 Zusaetzlich werden exakte Laufzeitpositionen und Fehlernummern, Rekursion,
 verschachteltes ByRef, Hostfehler, Reset, Nullbudget-Abbruch, Fokus- und
 Instanztrennung, pausierte Wartezeit, Fensterereignisse waehrend SLEEP,
@@ -580,14 +621,14 @@ Architekturvergleich beschafften offenen Implementierung dokumentiert.
 die ausgewerteten Referenzabschnitte. GORILLA.BAS wird direkt aus dem lokalen,
 vom Git-Push ausgeschlossenen `Artifacts/Distribution/Injection`-Baum fuer
 Entwicklung und Abnahme gelesen. Ein Upload eines neuen `Release.zip` ist
-nicht Teil der 0.66.X-Roadmap.
+nicht Teil der 0.70.X-Roadmap.
 
 Noch offene v2-Bereiche
 -----------------------
 
 Der Interpretervertrag zielt auf die vollstaendige QuickBASIC-4.5-Sprache
-und -Laufzeit. Nach 0.70.5 folgen insbesondere Speicherklassen und
-Deklarationen, Prozedur-/Fehlerfluss, Random-/Binary-Dateien,
+und -Laufzeit. Nach 0.70.6 folgen insbesondere Prozedur-/Fehlerfluss,
+Random-/Binary-Dateien,
 Plattformoperationen, weitere Grafikmodi und -primitive, Audio/Ereignisse
 sowie die private sichere Abbildung historischer Geraete- und
 Fremdcodeoberflaechen. IDE, Debugger, nativer Compiler, Linker und Editor sind

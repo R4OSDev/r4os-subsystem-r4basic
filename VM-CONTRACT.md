@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 execution foundation
 
-Contract version: `2.1.0`
+Contract version: `2.2.0`
 
 This document freezes the executable R4BASIC foundation and its non-regression
 invariants while the complete v2 target in `COMPATIBILITY.md` and
@@ -54,11 +54,24 @@ created.
 - A `SUB` or `FUNCTION` owns its parameters, locals, hidden loop values, and
   labels. An unshared module variable is not silently captured by a normal
   procedure.
-- `DIM SHARED` exposes a module variable to procedures. Constants are visible
-  from procedure scopes and cannot be assigned after initialization.
-- `DEFINT` changes the default type by initial letter. The suffixes `%`, `&`,
-  `!`, `#`, and `$` override that default for INTEGER, LONG, SINGLE, DOUBLE,
-  and String respectively. Without either rule the default is SINGLE.
+- `DIM SHARED`, `REDIM SHARED`, and standalone `SHARED` expose one module
+  variable to procedures. Constants are visible from procedure scopes and
+  cannot be assigned after initialization.
+- `DEFINT`, `DEFLNG`, `DEFSNG`, `DEFDBL`, and `DEFSTR` change the default type
+  for one initial letter or an inclusive letter range, in source order. The
+  suffixes `%`, `&`, `!`, `#`, and `$` override that default for INTEGER,
+  LONG, SINGLE, DOUBLE, and String. A repeated declaration must retain its
+  original suffix/`AS` style and type; without any selector the default is
+  SINGLE.
+- Procedure locals are automatic unless the procedure has a trailing
+  `STATIC`, a standalone `STATIC` declaration selects the name, or an
+  applicable `$STATIC` array metacommand selects static allocation. Static
+  cells are hidden VM globals reached through local descriptors; recursion
+  shares exactly that cell while separate VMs and reset never do.
+- Blank and named `COMMON` blocks own source-ordered, typed entries with
+  canonical guest offsets. Their metadata contains no host pointer. Optional
+  `SHARED` controls procedure visibility; cross-program transfer is reserved
+  for `CHAIN` in 0.70.9.
 - Names and labels compare case-insensitively in ASCII while their original
   source spans remain unchanged.
 - Numbered lines range from 0 through 65,529 and execute in source order; they
@@ -72,13 +85,23 @@ aliases, and error-handler state belong to each VM instance.
 
 ## Arrays, records, and DATA
 
-- `DIM` supports up to 60 dimensions with explicit signed lower and upper
-  bounds. An omitted lower bound is zero. `DIM SHARED` exposes the same
-  instance-local aggregate to procedures.
-- `'$DYNAMIC` and `REM $DYNAMIC` mark following declarations dynamic;
-  `REDIM` reallocates a dynamic array with the same rank and element type and
-  resets every element. A VM limits one array to 16,777,216 elements before
-  attempting allocation. INTEGER, LONG, SINGLE, and DOUBLE arrays use exact
+- `OPTION BASE 0` or `OPTION BASE 1` selects the omitted lower bound once,
+  at module level and before the first array. An undeclared subscripted name
+  creates a one-dimensional array from that base through 10. `DIM` supports
+  up to 60 dimensions with explicit signed lower and upper bounds.
+- Compile-time constant bounds are static by default; variable bounds and
+  arrays declared inside non-STATIC procedures are dynamic. `$DYNAMIC` and
+  `$STATIC` switch subsequent eligible declarations. `ERASE` releases a
+  dynamic array and clears a static array without losing its bounds.
+  `LBOUND` and `UBOUND` expose the live bound of an optional one-based
+  dimension.
+- `REDIM` reallocates a dynamic array with the same rank and element type and
+  normally resets every element. `REDIM PRESERVE` retains the overlapping
+  payload and permits only the final upper bound to change; every lower bound
+  and earlier upper bound must remain equal. Validation and complete new
+  allocation happen before the old value changes. A VM limits one array to
+  16,777,216 elements before attempting allocation. INTEGER, LONG, SINGLE,
+  and DOUBLE arrays use exact
   2-, 4-, 4-, and 8-byte typed payloads; variable strings, fixed strings and
   records retain generic Cells. Fixed-string elements additionally charge
   their exact declared byte length to the logical payload. The logical
@@ -86,10 +109,12 @@ aliases, and error-handler state belong to each VM instance.
   atomic resize transition, including old/new dimensions, to 192 MiB. A
   rejected `DIM` or `REDIM` reports out-of-memory before replacing the old
   dimensions or payload.
-- `TYPE` layouts contain named scalar and fixed-string fields. Scalar records
-  and arrays of records initialize every field independently; fixed fields
-  begin as exact-length spaces. Qualified field access is bound to a field
-  index; arbitrary byte offsets do not exist.
+- `TYPE` layouts contain named scalar, fixed-string, and already defined
+  nested-record fields. Every field has a canonical little-endian byte offset
+  and every type has a canonical byte size independent of Zig or host ABI.
+  Scalar records and arrays of records initialize every field independently;
+  fixed fields begin as exact-length spaces. Qualified nested access is bound
+  to field indices; arbitrary host byte offsets do not exist.
 - Array and record references use storage aliases, including scalar array
   elements and record fields. Alias targets stay inside VM-owned global,
   frame, array, or record cells.
@@ -144,13 +169,21 @@ aliases, and error-handler state belong to each VM instance.
   little-endian inverses. The MBF variants convert the 23- and 55-fraction-
   bit Microsoft Binary formats with exponent bias 129 and explicit IEEE
   rounding at representation boundaries.
+- `LEN` returns the live byte length of a string, the canonical byte size of
+  a record, or the storage width of a numeric scalar. String `LSET`/`RSET`
+  justify within the destination width. Record `LSET` copies the canonical
+  byte prefix between different layouts without exposing host storage.
+  `SWAP` exchanges exact-compatible numeric, string, fixed-string, or record
+  values without an intermediate BASIC variable.
 
 ## Executable statements
 
 The VM executes:
 
-- `CONST`, `DEFINT`, scalar and array `DIM`, `DIM SHARED`, `REDIM`, `TYPE`,
-  qualified assignment, `DATA`, `READ`, and `RESTORE`;
+- `CONST`, every `DEFtype`, `OPTION BASE`, scalar and array `DIM`, standalone
+  or declaration-level `STATIC`/`SHARED`, `COMMON`, `REDIM [PRESERVE]`,
+  `ERASE`, `TYPE`, qualified and whole-record assignment, `LSET`, `RSET`,
+  `SWAP`, `CLEAR`, `DATA`, `READ`, and `RESTORE`;
 - block and single-line `IF`, `ELSEIF`, and `ELSE`;
 - `SELECT CASE`, comma alternatives, inclusive `TO` ranges, and `CASE ELSE`;
 - positive, negative, and zero-step `FOR`/`NEXT`, including `EXIT FOR`;
@@ -196,6 +229,10 @@ partially changing the queue or persistent music settings.
   fresh generation initializes only parameters, returns and locals reached by
   executed bytecode. Teardown destroys exactly those initialized Cells.
   Recursion is supported up to 256 simultaneous frames.
+- Automatic locals are recreated for every invocation. Procedure-level or
+  explicitly declared static locals retain values across invocations and are
+  shared by recursive invocations of that procedure, but remain owned by the
+  current VM and are reset with it.
 - Functions own a typed return cell addressed by their function name.
   `EXIT SUB` and `EXIT FUNCTION` return immediately through the same frame
   teardown path as the matching terminator.
@@ -505,6 +542,11 @@ guest address can become an R4OS or host pointer.
   pixel/span work, damage commits, text rows, clipped line work, flood-fill
   spans and queue bounds, requested/emitted/skipped circle segments, and the
   exact packed byte prefixes consumed by `GET` and `PUT`.
+- `CLEAR` closes sequential files through the retryable close path, clears
+  scalar, record, COMMON and static-local values, releases dynamic arrays,
+  preserves and clears static array bounds, and discards evaluation and
+  GOSUB stacks. Its optional stack argument is range-validated before state
+  changes.
 - Reset constructs a fresh global-value and aggregate set before discarding
   the old state, then clears stacks, DATA cursor, handlers, trapped error,
   private segment and byte, text screen, keyboard and input line, guest-time
@@ -518,7 +560,8 @@ guest address can become an R4OS or host pointer.
 ## Instance and ownership contract
 
 An immutable compiled program may be shared by multiple VMs. Each VM owns
-its globals, strings, array bounds and elements, record fields, aliases, DATA
+its globals, static-local backing cells, COMMON values, strings, array bounds
+and elements, record fields, aliases, DATA
 cursor, error handlers, compatibility byte, text cells and cursor, graphics
 mode, current point, palette, pixels and damage, keyboard
 and pending input, guest time and sleep deadline, random generator, music

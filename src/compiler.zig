@@ -166,9 +166,15 @@ const BoundType = struct {
     }
 };
 
+const ArrayBounds = struct {
+    dimensions: u8,
+    compile_time_constant: bool,
+};
+
 const BoundLvalue = struct {
     value_type: bytecode.ValueType,
     record_type: u32 = bytecode.invalid_index,
+    fixed_string_length: u16 = 0,
     is_whole_array: bool = false,
     dimensions: u8 = 0,
     is_constant: bool = false,
@@ -404,10 +410,22 @@ const RecordTypeBuilder = struct {
     name: frontend.Span,
     fields: std.ArrayList(bytecode.RecordField) = .empty,
     field_names: NameIndex = .{},
+    byte_size: u32 = 0,
 
     fn deinit(self: *RecordTypeBuilder, allocator: std.mem.Allocator) void {
         self.field_names.deinit(allocator);
         self.fields.deinit(allocator);
+    }
+};
+
+const CommonBlockBuilder = struct {
+    name: frontend.Span,
+    named: bool,
+    entries: std.ArrayList(bytecode.CommonEntry) = .empty,
+    byte_size: u32 = 0,
+
+    fn deinit(self: *CommonBlockBuilder, allocator: std.mem.Allocator) void {
+        self.entries.deinit(allocator);
     }
 };
 
@@ -418,6 +436,7 @@ const ProcedureBuilder = struct {
     end_ip: u32 = bytecode.invalid_index,
     return_local: u32 = bytecode.invalid_index,
     return_type: bytecode.ValueType = .single,
+    is_static: bool = false,
     declared: bool = false,
     defined: bool = false,
     called: bool = false,
@@ -430,6 +449,12 @@ const ProcedureBuilder = struct {
         self.locals.deinit(allocator);
         self.parameters.deinit(allocator);
     }
+};
+
+const ArrayAllocationMode = enum(u8) {
+    automatic,
+    static,
+    dynamic,
 };
 
 const Label = struct {
@@ -574,6 +599,7 @@ const Builder = struct {
     globals: std.ArrayList(bytecode.Variable) = .empty,
     procedures: std.ArrayList(ProcedureBuilder) = .empty,
     record_types: std.ArrayList(RecordTypeBuilder) = .empty,
+    common_blocks: std.ArrayList(CommonBlockBuilder) = .empty,
     data_items: std.ArrayList(bytecode.DataItem) = .empty,
     diagnostics: std.ArrayList(bytecode.Diagnostic) = .empty,
     labels: std.ArrayList(Label) = .empty,
@@ -592,7 +618,11 @@ const Builder = struct {
     default_types: [26]bytecode.ValueType = [_]bytecode.ValueType{.single} ** 26,
     current_procedure: u32 = bytecode.invalid_index,
     current_procedure_skip: u32 = bytecode.invalid_index,
-    arrays_dynamic: bool = false,
+    array_allocation_mode: ArrayAllocationMode = .automatic,
+    option_base: u8 = 0,
+    option_base_seen: bool = false,
+    array_declaration_seen: bool = false,
+    module_executable_seen: bool = false,
     logical_line_start: bool = true,
     current_basic_line: u16 = 0,
     stopped: bool = false,
@@ -603,6 +633,7 @@ const Builder = struct {
     fn deinit(self: *Builder) void {
         for (self.procedures.items) |*procedure| procedure.deinit(self.allocator);
         for (self.record_types.items) |*record_type| record_type.deinit(self.allocator);
+        for (self.common_blocks.items) |*block| block.deinit(self.allocator);
         for (self.blocks.items) |*block| block.deinit(self.allocator);
         self.instruction_metadata.deinit(self.allocator);
         self.instructions.deinit(self.allocator);
@@ -610,6 +641,7 @@ const Builder = struct {
         self.globals.deinit(self.allocator);
         self.procedures.deinit(self.allocator);
         self.record_types.deinit(self.allocator);
+        self.common_blocks.deinit(self.allocator);
         self.data_items.deinit(self.allocator);
         self.diagnostics.deinit(self.allocator);
         self.labels.deinit(self.allocator);
@@ -634,13 +666,14 @@ const Builder = struct {
         try self.globals.ensureTotalCapacityPrecise(self.allocator, hints.globals);
         try self.procedures.ensureTotalCapacityPrecise(self.allocator, hints.procedures);
         try self.record_types.ensureTotalCapacityPrecise(self.allocator, hints.record_types);
+        try self.common_blocks.ensureTotalCapacityPrecise(self.allocator, 4);
         try self.data_items.ensureTotalCapacityPrecise(self.allocator, hints.data_items);
         try self.diagnostics.ensureTotalCapacityPrecise(self.allocator, maximum_stored_diagnostics);
         try self.labels.ensureTotalCapacityPrecise(self.allocator, hints.labels);
         try self.label_fixups.ensureTotalCapacityPrecise(self.allocator, hints.label_fixups);
         try self.data_fixups.ensureTotalCapacityPrecise(self.allocator, hints.data_fixups);
         try self.blocks.ensureTotalCapacityPrecise(self.allocator, hints.blocks);
-        self.stats.list_reservations = 12;
+        self.stats.list_reservations = 13;
         self.stats.initial_list_bytes = @intCast(
             self.instructions.capacity * @sizeOf(bytecode.Instruction) +
                 self.instruction_metadata.capacity * @sizeOf(bytecode.InstructionMetadata) +
@@ -648,6 +681,7 @@ const Builder = struct {
                 self.globals.capacity * @sizeOf(bytecode.Variable) +
                 self.procedures.capacity * @sizeOf(ProcedureBuilder) +
                 self.record_types.capacity * @sizeOf(RecordTypeBuilder) +
+                self.common_blocks.capacity * @sizeOf(CommonBlockBuilder) +
                 self.data_items.capacity * @sizeOf(bytecode.DataItem) +
                 self.diagnostics.capacity * @sizeOf(bytecode.Diagnostic) +
                 self.labels.capacity * @sizeOf(Label) +
@@ -675,8 +709,8 @@ const Builder = struct {
             }
             if (self.at(.metacommand)) {
                 const command = self.advance();
-                if (command.keyword == .dynamic) self.arrays_dynamic = true;
-                if (command.keyword == .static) self.arrays_dynamic = false;
+                if (command.keyword == .dynamic) self.array_allocation_mode = .dynamic;
+                if (command.keyword == .static) self.array_allocation_mode = .static;
                 continue;
             }
             if (self.logical_line_start and self.at(.identifier) and self.peek(1).kind == .colon) {
@@ -687,6 +721,9 @@ const Builder = struct {
 
             self.logical_line_start = false;
             const before = self.index;
+            if (self.current_procedure == bytecode.invalid_index and self.statementStartsExecutableCode()) {
+                self.module_executable_seen = true;
+            }
             if (!try self.parseBoundStatement(false)) {
                 if (self.index == before) _ = self.advance();
                 self.synchronize();
@@ -732,6 +769,15 @@ const Builder = struct {
         return result;
     }
 
+    fn statementStartsExecutableCode(self: *Builder) bool {
+        if (!self.at(.keyword)) return true;
+        return switch (self.current().keyword) {
+            .common, .const_, .data, .declare, .defint, .deflng, .defsng, .defdbl, .defstr, .dim, .option, .type => false,
+            .sub, .function => false,
+            else => true,
+        };
+    }
+
     fn parseStatement(self: *Builder, inline_statement: bool) std.mem.Allocator.Error!bool {
         if (self.at(.question)) return self.parsePrintStatement();
         if (self.at(.identifier)) return self.parseAssignmentOrImplicitCall();
@@ -739,9 +785,22 @@ const Builder = struct {
 
         return switch (self.current().keyword) {
             .const_ => self.parseConst(),
-            .defint => self.parseDefInt(),
+            .defint => self.parseDefType(.integer),
+            .deflng => self.parseDefType(.long),
+            .defsng => self.parseDefType(.single),
+            .defdbl => self.parseDefType(.double),
+            .defstr => self.parseDefType(.string),
+            .option => self.parseOption(),
             .dim => self.parseDim(),
             .redim => self.parseRedim(),
+            .erase => self.parseErase(),
+            .shared => self.parseShared(),
+            .static => self.parseStatic(),
+            .common => self.parseCommon(),
+            .clear => self.parseClear(),
+            .lset => self.parseJustify(false),
+            .rset => self.parseJustify(true),
+            .swap => self.parseSwap(),
             .type => self.parseTypeBlock(),
             .data => self.parseData(),
             .read => self.parseRead(),
@@ -922,7 +981,15 @@ const Builder = struct {
         };
     }
 
+    fn variableIsStatic(self: Builder, reference: VariableReference) bool {
+        return switch (reference.storage) {
+            .global => self.globals.items[reference.index].is_static,
+            .local => self.procedures.items[self.current_procedure].locals.items[reference.index].is_static,
+        };
+    }
+
     fn resolveVariable(self: *Builder, name: frontend.Span, create: bool) !?VariableReference {
+        const implicit_dimensions = if (create) self.implicitArrayDimensions() else 0;
         if (self.current_procedure != bytecode.invalid_index) {
             if (self.findLocal(self.current_procedure, name)) |index| return self.variableReference(.local, index);
 
@@ -932,17 +999,67 @@ const Builder = struct {
                 if (procedure.kind == .def_fn or global.is_shared or global.is_constant) return self.variableReference(.global, index);
             }
             if (!create) return null;
-            const local_index = try self.addLocal(self.current_procedure, .{
+            const local_index = try self.addDeclaredLocal(self.current_procedure, .{
                 .name = name,
                 .value_type = self.inferredType(name),
+                .dimensions = implicit_dimensions,
+                .is_dynamic = implicit_dimensions != 0 and self.arrayIsDynamic(true),
             });
-            return self.variableReference(.local, local_index);
+            const reference = self.variableReference(.local, local_index);
+            if (implicit_dimensions != 0) try self.emitImplicitArrayDimension(reference, implicit_dimensions, name);
+            return reference;
         }
 
         if (self.findGlobal(name)) |index| return self.variableReference(.global, index);
         if (!create) return null;
-        const global_index = try self.addGlobal(.{ .name = name, .value_type = self.inferredType(name) });
-        return self.variableReference(.global, global_index);
+        const global_index = try self.addGlobal(.{
+            .name = name,
+            .value_type = self.inferredType(name),
+            .dimensions = implicit_dimensions,
+            .is_dynamic = implicit_dimensions != 0 and self.arrayIsDynamic(true),
+        });
+        const reference = self.variableReference(.global, global_index);
+        if (implicit_dimensions != 0) try self.emitImplicitArrayDimension(reference, implicit_dimensions, name);
+        return reference;
+    }
+
+    fn implicitArrayDimensions(self: *Builder) u8 {
+        if (!self.at(.left_paren) or self.peek(1).kind == .right_paren) return 0;
+        var depth: usize = 0;
+        var dimensions: usize = 1;
+        var token_index = self.index;
+        while (token_index < self.tokens.len) : (token_index += 1) {
+            const token = self.tokens[token_index];
+            if (token.kind == .left_paren) {
+                depth += 1;
+            } else if (token.kind == .right_paren) {
+                if (depth == 0) return 0;
+                depth -= 1;
+                if (depth == 0) return @intCast(@min(dimensions, maximum_array_dimensions));
+            } else if (token.kind == .comma and depth == 1) {
+                dimensions += 1;
+                if (dimensions > maximum_array_dimensions) return 0;
+            } else if (token.kind == .newline or token.kind == .colon or token.kind == .eof) {
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+    fn emitImplicitArrayDimension(
+        self: *Builder,
+        reference: VariableReference,
+        dimensions: u8,
+        span: frontend.Span,
+    ) !void {
+        self.array_declaration_seen = true;
+        const upper = try self.addConstant(.{ .integer = 10 });
+        for (0..dimensions) |_| {
+            _ = try self.emit(.push_constant, upper, 0, span);
+            _ = try self.emit(.array_default_lower, self.option_base, 0, span);
+        }
+        try self.emitReference(reference, span);
+        _ = try self.emit(.dimension, dimensions, 1, span);
     }
 
     fn inspectVariable(self: *Builder, name: frontend.Span) VariableLookup {
@@ -988,6 +1105,67 @@ const Builder = struct {
         try procedure.locals.append(self.allocator, variable);
         if (!variable.hidden) try procedure.local_names.insert(self.allocator, self.source, 0, variable.name, index, &self.stats);
         return index;
+    }
+
+    fn addDeclaredLocal(self: *Builder, procedure_id: u32, variable: bytecode.Variable) !u32 {
+        if (!self.procedures.items[procedure_id].is_static or variable.is_parameter or variable.hidden) {
+            return self.addLocal(procedure_id, variable);
+        }
+        return self.addStaticLocal(procedure_id, variable, false);
+    }
+
+    fn addStaticLocal(
+        self: *Builder,
+        procedure_id: u32,
+        variable: bytecode.Variable,
+        explicit_static: bool,
+    ) !u32 {
+        var backing = variable;
+        backing.hidden = true;
+        backing.is_static = true;
+        backing.is_explicit_static = explicit_static;
+        backing.backing_global_index = bytecode.invalid_index;
+        const global_index = try self.addGlobal(backing);
+        var proxy = variable;
+        proxy.is_static = true;
+        proxy.is_explicit_static = explicit_static;
+        proxy.backing_global_index = global_index;
+        return self.addLocal(procedure_id, proxy);
+    }
+
+    fn makeLocalStatic(self: *Builder, procedure_id: u32, local_index: u32) !void {
+        var local = &self.procedures.items[procedure_id].locals.items[local_index];
+        if (local.is_parameter or local.is_constant) {
+            try self.addDiagnostic(.duplicate_symbol, local.name);
+            return;
+        }
+        if (local.is_static) return;
+        if (local.backing_global_index != bytecode.invalid_index) {
+            try self.addDiagnostic(.duplicate_symbol, local.name);
+            return;
+        }
+        var backing = local.*;
+        backing.hidden = true;
+        backing.is_static = true;
+        backing.is_explicit_static = true;
+        backing.backing_global_index = bytecode.invalid_index;
+        const global_index = try self.addGlobal(backing);
+        local = &self.procedures.items[procedure_id].locals.items[local_index];
+        local.is_static = true;
+        local.is_explicit_static = true;
+        local.backing_global_index = global_index;
+    }
+
+    fn syncLocalBacking(self: *Builder, procedure_id: u32, local_index: u32) void {
+        const local = self.procedures.items[procedure_id].locals.items[local_index];
+        if (local.backing_global_index == bytecode.invalid_index) return;
+        var backing = &self.globals.items[local.backing_global_index];
+        const hidden = backing.hidden;
+        const is_static = backing.is_static;
+        backing.* = local;
+        backing.hidden = hidden;
+        backing.is_static = is_static;
+        backing.backing_global_index = bytecode.invalid_index;
     }
 
     fn addHidden(self: *Builder, value_type: bytecode.ValueType, span: frontend.Span) !VariableReference {
@@ -1167,7 +1345,7 @@ const Builder = struct {
         return true;
     }
 
-    fn parseDefInt(self: *Builder) !bool {
+    fn parseDefType(self: *Builder, value_type: bytecode.ValueType) !bool {
         _ = self.advance();
         while (true) {
             const first = (try self.expectIdentifier()) orelse return false;
@@ -1175,74 +1353,151 @@ const Builder = struct {
             if (self.consume(.minus)) last = (try self.expectIdentifier()) orelse return false;
             const first_text = self.tokenText(first);
             const last_text = self.tokenText(last);
-            if (first_text.len == 0 or last_text.len == 0) return self.fail(.expected_identifier);
+            if (first_text.len != 1 or last_text.len != 1) {
+                try self.addDiagnostic(.unexpected_token, first.span);
+                if (!self.consume(.comma)) break;
+                continue;
+            }
             const first_letter = std.ascii.toUpper(first_text[0]);
             const last_letter = std.ascii.toUpper(last_text[0]);
             if (first_letter < 'A' or first_letter > 'Z' or last_letter < first_letter or last_letter > 'Z') {
                 try self.addDiagnostic(.unexpected_token, first.span);
             } else {
                 var letter = first_letter;
-                while (letter <= last_letter) : (letter += 1) self.default_types[letter - 'A'] = .integer;
+                while (letter <= last_letter) : (letter += 1) self.default_types[letter - 'A'] = value_type;
             }
             if (!self.consume(.comma)) break;
         }
+        return true;
+    }
+
+    fn parseOption(self: *Builder) !bool {
+        const statement = self.advance();
+        if (self.current_procedure != bytecode.invalid_index or !self.consumeKeyword(.base)) {
+            try self.addDiagnostic(.unexpected_token, statement.span);
+            return false;
+        }
+        if (self.option_base_seen or self.array_declaration_seen) {
+            try self.addDiagnostic(.duplicate_symbol, statement.span);
+        }
+        if (!self.at(.number)) return self.fail(.expected_token);
+        const value_token = self.advance();
+        const parsed = parseNumericConstant(self.mutableTokenText(value_token)) catch {
+            try self.addDiagnostic(.invalid_number, value_token.span);
+            return false;
+        };
+        const value: i64 = switch (parsed) {
+            .integer => |number| number,
+            .long => |number| number,
+            else => -1,
+        };
+        if (value != 0 and value != 1) {
+            try self.addDiagnostic(.invalid_number, value_token.span);
+            return false;
+        }
+        self.option_base = @intCast(value);
+        self.option_base_seen = true;
         return true;
     }
 
     fn parseDim(self: *Builder) !bool {
         const statement = self.advance();
         const shared = self.consumeKeyword(.shared);
+        if (shared and self.current_procedure != bytecode.invalid_index) {
+            try self.addDiagnostic(.unexpected_token, statement.span);
+        }
         while (true) {
             const name_token = (try self.expectIdentifier()) orelse return false;
             var dimensions: u8 = 0;
+            var bounds_constant = true;
             if (self.consume(.left_paren)) {
-                dimensions = (try self.parseArrayBounds()) orelse return false;
+                const bounds = (try self.parseArrayBounds()) orelse return false;
+                dimensions = bounds.dimensions;
+                bounds_constant = bounds.compile_time_constant;
+                self.array_declaration_seen = true;
             }
 
             var bound_type = BoundType{ .value_type = self.inferredType(name_token.span) };
-            if (self.consumeKeyword(.as)) {
+            const with_as = self.consumeKeyword(.as);
+            if (with_as) {
                 bound_type = (try self.parseBoundType()) orelse return false;
                 if (bound_type.accepts_any) {
                     try self.addDiagnostic(.unknown_type, name_token.span);
                     return false;
                 }
-                if (self.suffixType(name_token.span)) |suffix| {
-                    if (bound_type.isRecord() or suffix != bound_type.value_type) try self.addDiagnostic(.type_mismatch, name_token.span);
-                }
+                try self.validateSuffixType(name_token.span, bound_type);
             }
 
-            const variable = try self.declareVariable(name_token.span, bound_type, shared, dimensions, self.arrays_dynamic);
+            const variable = try self.declareVariable(
+                name_token.span,
+                bound_type,
+                shared,
+                dimensions,
+                if (dimensions == 0) false else self.arrayIsDynamic(bounds_constant),
+                with_as,
+            );
+            if (self.current_procedure == bytecode.invalid_index and dimensions != 0 and variable.is_dynamic) {
+                self.module_executable_seen = true;
+            }
             if (dimensions != 0) {
                 try self.emitReference(variable, name_token.span);
-                _ = try self.emit(.dimension, dimensions, 0, statement.span);
+                _ = try self.emit(.dimension, dimensions, @intFromBool(self.variableIsStatic(variable)), statement.span);
             }
             if (!self.consume(.comma)) break;
         }
         return true;
     }
 
-    fn parseArrayBounds(self: *Builder) !?u8 {
+    fn parseArrayBounds(self: *Builder) !?ArrayBounds {
         if (self.consume(.right_paren)) {
             try self.addDiagnostic(.invalid_array_bounds, self.tokens[self.index - 1].span);
             return null;
         }
         var dimensions: usize = 0;
+        var compile_time_constant = true;
         while (true) {
             if (dimensions >= maximum_array_dimensions) {
                 try self.addDiagnostic(.capacity_exceeded, self.current().span);
                 return null;
             }
+            const first_token = self.index;
             _ = (try self.parseExpression()) orelse return null;
+            compile_time_constant = compile_time_constant and self.isConstantBoundExpression(first_token, self.index);
             if (self.consumeKeyword(.to)) {
+                const last_token = self.index;
                 _ = (try self.parseExpression()) orelse return null;
+                compile_time_constant = compile_time_constant and self.isConstantBoundExpression(last_token, self.index);
             } else {
-                _ = try self.emit(.array_default_lower, 0, 0, self.tokens[self.index - 1].span);
+                _ = try self.emit(.array_default_lower, self.option_base, 0, self.tokens[self.index - 1].span);
             }
             dimensions += 1;
             if (!self.consume(.comma)) break;
         }
         if (!try self.expect(.right_paren)) return null;
-        return @intCast(dimensions);
+        return .{ .dimensions = @intCast(dimensions), .compile_time_constant = compile_time_constant };
+    }
+
+    fn isConstantBoundExpression(self: *Builder, first: usize, last: usize) bool {
+        for (self.tokens[first..last]) |token| switch (token.kind) {
+            .number, .plus, .minus, .multiply, .divide, .integer_divide, .power, .left_paren, .right_paren => {},
+            .identifier => {
+                const lookup = self.inspectVariable(token.span);
+                if (lookup.reference == null or !lookup.reference.?.is_constant) return false;
+            },
+            .keyword => if (token.keyword != .mod) return false,
+            else => return false,
+        };
+        return true;
+    }
+
+    fn arrayIsDynamic(self: *Builder, bounds_constant: bool) bool {
+        if (self.current_procedure != bytecode.invalid_index and
+            !self.procedures.items[self.current_procedure].is_static) return true;
+        return switch (self.array_allocation_mode) {
+            .dynamic => true,
+            .static => false,
+            .automatic => !bounds_constant,
+        };
     }
 
     fn declareVariable(
@@ -1252,6 +1507,7 @@ const Builder = struct {
         shared: bool,
         dimensions: u8,
         is_dynamic: bool,
+        with_as: bool,
     ) !VariableReference {
         if (self.current_procedure == bytecode.invalid_index or shared) {
             if (self.findGlobal(name)) |index| {
@@ -1261,9 +1517,14 @@ const Builder = struct {
                 {
                     try self.addDiagnostic(.type_mismatch, name);
                 }
-                if (variable.dimensions != dimensions) try self.addDiagnostic(.wrong_dimension_count, name);
+                if (variable.dimensions == bytecode.unknown_dimensions and dimensions != 0) {
+                    variable.dimensions = dimensions;
+                } else if (dimensions != bytecode.unknown_dimensions and variable.dimensions != dimensions) {
+                    try self.addDiagnostic(.wrong_dimension_count, name);
+                }
                 if (shared) variable.is_shared = true;
                 if (is_dynamic) variable.is_dynamic = true;
+                try self.applyDeclarationStyle(variable, with_as, name);
                 return self.variableReference(.global, index);
             }
             const index = try self.addGlobal(.{
@@ -1274,39 +1535,62 @@ const Builder = struct {
                 .dimensions = dimensions,
                 .is_dynamic = is_dynamic,
                 .is_shared = shared,
+                .is_declared = true,
+                .declared_with_as = with_as,
             });
             return self.variableReference(.global, index);
         }
 
         if (self.findLocal(self.current_procedure, name)) |index| {
-            const variable = &self.procedures.items[self.current_procedure].locals.items[index];
+            var variable = &self.procedures.items[self.current_procedure].locals.items[index];
             if (variable.value_type != bound_type.value_type or variable.record_type != bound_type.record_type or
                 variable.fixed_string_length != bound_type.fixed_string_length)
             {
                 try self.addDiagnostic(.type_mismatch, name);
             }
-            if (variable.dimensions != dimensions) try self.addDiagnostic(.wrong_dimension_count, name);
+            if (variable.dimensions == bytecode.unknown_dimensions and dimensions != 0) {
+                variable.dimensions = dimensions;
+            } else if (dimensions != bytecode.unknown_dimensions and variable.dimensions != dimensions) {
+                try self.addDiagnostic(.wrong_dimension_count, name);
+            }
             if (is_dynamic) variable.is_dynamic = true;
+            try self.applyDeclarationStyle(variable, with_as, name);
+            self.syncLocalBacking(self.current_procedure, index);
             return self.variableReference(.local, index);
         }
-        const index = try self.addLocal(self.current_procedure, .{
+        const index = try self.addDeclaredLocal(self.current_procedure, .{
             .name = name,
             .value_type = bound_type.value_type,
             .record_type = bound_type.record_type,
             .fixed_string_length = bound_type.fixed_string_length,
             .dimensions = dimensions,
             .is_dynamic = is_dynamic,
+            .is_declared = true,
+            .declared_with_as = with_as,
         });
         return self.variableReference(.local, index);
     }
 
     fn parseRedim(self: *Builder) !bool {
         const statement = self.advance();
-        const shared = self.consumeKeyword(.shared);
+        var preserve = false;
+        var shared = false;
+        while (true) {
+            if (!preserve and self.consumeKeyword(.preserve)) {
+                preserve = true;
+            } else if (!shared and self.consumeKeyword(.shared)) {
+                shared = true;
+            } else break;
+        }
+        if (shared and self.current_procedure != bytecode.invalid_index) {
+            try self.addDiagnostic(.unexpected_token, statement.span);
+        }
         while (true) {
             const name = (try self.expectIdentifier()) orelse return false;
             if (!try self.expect(.left_paren)) return false;
-            const dimensions = (try self.parseArrayBounds()) orelse return false;
+            const bounds = (try self.parseArrayBounds()) orelse return false;
+            const dimensions = bounds.dimensions;
+            self.array_declaration_seen = true;
             const existing = try self.resolveVariable(name.span, false);
             var bound_type = if (existing) |reference|
                 BoundType{
@@ -1316,9 +1600,11 @@ const Builder = struct {
                 }
             else
                 BoundType{ .value_type = self.inferredType(name.span) };
-            if (self.consumeKeyword(.as)) bound_type = (try self.parseBoundType()) orelse return false;
+            const with_as = self.consumeKeyword(.as);
+            if (with_as) bound_type = (try self.parseBoundType()) orelse return false;
+            try self.validateSuffixType(name.span, bound_type);
 
-            var reference = existing orelse try self.declareVariable(name.span, bound_type, shared, dimensions, true);
+            var reference = existing orelse try self.declareVariable(name.span, bound_type, shared, dimensions, true, with_as);
             if (reference.dimensions == 0) try self.addDiagnostic(.invalid_array_argument, name.span);
             if (reference.dimensions != bytecode.unknown_dimensions and reference.dimensions != dimensions) {
                 try self.addDiagnostic(.wrong_dimension_count, name.span);
@@ -1328,15 +1614,342 @@ const Builder = struct {
             {
                 try self.addDiagnostic(.type_mismatch, name.span);
             }
+            if (existing != null) switch (reference.storage) {
+                .global => try self.applyDeclarationStyle(&self.globals.items[reference.index], with_as, name.span),
+                .local => {
+                    try self.applyDeclarationStyle(
+                        &self.procedures.items[self.current_procedure].locals.items[reference.index],
+                        with_as,
+                        name.span,
+                    );
+                    self.syncLocalBacking(self.current_procedure, reference.index);
+                },
+            };
             reference.is_dynamic = true;
             switch (reference.storage) {
-                .global => self.globals.items[reference.index].is_dynamic = true,
-                .local => self.procedures.items[self.current_procedure].locals.items[reference.index].is_dynamic = true,
+                .global => {
+                    self.globals.items[reference.index].is_dynamic = true;
+                    if (shared) self.globals.items[reference.index].is_shared = true;
+                },
+                .local => {
+                    self.procedures.items[self.current_procedure].locals.items[reference.index].is_dynamic = true;
+                    self.syncLocalBacking(self.current_procedure, reference.index);
+                },
             }
             try self.emitReference(reference, name.span);
-            _ = try self.emit(.redimension, dimensions, 0, statement.span);
+            _ = try self.emit(.redimension, dimensions, @intFromBool(preserve), statement.span);
             if (!self.consume(.comma)) break;
         }
+        return true;
+    }
+
+    fn parseErase(self: *Builder) !bool {
+        const statement = self.advance();
+        while (true) {
+            const name = (try self.expectIdentifier()) orelse return false;
+            const reference = (try self.resolveVariable(name.span, false)) orelse {
+                try self.addDiagnostic(.expected_identifier, name.span);
+                return false;
+            };
+            if (reference.dimensions == 0) {
+                try self.addDiagnostic(.invalid_array_argument, name.span);
+                return false;
+            }
+            try self.emitReference(reference, name.span);
+            _ = try self.emit(.erase_array, 0, 0, statement.span);
+            if (!self.consume(.comma)) break;
+        }
+        return true;
+    }
+
+    fn parseStatic(self: *Builder) !bool {
+        const statement = self.advance();
+        if (self.current_procedure == bytecode.invalid_index) {
+            try self.addDiagnostic(.unexpected_token, statement.span);
+            return false;
+        }
+        while (true) {
+            const name = (try self.expectIdentifier()) orelse return false;
+            var dimensions: u8 = 0;
+            if (self.consume(.left_paren)) {
+                if (!try self.expect(.right_paren)) return false;
+                dimensions = bytecode.unknown_dimensions;
+                self.array_declaration_seen = true;
+            }
+            var bound_type = BoundType{ .value_type = self.inferredType(name.span) };
+            const with_as = self.consumeKeyword(.as);
+            if (with_as) bound_type = (try self.parseBoundType()) orelse return false;
+            try self.validateSuffixType(name.span, bound_type);
+
+            var local_index: u32 = undefined;
+            if (self.findLocal(self.current_procedure, name.span)) |existing| {
+                local_index = existing;
+                var local = &self.procedures.items[self.current_procedure].locals.items[existing];
+                if (local.value_type != bound_type.value_type or local.record_type != bound_type.record_type or
+                    local.fixed_string_length != bound_type.fixed_string_length)
+                {
+                    try self.addDiagnostic(.type_mismatch, name.span);
+                }
+                if (dimensions != 0) {
+                    if (local.dimensions == 0) local.dimensions = dimensions else if (local.dimensions != dimensions)
+                        try self.addDiagnostic(.wrong_dimension_count, name.span);
+                }
+                try self.applyDeclarationStyle(local, with_as, name.span);
+                try self.makeLocalStatic(self.current_procedure, existing);
+            } else {
+                local_index = try self.addStaticLocal(self.current_procedure, .{
+                    .name = name.span,
+                    .value_type = bound_type.value_type,
+                    .record_type = bound_type.record_type,
+                    .fixed_string_length = bound_type.fixed_string_length,
+                    .dimensions = dimensions,
+                    .is_declared = true,
+                    .declared_with_as = with_as,
+                }, true);
+                if (self.findGlobal(name.span)) |global_index| {
+                    self.rewriteProcedureGlobalAsLocal(self.current_procedure, global_index, local_index);
+                }
+            }
+            self.syncLocalBacking(self.current_procedure, local_index);
+            if (!self.consume(.comma)) break;
+        }
+        return true;
+    }
+
+    fn parseShared(self: *Builder) !bool {
+        const statement = self.advance();
+        if (self.current_procedure == bytecode.invalid_index) {
+            try self.addDiagnostic(.unexpected_token, statement.span);
+            return false;
+        }
+        while (true) {
+            const name = (try self.expectIdentifier()) orelse return false;
+            var dimensions: u8 = 0;
+            if (self.consume(.left_paren)) {
+                if (!try self.expect(.right_paren)) return false;
+                dimensions = bytecode.unknown_dimensions;
+                self.array_declaration_seen = true;
+            }
+            var bound_type = BoundType{ .value_type = self.inferredType(name.span) };
+            const with_as = self.consumeKeyword(.as);
+            if (with_as) bound_type = (try self.parseBoundType()) orelse return false;
+            try self.validateSuffixType(name.span, bound_type);
+
+            const global_index = self.findGlobal(name.span) orelse try self.addGlobal(.{
+                .name = name.span,
+                .value_type = bound_type.value_type,
+                .record_type = bound_type.record_type,
+                .fixed_string_length = bound_type.fixed_string_length,
+                .dimensions = dimensions,
+                .is_dynamic = dimensions != 0,
+                .is_declared = true,
+                .declared_with_as = with_as,
+            });
+            var global = &self.globals.items[global_index];
+            if (global.value_type != bound_type.value_type or global.record_type != bound_type.record_type or
+                global.fixed_string_length != bound_type.fixed_string_length)
+            {
+                try self.addDiagnostic(.type_mismatch, name.span);
+            }
+            if (global.dimensions == 0 and dimensions != 0) global.dimensions = dimensions;
+            try self.applyDeclarationStyle(global, with_as, name.span);
+
+            if (self.findLocal(self.current_procedure, name.span)) |local_index| {
+                var local = &self.procedures.items[self.current_procedure].locals.items[local_index];
+                if (local.is_parameter or local.is_explicit_static or local.is_constant) {
+                    try self.addDiagnostic(.duplicate_symbol, name.span);
+                } else {
+                    try self.applyDeclarationStyle(local, with_as, name.span);
+                    local.value_type = global.value_type;
+                    local.record_type = global.record_type;
+                    local.fixed_string_length = global.fixed_string_length;
+                    local.dimensions = global.dimensions;
+                    local.is_dynamic = global.is_dynamic;
+                    local.is_static = false;
+                    local.backing_global_index = global_index;
+                }
+            } else {
+                var proxy = global.*;
+                proxy.name = name.span;
+                proxy.hidden = false;
+                proxy.is_shared = false;
+                proxy.is_common = false;
+                proxy.backing_global_index = global_index;
+                _ = try self.addLocal(self.current_procedure, proxy);
+            }
+            if (!self.consume(.comma)) break;
+        }
+        return true;
+    }
+
+    fn rewriteProcedureGlobalAsLocal(self: *Builder, procedure_id: u32, global_index: u32, local_index: u32) void {
+        const first = self.procedures.items[procedure_id].entry_ip;
+        if (first == bytecode.invalid_index) return;
+        for (self.instructions.items[first..]) |*instruction| switch (instruction.op) {
+            .load_global => if (instruction.a == global_index) {
+                instruction.op = .load_local;
+                instruction.a = local_index;
+            },
+            .store_global => if (instruction.a == global_index) {
+                instruction.op = .store_local;
+                instruction.a = local_index;
+            },
+            .initialize_global => if (instruction.a == global_index) {
+                instruction.op = .initialize_local;
+                instruction.a = local_index;
+            },
+            .push_global_reference => if (instruction.a == global_index) {
+                instruction.op = .push_local_reference;
+                instruction.a = local_index;
+            },
+            else => {},
+        };
+    }
+
+    fn parseCommon(self: *Builder) !bool {
+        const statement = self.advance();
+        if (self.current_procedure != bytecode.invalid_index or self.module_executable_seen) {
+            try self.addDiagnostic(.unexpected_token, statement.span);
+        }
+        const shared = self.consumeKeyword(.shared);
+        var named = false;
+        var block_name = statement.span;
+        if (self.consume(.divide)) {
+            named = true;
+            block_name = ((try self.expectIdentifier()) orelse return false).span;
+            if (!try self.expect(.divide)) return false;
+        }
+        const block_index = try self.commonBlock(block_name, named);
+        while (true) {
+            const name = (try self.expectIdentifier()) orelse return false;
+            var dimensions: u8 = 0;
+            if (self.consume(.left_paren)) {
+                if (!try self.expect(.right_paren)) return false;
+                dimensions = bytecode.unknown_dimensions;
+                self.array_declaration_seen = true;
+            }
+            var bound_type = BoundType{ .value_type = self.inferredType(name.span) };
+            const with_as = self.consumeKeyword(.as);
+            if (with_as) bound_type = (try self.parseBoundType()) orelse return false;
+            try self.validateSuffixType(name.span, bound_type);
+
+            const global_index = self.findGlobal(name.span) orelse try self.addGlobal(.{
+                .name = name.span,
+                .value_type = bound_type.value_type,
+                .record_type = bound_type.record_type,
+                .fixed_string_length = bound_type.fixed_string_length,
+                .dimensions = dimensions,
+                .is_dynamic = dimensions != 0,
+                .is_declared = true,
+                .declared_with_as = with_as,
+            });
+            var global = &self.globals.items[global_index];
+            if (global.is_common) try self.addDiagnostic(.duplicate_symbol, name.span);
+            if (global.value_type != bound_type.value_type or global.record_type != bound_type.record_type or
+                global.fixed_string_length != bound_type.fixed_string_length)
+            {
+                try self.addDiagnostic(.type_mismatch, name.span);
+            }
+            if (global.dimensions == 0 and dimensions != 0) {
+                global.dimensions = dimensions;
+                global.is_dynamic = true;
+            }
+            try self.applyDeclarationStyle(global, with_as, name.span);
+            const entry_size: u32 = if (global.dimensions != 0) 16 else self.boundTypeByteSize(bound_type) orelse {
+                try self.addDiagnostic(.capacity_exceeded, name.span);
+                return false;
+            };
+            var block = &self.common_blocks.items[block_index];
+            const offset = block.byte_size;
+            block.byte_size = std.math.add(u32, block.byte_size, entry_size) catch {
+                try self.addDiagnostic(.capacity_exceeded, name.span);
+                return false;
+            };
+            try block.entries.append(self.allocator, .{
+                .global_index = global_index,
+                .offset = offset,
+                .byte_size = entry_size,
+            });
+            global = &self.globals.items[global_index];
+            global.is_common = true;
+            global.is_shared = global.is_shared or shared;
+            global.common_block_index = block_index;
+            global.common_offset = offset;
+            if (!self.consume(.comma)) break;
+        }
+        return true;
+    }
+
+    fn commonBlock(self: *Builder, name: frontend.Span, named: bool) !u32 {
+        for (self.common_blocks.items, 0..) |block, index| {
+            if (block.named != named) continue;
+            if (!named or self.namesEqual(block.name, name)) return @intCast(index);
+        }
+        const index: u32 = @intCast(self.common_blocks.items.len);
+        try self.common_blocks.append(self.allocator, .{ .name = name, .named = named });
+        return index;
+    }
+
+    fn parseClear(self: *Builder) !bool {
+        const statement = self.advance();
+        if (self.current_procedure != bytecode.invalid_index) {
+            try self.addDiagnostic(.unexpected_token, statement.span);
+            return false;
+        }
+        var has_stack = false;
+        if (self.consume(.comma)) {
+            if (!try self.expect(.comma)) return false;
+            const value_type = (try self.parseExpression()) orelse return false;
+            if (!value_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            has_stack = true;
+        }
+        _ = try self.emit(.clear_state, @intFromBool(has_stack), 0, statement.span);
+        return true;
+    }
+
+    fn parseJustify(self: *Builder, right: bool) !bool {
+        const statement = self.advance();
+        const name = (try self.expectIdentifier()) orelse return false;
+        const target = (try self.parseLvalueReference(name, true)) orelse return false;
+        if (target.is_whole_array) {
+            try self.addDiagnostic(.invalid_array_argument, name.span);
+            return false;
+        }
+        if (!try self.expect(.equal)) return false;
+        if (target.record_type != bytecode.invalid_index) {
+            if (right) {
+                try self.addDiagnostic(.type_mismatch, name.span);
+                return false;
+            }
+            const source_name = (try self.expectIdentifier()) orelse return false;
+            const source = (try self.parseLvalueReference(source_name, false)) orelse return false;
+            if (source.record_type == bytecode.invalid_index or source.is_whole_array) {
+                try self.addDiagnostic(.type_mismatch, source_name.span);
+                return false;
+            }
+            _ = try self.emit(.lset_record, 0, 0, statement.span);
+            return true;
+        }
+        if (target.value_type != .string) try self.addDiagnostic(.type_mismatch, name.span);
+        const source_type = (try self.parseExpression()) orelse return false;
+        if (source_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+        _ = try self.emit(.justify_string, @intFromBool(right), 0, statement.span);
+        return true;
+    }
+
+    fn parseSwap(self: *Builder) !bool {
+        const statement = self.advance();
+        const first_name = (try self.expectIdentifier()) orelse return false;
+        const first = (try self.parseLvalueReference(first_name, true)) orelse return false;
+        if (!try self.expect(.comma)) return false;
+        const second_name = (try self.expectIdentifier()) orelse return false;
+        const second = (try self.parseLvalueReference(second_name, true)) orelse return false;
+        if (first.is_whole_array or second.is_whole_array or first.value_type != second.value_type or
+            first.record_type != second.record_type or first.fixed_string_length != second.fixed_string_length)
+        {
+            try self.addDiagnostic(.type_mismatch, statement.span);
+        }
+        _ = try self.emit(.swap_values, 0, 0, statement.span);
         return true;
     }
 
@@ -1372,8 +1985,9 @@ const Builder = struct {
             const field_name = (try self.expectIdentifier()) orelse return false;
             if (!try self.expectKeyword(.as)) return false;
             const field_type = (try self.parseBoundType()) orelse return false;
-            if (field_type.accepts_any or field_type.isRecord()) {
-                try self.addDiagnostic(.unsupported_core_feature, field_name.span);
+            if (field_type.accepts_any or (field_type.isRecord() and field_type.record_type >= record_index)) {
+                try self.addDiagnostic(.unknown_type, field_name.span);
+                return false;
             }
             if (field_type.value_type == .string and field_type.fixed_string_length == 0) {
                 try self.addDiagnostic(.type_mismatch, field_name.span);
@@ -1387,17 +2001,61 @@ const Builder = struct {
             if (record_type.field_names.lookup(self.source, 0, field_name.span, &self.stats) != null)
                 try self.addDiagnostic(.duplicate_symbol, field_name.span);
             const field_index: u32 = @intCast(record_type.fields.items.len);
+            const field_size = self.boundTypeByteSize(field_type) orelse {
+                try self.addDiagnostic(.capacity_exceeded, field_name.span);
+                return false;
+            };
+            const next_size = std.math.add(u32, record_type.byte_size, field_size) catch {
+                try self.addDiagnostic(.capacity_exceeded, field_name.span);
+                return false;
+            };
             try record_type.fields.append(self.allocator, .{
                 .name = field_name.span,
                 .value_type = field_type.value_type,
+                .record_type = field_type.record_type,
                 .fixed_string_length = field_type.fixed_string_length,
+                .offset = record_type.byte_size,
             });
+            record_type.byte_size = next_size;
             try record_type.field_names.insert(self.allocator, self.source, 0, field_name.span, field_index, &self.stats);
             if (!self.atBoundary()) return self.fail(.unexpected_token);
             while (self.consume(.newline) or self.consume(.colon)) {}
         }
         try self.addDiagnostic(.block_not_closed, statement.span);
         return false;
+    }
+
+    fn boundTypeByteSize(self: *Builder, bound_type: BoundType) ?u32 {
+        if (bound_type.record_type != bytecode.invalid_index) {
+            if (bound_type.record_type >= self.record_types.items.len) return null;
+            return self.record_types.items[bound_type.record_type].byte_size;
+        }
+        return switch (bound_type.value_type) {
+            .integer => 2,
+            .long, .single => 4,
+            .double => 8,
+            .string => if (bound_type.fixed_string_length == 0) 4 else bound_type.fixed_string_length,
+        };
+    }
+
+    fn validateSuffixType(self: *Builder, name: frontend.Span, bound_type: BoundType) !void {
+        if (self.suffixType(name)) |suffix| {
+            if (bound_type.isRecord() or suffix != bound_type.value_type) try self.addDiagnostic(.type_mismatch, name);
+        }
+    }
+
+    fn applyDeclarationStyle(
+        self: *Builder,
+        variable: *bytecode.Variable,
+        with_as: bool,
+        span: frontend.Span,
+    ) !void {
+        if (variable.is_declared and variable.declared_with_as != with_as) {
+            try self.addDiagnostic(.type_mismatch, span);
+        } else if (!variable.is_declared) {
+            variable.is_declared = true;
+            variable.declared_with_as = with_as;
+        }
     }
 
     fn parseData(self: *Builder) !bool {
@@ -2101,7 +2759,7 @@ const Builder = struct {
             });
         }
         if (self.at(.left_paren) and !try self.parseParameters(procedure_id, false)) return false;
-        _ = self.consumeKeyword(.static);
+        procedure.is_static = self.consumeKeyword(.static);
         try self.validateDeclaredSignature(name.span, declared_types, procedure.parameters.items);
 
         self.current_procedure_skip = try self.emit(.jump, bytecode.invalid_index, 0, statement.span);
@@ -2257,8 +2915,18 @@ const Builder = struct {
     }
 
     fn parseAssignment(self: *Builder, name: frontend.Token, target: BoundLvalue) !bool {
+        if (target.record_type != bytecode.invalid_index and !target.is_whole_array) {
+            const source_name = (try self.expectIdentifier()) orelse return false;
+            const source = (try self.parseLvalueReference(source_name, false)) orelse return false;
+            if (source.is_whole_array or source.record_type != target.record_type) {
+                try self.addDiagnostic(.type_mismatch, source_name.span);
+                return false;
+            }
+            _ = try self.emit(.copy_record, 0, 0, name.span);
+            return true;
+        }
         const expression_type = (try self.parseExpression()) orelse return false;
-        if (target.is_whole_array or target.record_type != bytecode.invalid_index) {
+        if (target.is_whole_array) {
             try self.addDiagnostic(.invalid_record_access, name.span);
             return false;
         }
@@ -2283,6 +2951,7 @@ const Builder = struct {
         var result = BoundLvalue{
             .value_type = variable.value_type,
             .record_type = variable.record_type,
+            .fixed_string_length = variable.fixed_string_length,
             .dimensions = variable.dimensions,
             .is_constant = variable.is_constant,
         };
@@ -2318,7 +2987,7 @@ const Builder = struct {
             return result;
         }
 
-        if (self.consume(.dot)) {
+        while (self.consume(.dot)) {
             if (result.record_type == bytecode.invalid_index) {
                 try self.addDiagnostic(.invalid_record_access, name.span);
                 return null;
@@ -2328,10 +2997,11 @@ const Builder = struct {
                 try self.addDiagnostic(.unknown_field, field.span);
                 return null;
             };
-            const field_type = self.record_types.items[result.record_type].fields.items[field_index].value_type;
+            const field_definition = self.record_types.items[result.record_type].fields.items[field_index];
             _ = try self.emit(.select_record_field, field_index, 0, field.span);
-            result.value_type = field_type;
-            result.record_type = bytecode.invalid_index;
+            result.value_type = field_definition.value_type;
+            result.record_type = field_definition.record_type;
+            result.fixed_string_length = field_definition.fixed_string_length;
         }
         return result;
     }
@@ -2688,6 +3358,9 @@ const Builder = struct {
         }
         if (self.at(.keyword)) {
             if (self.atKeyword(.input_string)) return self.parseInputStringFunction();
+            if (self.atKeyword(.lbound)) return self.parseArrayBoundFunction(false);
+            if (self.atKeyword(.ubound)) return self.parseArrayBoundFunction(true);
+            if (self.atKeyword(.len) and self.lenStartsVariableForm()) return self.parseLenVariable();
             if (builtinForKeyword(self.current().keyword)) |builtin| return self.parseBuiltin(builtin);
         }
         if (self.consume(.left_paren)) {
@@ -2714,6 +3387,92 @@ const Builder = struct {
         if (!try self.expect(.right_paren)) return null;
         _ = try self.emit(.input_string, if (from_file) 2 else 1, @intFromBool(from_file), function_token.span);
         return .string;
+    }
+
+    fn parseArrayBoundFunction(self: *Builder, upper: bool) !?bytecode.ValueType {
+        const function_token = self.advance();
+        if (!try self.expect(.left_paren)) return null;
+        const name = (try self.expectIdentifier()) orelse return null;
+        const reference = (try self.resolveVariable(name.span, false)) orelse blk: {
+            const dimensions: u8 = 1;
+            const dynamic = self.arrayIsDynamic(true);
+            const index = if (self.current_procedure == bytecode.invalid_index)
+                try self.addGlobal(.{
+                    .name = name.span,
+                    .value_type = self.inferredType(name.span),
+                    .dimensions = dimensions,
+                    .is_dynamic = dynamic,
+                })
+            else
+                try self.addDeclaredLocal(self.current_procedure, .{
+                    .name = name.span,
+                    .value_type = self.inferredType(name.span),
+                    .dimensions = dimensions,
+                    .is_dynamic = dynamic,
+                });
+            const created = self.variableReference(
+                if (self.current_procedure == bytecode.invalid_index) .global else .local,
+                index,
+            );
+            try self.emitImplicitArrayDimension(created, dimensions, name.span);
+            break :blk created;
+        };
+        if (reference.dimensions == 0) {
+            try self.addDiagnostic(.invalid_array_argument, name.span);
+            return null;
+        }
+        try self.emitReference(reference, name.span);
+        if (self.consume(.comma)) {
+            const dimension_type = (try self.parseExpression()) orelse return null;
+            if (!dimension_type.isNumeric()) try self.addDiagnostic(.type_mismatch, function_token.span);
+        } else {
+            const one = try self.addConstant(.{ .integer = 1 });
+            _ = try self.emit(.push_constant, one, 0, function_token.span);
+        }
+        if (!try self.expect(.right_paren)) return null;
+        _ = try self.emit(.array_bound, @intFromBool(upper), 0, function_token.span);
+        return .integer;
+    }
+
+    fn lenStartsVariableForm(self: *Builder) bool {
+        if (self.peek(1).kind != .left_paren or self.peek(2).kind != .identifier) return false;
+        const name = self.peek(2);
+        if (self.inspectVariable(name.span).reference) |reference| {
+            return reference.value_type != .string or reference.record_type != bytecode.invalid_index;
+        }
+        return self.inferredType(name.span) != .string;
+    }
+
+    fn parseLenVariable(self: *Builder) !?bytecode.ValueType {
+        const function_token = self.advance();
+        if (!try self.expect(.left_paren)) return null;
+        const name = (try self.expectIdentifier()) orelse return null;
+        const target = (try self.parseLvalueReference(name, true)) orelse return null;
+        if (!try self.expect(.right_paren)) return null;
+        if (target.is_whole_array) {
+            try self.addDiagnostic(.invalid_array_argument, name.span);
+            return null;
+        }
+        if (target.value_type == .string and target.record_type == bytecode.invalid_index) {
+            _ = try self.emit(.call_builtin, @intFromEnum(bytecode.Builtin.len), 1, function_token.span);
+            return .integer;
+        }
+        _ = try self.emit(.pop, 0, 0, function_token.span);
+        const byte_size: u32 = if (target.record_type != bytecode.invalid_index)
+            self.record_types.items[target.record_type].byte_size
+        else switch (target.value_type) {
+            .integer => 2,
+            .long, .single => 4,
+            .double => 8,
+            .string => unreachable,
+        };
+        if (byte_size > std.math.maxInt(i16)) {
+            try self.addDiagnostic(.capacity_exceeded, name.span);
+            return null;
+        }
+        const constant = try self.addConstant(.{ .integer = @intCast(byte_size) });
+        _ = try self.emit(.push_constant, constant, 0, function_token.span);
+        return .integer;
     }
 
     fn parseNumber(self: *Builder) !?bytecode.ValueType {
@@ -3357,6 +4116,7 @@ const Builder = struct {
     }
 
     fn finish(self: *Builder) !bytecode.Program {
+        self.bindModuleSharedAliases();
         std.debug.assert(self.instructions.items.len == self.instruction_metadata.items.len);
         self.stats.instruction_hot_bytes = @as(u64, @intCast(self.instructions.items.len)) * @sizeOf(bytecode.Instruction);
         self.stats.instruction_metadata_bytes = @as(u64, @intCast(self.instruction_metadata.items.len)) * @sizeOf(bytecode.InstructionMetadata);
@@ -3367,6 +4127,7 @@ const Builder = struct {
         self.stats.diagnostics_truncated = self.diagnostics_truncated;
         var owned_procedures: std.ArrayList(bytecode.Procedure) = .empty;
         var owned_record_types: std.ArrayList(bytecode.RecordType) = .empty;
+        var owned_common_blocks: std.ArrayList(bytecode.CommonBlock) = .empty;
         errdefer {
             for (owned_procedures.items) |procedure| {
                 self.allocator.free(procedure.locals);
@@ -3377,6 +4138,10 @@ const Builder = struct {
         errdefer {
             for (owned_record_types.items) |record_type| self.allocator.free(record_type.fields);
             owned_record_types.deinit(self.allocator);
+        }
+        errdefer {
+            for (owned_common_blocks.items) |block| self.allocator.free(block.entries);
+            owned_common_blocks.deinit(self.allocator);
         }
 
         for (self.procedures.items) |*procedure| {
@@ -3392,6 +4157,7 @@ const Builder = struct {
                 .end_ip = procedure.end_ip,
                 .return_local = procedure.return_local,
                 .return_type = procedure.return_type,
+                .is_static = procedure.is_static,
                 .locals = locals,
                 .parameters = parameters,
             });
@@ -3401,7 +4167,22 @@ const Builder = struct {
             const fields = try record_type.fields.toOwnedSlice(self.allocator);
             errdefer self.allocator.free(fields);
             record_type.field_names.deinit(self.allocator);
-            try owned_record_types.append(self.allocator, .{ .name = record_type.name, .fields = fields });
+            try owned_record_types.append(self.allocator, .{
+                .name = record_type.name,
+                .fields = fields,
+                .byte_size = record_type.byte_size,
+            });
+        }
+
+        for (self.common_blocks.items) |*block| {
+            const entries = try block.entries.toOwnedSlice(self.allocator);
+            errdefer self.allocator.free(entries);
+            try owned_common_blocks.append(self.allocator, .{
+                .name = block.name,
+                .named = block.named,
+                .entries = entries,
+                .byte_size = block.byte_size,
+            });
         }
 
         const instructions = try self.instructions.toOwnedSlice(self.allocator);
@@ -3425,6 +4206,11 @@ const Builder = struct {
             for (record_types) |record_type| self.allocator.free(record_type.fields);
             self.allocator.free(record_types);
         }
+        const common_blocks = try owned_common_blocks.toOwnedSlice(self.allocator);
+        errdefer {
+            for (common_blocks) |block| self.allocator.free(block.entries);
+            self.allocator.free(common_blocks);
+        }
         const data_items = try self.data_items.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(data_items);
         const diagnostics = try self.diagnostics.toOwnedSlice(self.allocator);
@@ -3436,6 +4222,7 @@ const Builder = struct {
         self.blocks.deinit(self.allocator);
         self.procedures.deinit(self.allocator);
         self.record_types.deinit(self.allocator);
+        self.common_blocks.deinit(self.allocator);
         self.global_names.deinit(self.allocator);
         self.procedure_names.deinit(self.allocator);
         self.record_names.deinit(self.allocator);
@@ -3453,6 +4240,7 @@ const Builder = struct {
             .globals = globals,
             .procedures = procedures,
             .record_types = record_types,
+            .common_blocks = common_blocks,
             .data_items = data_items,
             .diagnostics = diagnostics,
             .diagnostics_total = self.diagnostics_total,
@@ -3460,6 +4248,27 @@ const Builder = struct {
             .module_entry = 0,
             .compile_stats = self.stats,
         };
+    }
+
+    fn bindModuleSharedAliases(self: *Builder) void {
+        for (self.procedures.items) |*procedure| {
+            for (procedure.locals.items) |*local| {
+                if (local.is_parameter or local.is_constant or local.is_explicit_static or local.hidden) continue;
+                var global_index = local.backing_global_index;
+                if (global_index == bytecode.invalid_index) {
+                    global_index = self.findGlobal(local.name) orelse continue;
+                    if (!self.globals.items[global_index].is_shared) continue;
+                    local.backing_global_index = global_index;
+                }
+                const global = self.globals.items[global_index];
+                local.value_type = global.value_type;
+                local.record_type = global.record_type;
+                local.fixed_string_length = global.fixed_string_length;
+                local.dimensions = global.dimensions;
+                local.is_dynamic = global.is_dynamic;
+                local.is_static = false;
+            }
+        }
     }
 
     fn addDiagnostic(self: *Builder, code: bytecode.DiagnosticCode, span: frontend.Span) !void {

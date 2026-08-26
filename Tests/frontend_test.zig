@@ -213,11 +213,11 @@ test "all known keywords use bounded case-insensitive lexical lookup" {
 
 test "remaining QuickBASIC appendix-E words are reserved" {
     const reference_words = [_][]const u8{
-        "SEEK",   "ACCESS",   "ALIAS",   "ENDIF",  "LSET",     "SETMEM", "SIGNAL",
+        "SEEK",   "ACCESS",   "ALIAS",   "ENDIF",  "SETMEM",   "SIGNAL",
         "ERDEV",  "ERDEV$",   "BINARY",  "CALLS",  "FILEATTR", "OFF",    "STOP",
-        "CDECL",  "FREEFILE", "CLEAR",   "PEN",    "COM",      "PMAP",   "TROFF",
-        "TRON",   "UEVENT",   "VARPTR$", "RESET",  "DEFDBL",   "LIST",   "DEFLNG",
-        "DEFSNG", "LOCAL",    "WINDOW",  "DEFSTR", "RSET",
+        "CDECL",  "FREEFILE", "PEN",     "COM",    "PMAP",     "TROFF",
+        "TRON",   "UEVENT",   "VARPTR$", "RESET",  "LIST",     "LOCAL",
+        "WINDOW",
     };
     for (reference_words) |word| {
         const result = frontend.tokenizeNamed("appendix-e.bas", word, tokens[0..], diagnostics[0..]);

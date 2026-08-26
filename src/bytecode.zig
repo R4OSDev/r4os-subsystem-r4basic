@@ -1,7 +1,7 @@
 const std = @import("std");
 const frontend = @import("frontend.zig");
 
-pub const contract_version = "2.0.0";
+pub const contract_version = "2.1.0";
 pub const invalid_index: u32 = std.math.maxInt(u32);
 pub const unknown_dimensions: u8 = std.math.maxInt(u8);
 
@@ -49,7 +49,15 @@ pub const Variable = struct {
     is_dynamic: bool = false,
     is_constant: bool = false,
     is_parameter: bool = false,
+    is_declared: bool = false,
+    declared_with_as: bool = false,
     is_shared: bool = false,
+    is_static: bool = false,
+    is_explicit_static: bool = false,
+    is_common: bool = false,
+    backing_global_index: u32 = invalid_index,
+    common_block_index: u32 = invalid_index,
+    common_offset: u32 = 0,
     hidden: bool = false,
 
     pub fn isArray(self: Variable) bool {
@@ -78,12 +86,28 @@ pub const Parameter = struct {
 pub const RecordField = struct {
     name: frontend.Span,
     value_type: ValueType,
+    record_type: u32 = invalid_index,
     fixed_string_length: u16 = 0,
+    offset: u32 = 0,
 };
 
 pub const RecordType = struct {
     name: frontend.Span,
     fields: []RecordField,
+    byte_size: u32,
+};
+
+pub const CommonEntry = struct {
+    global_index: u32,
+    offset: u32,
+    byte_size: u32,
+};
+
+pub const CommonBlock = struct {
+    name: frontend.Span,
+    named: bool,
+    entries: []CommonEntry,
+    byte_size: u32,
 };
 
 pub const DataItem = struct {
@@ -127,6 +151,7 @@ pub const Procedure = struct {
     end_ip: u32 = invalid_index,
     return_local: u32 = invalid_index,
     return_type: ValueType = .single,
+    is_static: bool = false,
     locals: []Variable = &.{},
     parameters: []Parameter = &.{},
 
@@ -152,6 +177,13 @@ pub const OpCode = enum(u8) {
     store_reference,
     dimension,
     redimension,
+    erase_array,
+    array_bound,
+    clear_state,
+    justify_string,
+    copy_record,
+    lset_record,
+    swap_values,
     read_data,
     restore_data,
     set_error_handler,
@@ -423,6 +455,7 @@ pub const Program = struct {
     globals: []Variable,
     procedures: []Procedure,
     record_types: []RecordType,
+    common_blocks: []CommonBlock,
     data_items: []DataItem,
     diagnostics: []Diagnostic,
     diagnostics_total: u32 = 0,
@@ -452,6 +485,8 @@ pub const Program = struct {
             self.allocator.free(procedure.parameters);
         }
         for (self.record_types) |record_type| self.allocator.free(record_type.fields);
+        for (self.common_blocks) |block| self.allocator.free(block.entries);
+        self.allocator.free(self.common_blocks);
         self.allocator.free(self.record_types);
         self.allocator.free(self.data_items);
         self.allocator.free(self.procedures);

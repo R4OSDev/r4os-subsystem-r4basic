@@ -429,23 +429,24 @@ test "R4BASIC v2 conformance catalog is complete stable and machine readable" {
     );
     try expectTargetImplemented(core.conformance.part1_targets[0]);
     try expectTargetImplemented(core.conformance.part1_targets[1]);
+    try expectTargetImplemented(core.conformance.part1_targets[3]);
     try expectTargetImplemented(core.conformance.part1_targets[5]);
     try expectTargetImplemented(core.conformance.metacommand_targets[0]);
+    try expectTargetImplemented(core.conformance.metacommand_targets[1]);
+    try expectTargetImplemented(core.conformance.metacommand_targets[2]);
     for ([_]usize{
-        0,   1,   2,   11,  15,  18,  26,  27,  28,  29,  30,  51,  55,  64,  66,  68,  69,  71,  72,  79,
-        80,  84,  87,  90,  94,  95,  96,  97,  99,  101, 122, 124, 125, 130, 138, 140, 142, 145, 151, 154, 157,
-        158, 159, 163, 166, 170, 171, 179, 182, 186, 188, 191,
+        0,   1,   2,   11,  15,  17,  18,  26,  27,  28,  29,  30,  38,  39,  46,  51,  55,  64,  66,  68,
+        69,  71,  72,  78,  79,  80,  81,  84,  87,  90,  94,  95,  96,  97,  99,  101, 108, 122, 124, 125,
+        130, 132, 138, 140, 142, 145, 151, 152, 154, 157, 158, 159, 163, 166, 168, 170, 171, 177, 178, 179,
+        182, 186, 188, 191,
     }) |index| {
         try expectTargetImplemented(core.conformance.part2_targets[index]);
     }
-    try std.testing.expectEqual(core.conformance.Status.implemented, core.conformance.part1_targets[3].lexer);
 }
 
 test "unimplemented statements stop at catalog-addressed compile diagnostics" {
     const cases = [_]struct { source: []const u8, id: []const u8 }{
         .{ .source = "ERROR 5\nEND\n", .id = "QB45-P2-050" },
-        .{ .source = "SHARED Value\nEND\n", .id = "QB45-P2-153" },
-        .{ .source = "STATIC Value\nEND\n", .id = "QB45-P2-161" },
     };
     for (cases) |case| {
         var program = try core.compiler.compile(std.testing.allocator, "not-yet.bas", case.source);
@@ -1070,6 +1071,10 @@ test "compiler rejects invalid bindings labels and array shapes" {
         .{ .source = "CONST Fixed = 1\nFixed = 2\nEND\n", .expected = .constant_assignment },
         .{ .source = "IF \"text\" THEN Value = 1\nEND\n", .expected = .type_mismatch },
         .{ .source = "FOR Index = \"text\" TO 3\nNEXT Index\nEND\n", .expected = .type_mismatch },
+        .{ .source = "DIM Value% AS LONG\nEND\n", .expected = .type_mismatch },
+        .{ .source = "DIM Value AS INTEGER\nDIM Value\nEND\n", .expected = .type_mismatch },
+        .{ .source = "DEFINT AB\nEND\n", .expected = .unexpected_token },
+        .{ .source = "DIM Values(2)\nOPTION BASE 1\nEND\n", .expected = .duplicate_symbol },
     };
     for (cases) |case| {
         var program = try core.compiler.compile(std.testing.allocator, "compile-error.bas", case.source);
@@ -1143,6 +1148,279 @@ test "fixed bounds REDIM reset and RESTORE preserve typed DATA order" {
     try expectString(&machine, "Word$", "hello");
     try expectLong(&machine, "Signed&", -8);
     try expectString(&machine, "NumericText$", "7");
+}
+
+test "declaration defaults option base arrays records and byte layouts follow QuickBASIC storage rules" {
+    const source =
+        \\DEFLNG A-C
+        \\DEFSNG D-F
+        \\DEFDBL G-I
+        \\DEFSTR J-L
+        \\DEFINT M-Z
+        \\Alpha = 11
+        \\Delta = 2.5
+        \\Golf = 3.25
+        \\Juliet = "text"
+        \\OPTION BASE 1
+        \\Implicit(1) = 7
+        \\Implicit(10) = 9
+        \\DIM Fixed(2)
+        \\Fixed(1) = 41
+        \\'$DYNAMIC
+        \\DIM Dynamic(1 TO 2) AS LONG
+        \\Dynamic(1) = 100
+        \\Dynamic(2) = 200
+        \\REDIM PRESERVE Dynamic(1 TO 4) AS LONG
+        \\DIM Names(1 TO 2) AS STRING * 3
+        \\Names(1) = "AB"
+        \\REDIM PRESERVE Names(1 TO 3) AS STRING * 3
+        \\TYPE Pair
+        \\    Code AS INTEGER
+        \\    Tag AS STRING * 2
+        \\END TYPE
+        \\TYPE Envelope
+        \\    Number AS LONG
+        \\    Payload AS Pair
+        \\END TYPE
+        \\TYPE RawEight
+        \\    Bytes AS STRING * 8
+        \\END TYPE
+        \\DIM Items(1 TO 1) AS Pair
+        \\Items(1).Code = 77
+        \\Items(1).Tag = "Q"
+        \\REDIM PRESERVE Items(1 TO 2) AS Pair
+        \\DIM FirstEnvelope AS Envelope
+        \\DIM SecondEnvelope AS Envelope
+        \\DIM SecondCopy AS Envelope
+        \\DIM Raw AS RawEight
+        \\READ FirstEnvelope.Number, FirstEnvelope.Payload.Code, FirstEnvelope.Payload.Tag
+        \\SecondEnvelope.Number = 99
+        \\LSET Raw = FirstEnvelope
+        \\RawBytes$ = Raw.Bytes
+        \\RecordLength = LEN(FirstEnvelope)
+        \\SWAP FirstEnvelope, SecondEnvelope
+        \\Swapped& = FirstEnvelope.Number
+        \\SecondCopy = SecondEnvelope
+        \\Copied& = SecondCopy.Number
+        \\DIM LeftText AS STRING * 4
+        \\DIM RightText AS STRING * 4
+        \\LSET LeftText = "X"
+        \\RSET RightText = "Y"
+        \\Lower% = LBOUND(Dynamic)
+        \\Upper% = UBOUND(Dynamic, 1)
+        \\ERASE Fixed
+        \\FixedAfter = Fixed(1)
+        \\ERASE Dynamic
+        \\END
+        \\DATA 16909060&, &H0506, AZ
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "declarations-arrays-records.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    try std.testing.expectEqual(@as(usize, 3), program.record_types.len);
+    try std.testing.expectEqual(@as(u32, 4), program.record_types[0].byte_size);
+    try std.testing.expectEqual(@as(u32, 8), program.record_types[1].byte_size);
+    try std.testing.expectEqual(@as(u32, 4), program.record_types[1].fields[1].offset);
+    try std.testing.expectEqual(@as(u32, 0), program.record_types[1].fields[1].record_type);
+
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(1024, 64));
+    try expectLong(&machine, "Alpha", 11);
+    try expectSingle(&machine, "Delta", 2.5);
+    try expectDouble(&machine, "Golf", 3.25);
+    try expectString(&machine, "Juliet", "text");
+    try std.testing.expect(machine.globalArrayElement("Dynamic", &.{1}) == null);
+    try std.testing.expectEqual(@as(f64, 7), machine.globalArrayElement("Implicit", &.{1}).?.double);
+    try std.testing.expectEqual(@as(f64, 9), machine.globalArrayElement("Implicit", &.{10}).?.double);
+    try std.testing.expectEqualStrings("AB ", machine.globalArrayElement("Names", &.{1}).?.string);
+    try std.testing.expectEqualStrings("   ", machine.globalArrayElement("Names", &.{3}).?.string);
+    try expectArrayRecordInteger(&machine, "Items", &.{1}, "Code", 77);
+    try expectArrayRecordInteger(&machine, "Items", &.{2}, "Code", 0);
+    try expectInteger(&machine, "RecordLength", 8);
+    try expectLong(&machine, "Swapped&", 99);
+    try expectLong(&machine, "Copied&", 0x01020304);
+    try expectString(&machine, "LeftText", "X   ");
+    try expectString(&machine, "RightText", "   Y");
+    try expectInteger(&machine, "Lower%", 1);
+    try expectInteger(&machine, "Upper%", 4);
+    try expectSingle(&machine, "FixedAfter", 0);
+    try std.testing.expectEqualSlices(u8, &.{ 4, 3, 2, 1, 6, 5, 'A', 'Z' }, machine.global("RawBytes$").?.string);
+}
+
+test "REDIM PRESERVE rejects nonfinal shape changes without changing the array" {
+    const source =
+        \\DEFINT A-Z
+        \\'$DYNAMIC
+        \\DIM Grid(1 TO 2, 1 TO 2)
+        \\Grid(2, 2) = 42
+        \\ON ERROR GOTO PreserveError
+        \\REDIM PRESERVE Grid(1 TO 3, 1 TO 2)
+        \\After = Grid(2, 2)
+        \\END
+        \\PreserveError:
+        \\Caught = 1
+        \\StillThere = Grid(2, 2)
+        \\RESUME NEXT
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "preserve-atomic.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(256, 32));
+    try expectInteger(&machine, "Caught", 1);
+    try expectInteger(&machine, "StillThere", 42);
+    try expectInteger(&machine, "After", 42);
+    try std.testing.expectEqual(@as(i16, 42), machine.globalArrayElement("Grid", &.{ 2, 2 }).?.integer);
+    try std.testing.expect(machine.globalArrayElement("Grid", &.{ 3, 2 }) == null);
+}
+
+test "REDIM PRESERVE allocation failure leaves bounds and record values untouched" {
+    const source =
+        \\DEFINT A-Z
+        \\TYPE Item
+        \\    Code AS INTEGER
+        \\    Text AS STRING * 4
+        \\END TYPE
+        \\'$DYNAMIC
+        \\DIM Items(1 TO 2) AS Item
+        \\Items(2).Code = 73
+        \\Items(2).Text = "KEEP"
+        \\SLEEP 1
+        \\REDIM PRESERVE Items(1 TO 4) AS Item
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "preserve-oom.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    machine.setGuestTime(0);
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runToCompletion(128, 16));
+
+    var no_memory: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(no_memory[0..]);
+    machine.allocator = fixed.allocator();
+    machine.setGuestTime(2 * std.time.ns_per_s);
+    const status = machine.runToCompletion(128, 16);
+    machine.allocator = std.testing.allocator;
+    try std.testing.expectEqual(core.vm.Status.runtime_error, status);
+    try std.testing.expectEqual(core.vm.RuntimeCode.out_of_memory, machine.runtime_diagnostic.?.code);
+    try std.testing.expectEqual(@as(u32, 11), machine.runtime_diagnostic.?.span.line);
+    try expectArrayRecordInteger(&machine, "Items", &.{2}, "Code", 73);
+    try std.testing.expectEqual(@as(i32, 1), machine.globalArrayBound("Items", 1, false).?);
+    try std.testing.expectEqual(@as(i32, 2), machine.globalArrayBound("Items", 1, true).?);
+}
+
+test "automatic static shared and COMMON storage are recursive resettable and VM local" {
+    const source =
+        \\DEFINT A-Z
+        \\COMMON SHARED /State/ CommonCounter AS LONG
+        \\DECLARE SUB AutoStep(Index)
+        \\DECLARE SUB StaticStep(Index)
+        \\DECLARE SUB SelectedStep(Index)
+        \\DECLARE SUB SharedStep()
+        \\DECLARE SUB CommonStep()
+        \\DECLARE FUNCTION SumTo%(N)
+        \\DECLARE FUNCTION StaticDepth%(N)
+        \\DIM SHARED AutoResults(1 TO 2)
+        \\DIM SHARED StaticResults(1 TO 2)
+        \\DIM SHARED SelectedResults(1 TO 2)
+        \\DIM SHARED SharedCounter
+        \\SharedCounter = 40
+        \\CommonCounter = 50
+        \\CALL AutoStep(1)
+        \\CALL AutoStep(2)
+        \\CALL StaticStep(1)
+        \\CALL StaticStep(2)
+        \\CALL SelectedStep(1)
+        \\CALL SelectedStep(2)
+        \\CALL SharedStep
+        \\CALL CommonStep
+        \\Recursive = SumTo%(4)
+        \\StaticRecursiveFirst = StaticDepth%(3)
+        \\StaticRecursiveSecond = StaticDepth%(2)
+        \\END
+        \\SUB AutoStep(Index)
+        \\    Counter = Counter + 1
+        \\    AutoResults(Index) = Counter
+        \\END SUB
+        \\SUB StaticStep(Index) STATIC
+        \\    Counter = Counter + 1
+        \\    StaticResults(Index) = Counter
+        \\END SUB
+        \\SUB SelectedStep(Index)
+        \\    STATIC Counter
+        \\    Counter = Counter + 1
+        \\    SelectedResults(Index) = Counter
+        \\END SUB
+        \\SUB SharedStep
+        \\    SHARED SharedCounter
+        \\    SharedCounter = SharedCounter + 1
+        \\END SUB
+        \\SUB CommonStep
+        \\    CommonCounter = CommonCounter + 1
+        \\END SUB
+        \\FUNCTION SumTo%(N)
+        \\    LocalValue = N
+        \\    IF N > 1 THEN LocalValue = LocalValue + SumTo%(N - 1)
+        \\    SumTo% = LocalValue
+        \\END FUNCTION
+        \\FUNCTION StaticDepth%(N) STATIC
+        \\    Depth = Depth + 1
+        \\    IF N > 1 THEN Ignored = StaticDepth%(N - 1)
+        \\    StaticDepth% = Depth
+        \\END FUNCTION
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "scope-lifetimes.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    try std.testing.expectEqual(@as(usize, 1), program.common_blocks.len);
+    try std.testing.expect(program.common_blocks[0].named);
+    try std.testing.expectEqual(@as(u32, 4), program.common_blocks[0].byte_size);
+
+    var first = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer first.deinit();
+    var second = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer second.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, first.runToCompletion(2048, 64));
+    try std.testing.expectEqual(core.vm.Status.halted, second.runToCompletion(2048, 64));
+    try expectScopeResults(&first);
+    try expectScopeResults(&second);
+
+    try first.reset();
+    try std.testing.expectEqual(core.vm.Status.halted, first.runToCompletion(2048, 64));
+    try expectScopeResults(&first);
+}
+
+test "CLEAR preserves static array bounds and releases dynamic storage" {
+    const source =
+        \\DEFINT A-Z
+        \\DIM StaticValues(1 TO 2)
+        \\StaticValues(1) = 9
+        \\'$DYNAMIC
+        \\DIM DynamicValues(1 TO 2)
+        \\DynamicValues(1) = 8
+        \\Text$ = "filled"
+        \\CLEAR
+        \\StaticLower = LBOUND(StaticValues)
+        \\StaticUpper = UBOUND(StaticValues)
+        \\StaticValue = StaticValues(1)
+        \\TextLength = LEN(Text$)
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "clear-state.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(256, 32));
+    try expectInteger(&machine, "StaticLower", 1);
+    try expectInteger(&machine, "StaticUpper", 2);
+    try expectInteger(&machine, "StaticValue", 0);
+    try expectInteger(&machine, "TextLength", 0);
+    try std.testing.expect(machine.globalArrayElement("DynamicValues", &.{1}) == null);
 }
 
 test "aggregate runtime errors are bounded and deterministic" {
@@ -2980,6 +3258,20 @@ fn expectArrayRecordInteger(
     const actual = machine.globalArrayRecordField(name, indices, field) orelse return error.MissingRecordField;
     try std.testing.expectEqual(core.bytecode.ValueType.integer, actual.valueType());
     try std.testing.expectEqual(expected, actual.integer);
+}
+
+fn expectScopeResults(machine: *const core.vm.Vm) !void {
+    try std.testing.expectEqual(@as(i16, 1), machine.globalArrayElement("AutoResults", &.{1}).?.integer);
+    try std.testing.expectEqual(@as(i16, 1), machine.globalArrayElement("AutoResults", &.{2}).?.integer);
+    try std.testing.expectEqual(@as(i16, 1), machine.globalArrayElement("StaticResults", &.{1}).?.integer);
+    try std.testing.expectEqual(@as(i16, 2), machine.globalArrayElement("StaticResults", &.{2}).?.integer);
+    try std.testing.expectEqual(@as(i16, 1), machine.globalArrayElement("SelectedResults", &.{1}).?.integer);
+    try std.testing.expectEqual(@as(i16, 2), machine.globalArrayElement("SelectedResults", &.{2}).?.integer);
+    try expectInteger(machine, "SharedCounter", 41);
+    try expectLong(machine, "CommonCounter", 51);
+    try expectInteger(machine, "Recursive", 10);
+    try expectInteger(machine, "StaticRecursiveFirst", 3);
+    try expectInteger(machine, "StaticRecursiveSecond", 5);
 }
 
 fn containsCompileDiagnostic(diagnostics: []const core.bytecode.Diagnostic, expected: core.bytecode.DiagnosticCode) bool {

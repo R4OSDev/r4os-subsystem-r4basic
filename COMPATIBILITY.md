@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 QuickBASIC 4.5 target contract
 
-Contract version: `2.1.0`
+Contract version: `2.2.0`
 
 R4BASIC v2 targets the complete Microsoft QuickBASIC 4.5 interpreter language
 and runtime. The target is not limited by GORILLA.BAS or by the historical v1
@@ -109,10 +109,11 @@ the same grammar family. All fixture paths are below `Tests/Fixtures/`.
 | ID | v1 syntax promise | Required by local acceptance | Positive fixture | Negative fixture |
 | --- | --- | --- | --- | --- |
 | SRC-01 | CRLF/LF/CR, ASCII case folding, byte-preserving spans, 40-byte names, type suffixes, decimal literals, 8-bit string bytes | yes | `positive_source_contract.bas` plus inline span tests | `negative_lexical.bas` |
-| SRC-02 | Apostrophe and `REM` comments; `DYNAMIC` and `STATIC` metacommands | `DYNAMIC` | `positive_source_contract.bas` | `negative_lexical.bas` |
+| SRC-02 | Apostrophe and `REM` comments; `$INCLUDE`, `$DYNAMIC`, and `$STATIC` metacommands | `$DYNAMIC` | `positive_source_contract.bas` plus inline source-graph and allocation-mode vectors | `negative_lexical.bas` |
 | SRC-03 | Colon-separated statements and explicitly omitted comma arguments | yes | `positive_source_contract.bas`, `positive_io_graphics.bas` | `negative_statements.bas` |
-| DECL-01 | `CONST`, `DEFINT`, `DIM`, `DIM SHARED`, `REDIM`, fixed strings, scalar and multidimensional array bounds | yes | `positive_declarations.bas` plus inline fixed-string vectors | `negative_structure.bas` |
-| DECL-02 | `TYPE` blocks, elementary and fixed-string fields, user types, `AS ANY`, and empty array parameter dimensions | yes | `positive_declarations.bas` plus inline record ownership vectors | `negative_structure.bas` |
+| DECL-01 | `CONST`, all five `DEFtype` forms, `OPTION BASE`, implicit arrays, `DIM`/`DIM SHARED`, `REDIM PRESERVE`, `ERASE`, `LBOUND`/`UBOUND`, fixed strings and up to 60 dimensions | yes | `positive_declarations.bas` plus inline declaration, allocation, preservation and failure-atomicity vectors | `negative_structure.bas` plus inline declaration diagnostics |
+| DECL-02 | Nested `TYPE` blocks with canonical guest-byte layouts, elementary and fixed-string fields, record assignment, `LEN`, `LSET`/`RSET`, `SWAP`, `AS ANY`, and empty array parameter dimensions | yes | `positive_declarations.bas` plus inline record ownership and byte-layout vectors | `negative_structure.bas` plus inline type diagnostics |
+| SCOPE-01 | automatic and static procedure locals, procedure-level and standalone `STATIC`, standalone `SHARED`, `DIM`/`REDIM SHARED`, and blank or named `COMMON` metadata | yes | inline recursive, reset, two-VM, shared and COMMON-layout vectors | `negative_structure.bas` plus inline scope diagnostics |
 | PROC-01 | `DECLARE SUB`, `DECLARE FUNCTION`, `SUB`, `FUNCTION`, `STATIC`, `EXIT`, explicit `CALL`, and implicit calls | yes | `positive_declarations.bas` | `negative_structure.bas`, `negative_statements.bas` |
 | PROC-02 | One-line `DEF FN` and the selected `DEF SEG` compatibility form | yes | `positive_declarations.bas`, `positive_io_graphics.bas` | `negative_structure.bas` |
 | DATA-01 | Numeric/string `DATA`, named data labels, `READ`, and `RESTORE` | yes | `positive_declarations.bas` | `negative_expressions.bas` |
@@ -147,6 +148,8 @@ source does not select a separate production path.
   `HEX$`, `INT`, `LCASE$`, `LEN`, `LOG`, `LTRIM$`, `MKD$`, `MKDMBF$`,
   `MKI$`, `MKL$`, `MKS$`, `MKSMBF$`, `OCT$`, `PEEK`, `POS`, `RTRIM$`,
   `SGN`, `SIN`, `SPACE$`, `SQR`, `STR$`, `TAN`, `UCASE$`, `VAL`.
+- One or two arguments: `LBOUND` and `UBOUND` accept an array and an optional
+  one-based dimension number.
 - Two arguments: `LEFT$`, `RIGHT$`, `STRING$`, coordinate `POINT`.
 - Two or three arguments: `INSTR`, `MID$`.
 - Two or three arguments: text `SCREEN`.
@@ -187,7 +190,7 @@ the typed-program phase.
   v1 promises. They are v2 implementation targets where the QuickBASIC 4.5
   references require them. QBX extensions, a native-code compiler, IDE,
   debugger, and source editor remain separate products.
-- `COMMON`, `CHAIN`, `RUN`, `SHELL`, `SYSTEM`, printer/COM/device I/O,
+- `CHAIN`, `RUN`, `SHELL`, `SYSTEM`, printer/COM/device I/O,
   random/binary file records, directory mutation, and unrestricted hardware
   access.
 - `DRAW`, `PCOPY`, `BLOAD`, `BSAVE`, and general memory or port access.

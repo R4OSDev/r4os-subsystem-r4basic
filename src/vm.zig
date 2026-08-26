@@ -6,7 +6,7 @@ const graphics_screen = @import("graphics_screen.zig");
 const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "2.0.0";
+pub const contract_version = "2.1.0";
 pub const default_instruction_budget: u32 = 262_144;
 pub const timer_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
@@ -1284,6 +1284,17 @@ pub const Vm = struct {
         };
     }
 
+    pub fn globalArrayBound(self: *const Vm, name: []const u8, dimension: usize, upper: bool) ?i32 {
+        const root = self.globalCell(name) orelse return null;
+        const array = switch (root.owned) {
+            .array => |*value| value,
+            else => return null,
+        };
+        if (dimension == 0 or dimension > array.dimensions.len) return null;
+        const selected = array.dimensions[dimension - 1];
+        return if (upper) selected.upper else selected.lower;
+    }
+
     pub fn staticByteSize(_: *const Vm) usize {
         return @sizeOf(Vm);
     }
@@ -1409,6 +1420,13 @@ pub const Vm = struct {
             .store_reference,
             .dimension,
             .redimension,
+            .erase_array,
+            .array_bound,
+            .clear_state,
+            .justify_string,
+            .copy_record,
+            .lset_record,
+            .swap_values,
             .read_data,
             .restore_data,
             .mid_string_assign,
@@ -1509,13 +1527,20 @@ pub const Vm = struct {
             .store_local, .initialize_local => try self.store(try self.localCellAt(instruction.a), bytecode.decodeValueType(instruction.b)),
             .push_global_reference => try self.pushResolvedReference(try self.globalCellAt(instruction.a)),
             .push_local_reference => try self.pushResolvedReference(try self.localCellAt(instruction.a)),
-            .array_default_lower => try self.arrayDefaultLower(),
+            .array_default_lower => try self.arrayDefaultLower(instruction.a),
             .select_array_element => try self.selectArrayElement(instruction.a),
             .select_record_field => try self.selectRecordField(instruction.a),
             .load_reference => try self.load(try self.popReference()),
             .store_reference => try self.storeReference(bytecode.decodeValueType(instruction.a)),
-            .dimension => try self.dimensionArray(instruction.a, false),
-            .redimension => try self.dimensionArray(instruction.a, true),
+            .dimension => try self.dimensionArray(instruction.a, false, instruction.b != 0),
+            .redimension => try self.dimensionArray(instruction.a, true, instruction.b != 0),
+            .erase_array => try self.eraseArray(),
+            .array_bound => try self.arrayBound(instruction.a != 0),
+            .clear_state => try self.clearState(instruction.a != 0),
+            .justify_string => try self.justifyString(instruction.a != 0),
+            .copy_record => try self.copyRecord(),
+            .lset_record => try self.lsetRecord(),
+            .swap_values => try self.swapValues(),
             .read_data => try self.readData(bytecode.decodeValueType(instruction.a)),
             .restore_data => self.data_pointer = instruction.a,
             .set_error_handler => try self.setErrorHandler(instruction.a),
@@ -1670,9 +1695,10 @@ pub const Vm = struct {
         std.mem.copyForwards(u8, target[first .. first + amount], replacement_bytes[0..amount]);
     }
 
-    fn arrayDefaultLower(self: *Vm) ExecutionError!void {
+    fn arrayDefaultLower(self: *Vm, lower: u32) ExecutionError!void {
+        if (lower > 1) return error.InvalidInstruction;
         var upper = try self.popValue();
-        self.pushValue(.{ .integer = 0 }) catch |fault| {
+        self.pushValue(.{ .integer = @intCast(lower) }) catch |fault| {
             upper.deinit(self.allocator);
             return fault;
         };
@@ -1709,7 +1735,7 @@ pub const Vm = struct {
         try self.pushReference(&record.fields[field_index]);
     }
 
-    fn dimensionArray(self: *Vm, dimension_count: u32, redimension: bool) ExecutionError!void {
+    fn dimensionArray(self: *Vm, dimension_count: u32, redimension: bool, preserve_or_once: bool) ExecutionError!void {
         if (dimension_count == 0 or dimension_count > 60) return error.InvalidInstruction;
         const root = try (try self.popReference()).aggregateCell();
         const array = switch (root.owned) {
@@ -1720,7 +1746,6 @@ pub const Vm = struct {
             return error.SubscriptOutOfRange;
         }
         if (redimension and !array.is_dynamic) return error.IllegalFunctionCall;
-        if (!redimension and array.dimensions.len != 0) return error.ArrayAlreadyDimensioned;
 
         var lowers: [60]i32 = undefined;
         var uppers: [60]i32 = undefined;
@@ -1741,7 +1766,15 @@ pub const Vm = struct {
             lowers[remaining] = lower;
             uppers[remaining] = upper;
         }
-        try self.resizeArray(array, lowers[0..dimension_count], uppers[0..dimension_count]);
+        if (!redimension and array.dimensions.len != 0) {
+            if (preserve_or_once) return;
+            return error.ArrayAlreadyDimensioned;
+        }
+        if (redimension and preserve_or_once and array.dimensions.len != 0) {
+            try self.preserveArray(array, lowers[0..dimension_count], uppers[0..dimension_count]);
+        } else {
+            try self.resizeArray(array, lowers[0..dimension_count], uppers[0..dimension_count]);
+        }
     }
 
     fn resizeArray(self: *Vm, array: *ArrayValue, lowers: []const i32, uppers: []const i32) ExecutionError!void {
@@ -1816,6 +1849,337 @@ pub const Vm = struct {
 
         self.allocator.free(array.dimensions);
         array.dimensions = dimensions;
+    }
+
+    fn preserveArray(self: *Vm, array: *ArrayValue, lowers: []const i32, uppers: []const i32) ExecutionError!void {
+        if (array.dimensions.len != lowers.len or lowers.len == 0) return error.SubscriptOutOfRange;
+        for (array.dimensions, 0..) |dimension, index| {
+            if (dimension.lower != lowers[index]) return error.SubscriptOutOfRange;
+            if (index + 1 != lowers.len and dimension.upper != uppers[index]) return error.SubscriptOutOfRange;
+        }
+
+        const dimensions = try self.allocator.alloc(Dimension, lowers.len);
+        errdefer self.allocator.free(dimensions);
+        var total: usize = 1;
+        var reverse = lowers.len;
+        while (reverse != 0) {
+            reverse -= 1;
+            const length: usize = @intCast(uppers[reverse] - lowers[reverse] + 1);
+            if (length != 0 and total > maximum_array_elements / length) return error.OutOfMemory;
+            dimensions[reverse] = .{ .lower = lowers[reverse], .upper = uppers[reverse], .stride = total };
+            total *= length;
+        }
+        if (total > maximum_array_elements) return error.OutOfMemory;
+
+        const old_count = array.storage.len();
+        const old_payload_bytes = try arrayLogicalPayloadBytes(
+            self.program,
+            array.value_type,
+            array.record_type,
+            array.fixed_string_length,
+            old_count,
+        );
+        const new_payload_bytes = try arrayLogicalPayloadBytes(
+            self.program,
+            array.value_type,
+            array.record_type,
+            array.fixed_string_length,
+            total,
+        );
+        const old_dimension_bytes = std.math.mul(usize, array.dimensions.len, @sizeOf(Dimension)) catch return error.OutOfMemory;
+        const new_dimension_bytes = std.math.mul(usize, dimensions.len, @sizeOf(Dimension)) catch return error.OutOfMemory;
+        const current_live_bytes = std.math.cast(usize, self.array_live_payload_bytes) orelse return error.OutOfMemory;
+        const live_without_old_bytes = std.math.sub(usize, current_live_bytes, old_payload_bytes) catch return error.InvalidInstruction;
+        const final_live_bytes = std.math.add(usize, live_without_old_bytes, new_payload_bytes) catch return error.OutOfMemory;
+        var resize_live_bytes = std.math.add(usize, current_live_bytes, new_payload_bytes) catch return error.OutOfMemory;
+        resize_live_bytes = std.math.add(usize, resize_live_bytes, old_dimension_bytes) catch return error.OutOfMemory;
+        resize_live_bytes = std.math.add(usize, resize_live_bytes, new_dimension_bytes) catch return error.OutOfMemory;
+        if (final_live_bytes > array_live_payload_limit_bytes or resize_live_bytes > array_resize_live_limit_bytes) {
+            return error.OutOfMemory;
+        }
+
+        const old_final_length: usize = @intCast(array.dimensions[array.dimensions.len - 1].upper -
+            array.dimensions[array.dimensions.len - 1].lower + 1);
+        const new_final_length: usize = @intCast(uppers[uppers.len - 1] - lowers[lowers.len - 1] + 1);
+        const row_count = if (old_final_length == 0) 0 else old_count / old_final_length;
+        const copied_per_row = @min(old_final_length, new_final_length);
+
+        var replacement: ArrayStorage = undefined;
+        if (array.record_type == bytecode.invalid_index and array.value_type.isNumeric()) {
+            replacement = switch (array.value_type) {
+                .integer => .{ .integer = try self.allocator.alloc(i16, total) },
+                .long => .{ .long = try self.allocator.alloc(i32, total) },
+                .single => .{ .single = try self.allocator.alloc(f32, total) },
+                .double => .{ .double = try self.allocator.alloc(f64, total) },
+                .string => unreachable,
+            };
+            errdefer replacement.deinit(self.allocator);
+            switch (replacement) {
+                .integer => |items| @memset(items, 0),
+                .long => |items| @memset(items, 0),
+                .single => |items| @memset(items, 0),
+                .double => |items| @memset(items, 0),
+                .cells => unreachable,
+            }
+            for (0..row_count) |row| {
+                const old_first = row * old_final_length;
+                const new_first = row * new_final_length;
+                switch (array.storage) {
+                    .integer => |old| @memcpy(replacement.integer[new_first .. new_first + copied_per_row], old[old_first .. old_first + copied_per_row]),
+                    .long => |old| @memcpy(replacement.long[new_first .. new_first + copied_per_row], old[old_first .. old_first + copied_per_row]),
+                    .single => |old| @memcpy(replacement.single[new_first .. new_first + copied_per_row], old[old_first .. old_first + copied_per_row]),
+                    .double => |old| @memcpy(replacement.double[new_first .. new_first + copied_per_row], old[old_first .. old_first + copied_per_row]),
+                    .cells => unreachable,
+                }
+            }
+            self.compact_array_resizes +%= 1;
+            self.compact_array_elements +|= @intCast(total);
+        } else {
+            const elements = try self.allocator.alloc(Cell, total);
+            var initialized: usize = 0;
+            errdefer {
+                for (elements[0..initialized]) |*element| element.deinit(self.allocator);
+                self.allocator.free(elements);
+            }
+            for (elements) |*element| {
+                element.* = try allocateElement(
+                    self.allocator,
+                    self.program,
+                    array.value_type,
+                    array.record_type,
+                    array.fixed_string_length,
+                );
+                initialized += 1;
+            }
+            const old_elements = switch (array.storage) {
+                .cells => |items| items,
+                else => return error.InvalidInstruction,
+            };
+            for (0..row_count) |row| {
+                const old_first = row * old_final_length;
+                const new_first = row * new_final_length;
+                for (0..copied_per_row) |column| {
+                    const cloned = try cloneCell(self.allocator, self.program, &old_elements[old_first + column]);
+                    elements[new_first + column].deinit(self.allocator);
+                    elements[new_first + column] = cloned;
+                }
+            }
+            replacement = .{ .cells = elements };
+            self.generic_array_resizes +%= 1;
+            self.generic_array_initializations +|= @intCast(total);
+        }
+
+        array.storage.deinit(self.allocator);
+        self.allocator.free(array.dimensions);
+        array.storage = replacement;
+        array.dimensions = dimensions;
+        self.array_live_payload_bytes = @intCast(final_live_bytes);
+        self.maximum_array_live_payload_bytes = @max(self.maximum_array_live_payload_bytes, self.array_live_payload_bytes);
+        self.maximum_array_resize_live_bytes = @max(self.maximum_array_resize_live_bytes, @as(u64, @intCast(resize_live_bytes)));
+    }
+
+    fn eraseArray(self: *Vm) ExecutionError!void {
+        const root = try (try self.popReference()).aggregateCell();
+        const array = switch (root.owned) {
+            .array => |*value| value,
+            else => return error.TypeMismatch,
+        };
+        try self.eraseArrayValue(array);
+    }
+
+    fn eraseArrayValue(self: *Vm, array: *ArrayValue) ExecutionError!void {
+        if (!array.is_dynamic) {
+            switch (array.storage) {
+                .integer => |items| @memset(items, 0),
+                .long => |items| @memset(items, 0),
+                .single => |items| @memset(items, 0),
+                .double => |items| @memset(items, 0),
+                .cells => |items| for (items) |*item| try self.clearCell(item),
+            }
+            return;
+        }
+
+        const replacement_dimensions = try self.allocator.alloc(Dimension, 0);
+        errdefer self.allocator.free(replacement_dimensions);
+        var replacement_storage = try allocateEmptyArrayStorage(self.allocator, array.value_type, array.record_type);
+        errdefer replacement_storage.deinit(self.allocator);
+        const payload_bytes = try arrayLogicalPayloadBytes(
+            self.program,
+            array.value_type,
+            array.record_type,
+            array.fixed_string_length,
+            array.storage.len(),
+        );
+        array.storage.deinit(self.allocator);
+        self.allocator.free(array.dimensions);
+        array.storage = replacement_storage;
+        array.dimensions = replacement_dimensions;
+        self.array_live_payload_bytes -|= @intCast(payload_bytes);
+    }
+
+    fn clearCell(self: *Vm, source: *Cell) ExecutionError!void {
+        const cell = resolveCell(source) orelse return error.InvalidInstruction;
+        switch (cell.owned) {
+            .scalar => |*value| switch (value.*) {
+                .integer => value.* = .{ .integer = 0 },
+                .long => value.* = .{ .long = 0 },
+                .single => value.* = .{ .single = 0 },
+                .double => value.* = .{ .double = 0 },
+                .string => |bytes| {
+                    const empty = try self.allocator.alloc(u8, 0);
+                    self.allocator.free(bytes);
+                    value.* = .{ .string = empty };
+                },
+            },
+            .fixed_string => |*string| {
+                const bytes = switch (string.value) {
+                    .string => |value| value,
+                    else => return error.InvalidInstruction,
+                };
+                @memset(bytes, ' ');
+            },
+            .record => |*record| for (record.fields) |*field| try self.clearCell(field),
+            .array => |*array| try self.eraseArrayValue(array),
+        }
+    }
+
+    fn arrayBound(self: *Vm, upper: bool) ExecutionError!void {
+        var dimension_value = try self.popValue();
+        defer dimension_value.deinit(self.allocator);
+        const dimension = try values.asLong(dimension_value);
+        const root = try (try self.popReference()).aggregateCell();
+        const array = switch (root.owned) {
+            .array => |*value| value,
+            else => return error.TypeMismatch,
+        };
+        if (dimension < 1 or dimension > array.dimensions.len) return error.SubscriptOutOfRange;
+        const selected = array.dimensions[@intCast(dimension - 1)];
+        try self.pushValue(.{ .integer = @intCast(if (upper) selected.upper else selected.lower) });
+    }
+
+    fn clearState(self: *Vm, has_stack: bool) ExecutionError!void {
+        try self.closeAllFiles();
+        if (has_stack) {
+            var stack_value = try self.popValue();
+            defer stack_value.deinit(self.allocator);
+            const requested = try values.asLong(stack_value);
+            if (requested < 0) return error.IllegalFunctionCall;
+        }
+        self.discardStackFrom(0);
+        self.gosub_stack.clearRetainingCapacity();
+        for (self.globals) |*global_cell| try self.clearCell(global_cell);
+    }
+
+    fn justifyString(self: *Vm, right: bool) ExecutionError!void {
+        var incoming = try self.popValue();
+        defer incoming.deinit(self.allocator);
+        const source = switch (incoming) {
+            .string => |bytes| bytes,
+            else => return error.TypeMismatch,
+        };
+        const destination = try self.popReference();
+        const current = try destination.value();
+        const field = switch (current) {
+            .string => |bytes| bytes,
+            else => return error.TypeMismatch,
+        };
+        const replacement = try self.allocator.alloc(u8, field.len);
+        errdefer self.allocator.free(replacement);
+        @memset(replacement, ' ');
+        const amount = @min(replacement.len, source.len);
+        const first = if (right and source.len < replacement.len) replacement.len - amount else 0;
+        @memcpy(replacement[first .. first + amount], source[0..amount]);
+        try destination.replace(self.allocator, .{ .string = replacement });
+    }
+
+    fn copyRecord(self: *Vm) ExecutionError!void {
+        const source = try (try self.popReference()).aggregateCell();
+        const destination = try (try self.popReference()).aggregateCell();
+        const source_record = switch (source.owned) {
+            .record => |record| record,
+            else => return error.TypeMismatch,
+        };
+        const destination_record = switch (destination.owned) {
+            .record => |record| record,
+            else => return error.TypeMismatch,
+        };
+        if (source_record.record_type != destination_record.record_type) return error.TypeMismatch;
+        var replacement = try cloneCell(self.allocator, self.program, source);
+        const replacement_owned = switch (replacement) {
+            .owned => |owned| owned,
+            .alias => return error.InvalidInstruction,
+        };
+        destination.owned.deinit(self.allocator);
+        destination.owned = replacement_owned;
+        replacement = undefined;
+    }
+
+    fn lsetRecord(self: *Vm) ExecutionError!void {
+        const source = try (try self.popReference()).aggregateCell();
+        const destination = try (try self.popReference()).aggregateCell();
+        const source_type = switch (source.owned) {
+            .record => |record| record.record_type,
+            else => return error.TypeMismatch,
+        };
+        const destination_type = switch (destination.owned) {
+            .record => |record| record.record_type,
+            else => return error.TypeMismatch,
+        };
+        if (source_type >= self.program.record_types.len or destination_type >= self.program.record_types.len) {
+            return error.InvalidInstruction;
+        }
+        const source_bytes = try self.allocator.alloc(u8, self.program.record_types[source_type].byte_size);
+        defer self.allocator.free(source_bytes);
+        const destination_bytes = try self.allocator.alloc(u8, self.program.record_types[destination_type].byte_size);
+        defer self.allocator.free(destination_bytes);
+        try encodeRecord(self.program, source, source_bytes);
+        try encodeRecord(self.program, destination, destination_bytes);
+        @memcpy(destination_bytes[0..@min(source_bytes.len, destination_bytes.len)], source_bytes[0..@min(source_bytes.len, destination_bytes.len)]);
+        try decodeRecord(self.program, destination, destination_bytes);
+    }
+
+    fn swapValues(self: *Vm) ExecutionError!void {
+        const second = try self.popReference();
+        const first = try self.popReference();
+        if (first == .cell and second == .cell) {
+            const first_cell = try first.aggregateCell();
+            const second_cell = try second.aggregateCell();
+            const swappable_cells = switch (first_cell.owned) {
+                .scalar => |first_value| switch (second_cell.owned) {
+                    .scalar => |second_value| first_value.valueType() == .string and second_value.valueType() == .string,
+                    else => false,
+                },
+                .fixed_string => |first_string| switch (second_cell.owned) {
+                    .fixed_string => |second_string| first_string.length == second_string.length,
+                    else => false,
+                },
+                .record => |first_record| switch (second_cell.owned) {
+                    .record => |second_record| first_record.record_type == second_record.record_type,
+                    else => false,
+                },
+                .array => false,
+            };
+            if (swappable_cells) {
+                std.mem.swap(OwnedValue, &first_cell.owned, &second_cell.owned);
+                return;
+            }
+            if (first_cell.owned == .record or second_cell.owned == .record or
+                first_cell.owned == .fixed_string or second_cell.owned == .fixed_string)
+            {
+                return error.TypeMismatch;
+            }
+        }
+        const first_type = try first.valueType();
+        const second_type = try second.valueType();
+        if (first_type != second_type) return error.TypeMismatch;
+        if (first_type.isNumeric()) {
+            const first_value = try first.value();
+            const second_value = try second.value();
+            try first.replaceNumeric(second_value);
+            try second.replaceNumeric(first_value);
+            return;
+        }
+        return error.TypeMismatch;
     }
 
     fn readData(self: *Vm, target: bytecode.ValueType) ExecutionError!void {
@@ -3925,6 +4289,12 @@ pub const Vm = struct {
 
     fn localCellAt(self: *Vm, index: u32) ExecutionError!Reference {
         if (self.frames.items.len == 0) return error.InvalidInstruction;
+        const frame = self.frames.items[self.frames.items.len - 1];
+        if (index >= self.program.procedures[frame.procedure_id].locals.len) return error.InvalidInstruction;
+        const variable = self.program.procedures[frame.procedure_id].locals[index];
+        if (variable.backing_global_index != bytecode.invalid_index) {
+            return self.globalCellAt(variable.backing_global_index);
+        }
         return self.resolveCellTracked(try self.frameLocalCell(self.frames.items.len - 1, index));
     }
 
@@ -4755,14 +5125,24 @@ fn arrayLogicalPayloadBytes(
         }
     else record: {
         if (record_type >= program.record_types.len) return error.InvalidInstruction;
-        var field_bytes: usize = 0;
-        for (program.record_types[record_type].fields) |field| {
-            field_bytes = std.math.add(usize, field_bytes, @sizeOf(Cell)) catch return error.OutOfMemory;
-            field_bytes = std.math.add(usize, field_bytes, field.fixed_string_length) catch return error.OutOfMemory;
-        }
+        const field_bytes = try recordLogicalPayloadBytes(program, record_type);
         break :record std.math.add(usize, @sizeOf(Cell), field_bytes) catch return error.OutOfMemory;
     };
     return std.math.mul(usize, element_count, bytes_per_element) catch return error.OutOfMemory;
+}
+
+fn recordLogicalPayloadBytes(program: *const bytecode.Program, record_type: u32) ExecutionError!usize {
+    if (record_type >= program.record_types.len) return error.InvalidInstruction;
+    var total: usize = 0;
+    for (program.record_types[record_type].fields) |field| {
+        total = std.math.add(usize, total, @sizeOf(Cell)) catch return error.OutOfMemory;
+        if (field.record_type != bytecode.invalid_index) {
+            total = std.math.add(usize, total, try recordLogicalPayloadBytes(program, field.record_type)) catch return error.OutOfMemory;
+        } else {
+            total = std.math.add(usize, total, field.fixed_string_length) catch return error.OutOfMemory;
+        }
+    }
+    return total;
 }
 
 fn resizeCompactArrayStorage(
@@ -4831,12 +5211,143 @@ fn allocateElement(
             allocator,
             program,
             field.value_type,
-            bytecode.invalid_index,
+            field.record_type,
             field.fixed_string_length,
         );
         initialized += 1;
     }
     return .{ .owned = .{ .record = .{ .record_type = record_type, .fields = fields } } };
+}
+
+fn cloneCell(allocator: std.mem.Allocator, program: *const bytecode.Program, source: *const Cell) ExecutionError!Cell {
+    const resolved = resolveCellConst(source) orelse return error.InvalidInstruction;
+    return switch (resolved.*) {
+        .alias => unreachable,
+        .owned => |owned| switch (owned) {
+            .scalar => |value| .{ .owned = .{ .scalar = try value.clone(allocator) } },
+            .fixed_string => |string| .{ .owned = .{ .fixed_string = .{
+                .value = try string.value.clone(allocator),
+                .length = string.length,
+            } } },
+            .record => |record| blk: {
+                if (record.record_type >= program.record_types.len) return error.InvalidInstruction;
+                const fields = try allocator.alloc(Cell, record.fields.len);
+                var initialized: usize = 0;
+                errdefer {
+                    for (fields[0..initialized]) |*field| field.deinit(allocator);
+                    allocator.free(fields);
+                }
+                for (record.fields, 0..) |*field, index| {
+                    fields[index] = try cloneCell(allocator, program, field);
+                    initialized += 1;
+                }
+                break :blk .{ .owned = .{ .record = .{ .record_type = record.record_type, .fields = fields } } };
+            },
+            .array => return error.TypeMismatch,
+        },
+    };
+}
+
+fn encodeRecord(program: *const bytecode.Program, source: *const Cell, out: []u8) ExecutionError!void {
+    const resolved = resolveCellConst(source) orelse return error.InvalidInstruction;
+    const record = switch (resolved.owned) {
+        .record => |value| value,
+        else => return error.TypeMismatch,
+    };
+    if (record.record_type >= program.record_types.len) return error.InvalidInstruction;
+    const definition = program.record_types[record.record_type];
+    if (out.len != definition.byte_size or record.fields.len != definition.fields.len) return error.InvalidInstruction;
+    for (definition.fields, 0..) |field, index| {
+        const first: usize = field.offset;
+        const length: usize = if (field.record_type != bytecode.invalid_index)
+            program.record_types[field.record_type].byte_size
+        else switch (field.value_type) {
+            .integer => 2,
+            .long, .single => 4,
+            .double => 8,
+            .string => field.fixed_string_length,
+        };
+        try encodeRecordField(program, field, &record.fields[index], out[first .. first + length]);
+    }
+}
+
+fn encodeRecordField(
+    program: *const bytecode.Program,
+    definition: bytecode.RecordField,
+    source: *const Cell,
+    out: []u8,
+) ExecutionError!void {
+    if (definition.record_type != bytecode.invalid_index) return encodeRecord(program, source, out);
+    const resolved = resolveCellConst(source) orelse return error.InvalidInstruction;
+    switch (resolved.owned) {
+        .scalar => |value| switch (value) {
+            .integer => |number| std.mem.writeInt(u16, out[0..2], @bitCast(number), .little),
+            .long => |number| std.mem.writeInt(u32, out[0..4], @bitCast(number), .little),
+            .single => |number| std.mem.writeInt(u32, out[0..4], @bitCast(number), .little),
+            .double => |number| std.mem.writeInt(u64, out[0..8], @bitCast(number), .little),
+            .string => return error.InvalidInstruction,
+        },
+        .fixed_string => |string| {
+            const bytes = switch (string.value) {
+                .string => |value| value,
+                else => return error.InvalidInstruction,
+            };
+            if (bytes.len != out.len) return error.InvalidInstruction;
+            @memcpy(out, bytes);
+        },
+        else => return error.InvalidInstruction,
+    }
+}
+
+fn decodeRecord(program: *const bytecode.Program, destination: *Cell, bytes: []const u8) ExecutionError!void {
+    const resolved = resolveCell(destination) orelse return error.InvalidInstruction;
+    const record = switch (resolved.owned) {
+        .record => |*value| value,
+        else => return error.TypeMismatch,
+    };
+    if (record.record_type >= program.record_types.len) return error.InvalidInstruction;
+    const definition = program.record_types[record.record_type];
+    if (bytes.len != definition.byte_size or record.fields.len != definition.fields.len) return error.InvalidInstruction;
+    for (definition.fields, 0..) |field, index| {
+        const first: usize = field.offset;
+        const length: usize = if (field.record_type != bytecode.invalid_index)
+            program.record_types[field.record_type].byte_size
+        else switch (field.value_type) {
+            .integer => 2,
+            .long, .single => 4,
+            .double => 8,
+            .string => field.fixed_string_length,
+        };
+        try decodeRecordField(program, field, &record.fields[index], bytes[first .. first + length]);
+    }
+}
+
+fn decodeRecordField(
+    program: *const bytecode.Program,
+    definition: bytecode.RecordField,
+    destination: *Cell,
+    bytes: []const u8,
+) ExecutionError!void {
+    if (definition.record_type != bytecode.invalid_index) return decodeRecord(program, destination, bytes);
+    const resolved = resolveCell(destination) orelse return error.InvalidInstruction;
+    switch (resolved.owned) {
+        .scalar => |*value| switch (value.*) {
+            .integer => value.* = .{ .integer = @bitCast(std.mem.readInt(u16, bytes[0..2], .little)) },
+            .long => value.* = .{ .long = @bitCast(std.mem.readInt(u32, bytes[0..4], .little)) },
+            .single => value.* = .{ .single = @bitCast(std.mem.readInt(u32, bytes[0..4], .little)) },
+            .double => value.* = .{ .double = @bitCast(std.mem.readInt(u64, bytes[0..8], .little)) },
+            .string => return error.InvalidInstruction,
+        },
+        .fixed_string => |*string| {
+            const out = switch (string.value) {
+                .string => |value| value,
+                else => return error.InvalidInstruction,
+            };
+            if (out.len != bytes.len) return error.InvalidInstruction;
+            @memcpy(out, bytes);
+        },
+        else => return error.InvalidInstruction,
+    }
 }
 
 fn resolveCell(original: *Cell) ?*Cell {
