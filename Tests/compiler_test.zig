@@ -2827,6 +2827,127 @@ test "input adapter preserves every VM drop category without hot logging" {
     try std.testing.expectEqual(@as(u64, 7), input.last_dropped_tick);
 }
 
+test "mapped R4OS pointer input drives PEN state and one event trap" {
+    const source =
+        \\DEFINT A-Z
+        \\ON PEN GOSUB PenTrap
+        \\PEN ON
+        \\SLEEP
+        \\Done = 1
+        \\END
+        \\PenTrap:
+        \\PenCount = PenCount + 1
+        \\PenX = PEN(4)
+        \\PenY = PEN(5)
+        \\RETURN
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "pen-pointer.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    var adapter = core.runtime_adapter.Adapter.init(&machine);
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runSlice(128).status);
+
+    const delivery = adapter.handleInput(.{ .mouse = .{
+        .action = .down,
+        .client_x = 64,
+        .client_y = 32,
+        .guest = .{ .x = 64, .y = 32 },
+        .buttons = 1,
+        .modifiers = 0,
+        .tick = 22,
+        .sequence = 7,
+    } });
+    try std.testing.expectEqual(core.runtime_adapter.InputDeliveryStatus.accepted, delivery.status);
+    try std.testing.expectEqual(@as(u8, 0), delivery.accepted_bytes);
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runSlice(128).status);
+    try expectInteger(&machine, "PenCount", 1);
+    try expectInteger(&machine, "PenX", 64);
+    try expectInteger(&machine, "PenY", 32);
+    try std.testing.expect(try machine.enqueueTextCodepoint('X'));
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 8));
+    try expectInteger(&machine, "Done", 1);
+}
+
+test "PEN STICK and STRIG expose private virtual devices neutral defaults and destroyed trigger traps" {
+    const source =
+        \\DEFINT A-Z
+        \\ON STRIG(0) GOSUB TriggerTrap
+        \\STRIG(0) ON
+        \\PEN ON
+        \\SLEEP
+        \\PenUsed = PEN(0)
+        \\PenUsedAgain = PEN(0)
+        \\PressX = PEN(1)
+        \\PressY = PEN(2)
+        \\PenDown = PEN(3)
+        \\PenRow = PEN(8)
+        \\PenColumn = PEN(9)
+        \\AxisX = STICK(0)
+        \\AxisY = STICK(1)
+        \\AxisBX = STICK(2)
+        \\AxisBY = STICK(3)
+        \\END
+        \\TriggerTrap:
+        \\TriggerCount = TriggerCount + 1
+        \\Destroyed = STRIG(0)
+        \\Current = STRIG(1)
+        \\RETURN
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "virtual-devices.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runSlice(256).status);
+    try std.testing.expect(machine.acceptPenPointer(64, 32, true, .{ .sequence = 1, .tick = 1 }).accepted);
+    try std.testing.expect(machine.setVirtualJoystick(0, 10, 20, true, false));
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runSlice(256).status);
+    try expectInteger(&machine, "TriggerCount", 1);
+    try expectInteger(&machine, "Destroyed", 0);
+    try expectInteger(&machine, "Current", -1);
+    try std.testing.expect(try machine.enqueueTextCodepoint('X'));
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(256, 8));
+    try expectInteger(&machine, "PenUsed", -1);
+    try expectInteger(&machine, "PenUsedAgain", 0);
+    try expectInteger(&machine, "PressX", 64);
+    try expectInteger(&machine, "PressY", 32);
+    try expectInteger(&machine, "PenDown", -1);
+    try expectInteger(&machine, "PenRow", 3);
+    try expectInteger(&machine, "PenColumn", 9);
+    try expectInteger(&machine, "AxisX", 10);
+    try expectInteger(&machine, "AxisY", 20);
+    try expectInteger(&machine, "AxisBX", 100);
+    try expectInteger(&machine, "AxisBY", 100);
+
+    var neutral_program = try core.compiler.compile(
+        std.testing.allocator,
+        "neutral-joystick.bas",
+        "DEFINT A-Z\nX=STICK(0)\nY=STICK(1)\nPressed=STRIG(0)\nEND\n",
+    );
+    defer neutral_program.deinit();
+    try expectProgramOk(&neutral_program);
+    var neutral = try core.vm.Vm.init(std.testing.allocator, &neutral_program, .{});
+    defer neutral.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, neutral.runToCompletion(64, 8));
+    try expectInteger(&neutral, "X", 100);
+    try expectInteger(&neutral, "Y", 100);
+    try expectInteger(&neutral, "Pressed", 0);
+
+    var pen_off_program = try core.compiler.compile(
+        std.testing.allocator,
+        "pen-off.bas",
+        "DEFINT A-Z\nValue=PEN(0)\nEND\n",
+    );
+    defer pen_off_program.deinit();
+    try expectProgramOk(&pen_off_program);
+    var pen_off = try core.vm.Vm.init(std.testing.allocator, &pen_off_program, .{});
+    defer pen_off.deinit();
+    try std.testing.expectEqual(core.vm.Status.runtime_error, pen_off.runToCompletion(64, 8));
+    try std.testing.expectEqual(core.vm.RuntimeCode.illegal_function_call, pen_off.runtime_diagnostic.?.code);
+}
+
 test "TIMER SLEEP and RND use injected pause-free guest state" {
     var program = try compileFixture(fixture_paths.time_random);
     defer program.deinit();
@@ -2933,6 +3054,243 @@ test "SLEEP yields cooperatively and a new key interrupts it" {
     try expectInteger(&machine, "Done", 1);
 }
 
+test "event dispatcher nests fixed-priority UEVENT KEY and TIMER traps at statement boundaries" {
+    const source =
+        \\DEFINT A-Z
+        \\ON KEY(1) GOSUB KeyTrap
+        \\ON TIMER(2) GOSUB TimerTrap
+        \\ON UEVENT GOSUB UserTrap
+        \\KEY(1) ON
+        \\TIMER ON
+        \\UEVENT ON
+        \\SLEEP 10
+        \\Done = 1
+        \\END
+        \\KeyTrap:
+        \\Order = Order * 10 + 2
+        \\RETURN
+        \\TimerTrap:
+        \\Order = Order * 10 + 3
+        \\RETURN
+        \\UserTrap:
+        \\Order = Order * 10 + 1
+        \\RETURN
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "event-priority.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    machine.setGuestTime(0);
+    const initial = machine.runSlice(256);
+    try std.testing.expectEqual(core.vm.Status.waiting, initial.status);
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_s), initial.wake_guest_ns);
+
+    try std.testing.expect(machine.acceptVirtualScanCode(59, 0, .{ .sequence = 1, .tick = 1 }).accepted);
+    try std.testing.expect(machine.signalUserEvent());
+    machine.setGuestTime(2 * std.time.ns_per_s);
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(256, 16));
+    try expectInteger(&machine, "Order", 123);
+    try expectInteger(&machine, "Done", 1);
+    try std.testing.expectEqual(@as(usize, 0), machine.gosubDepth());
+    const stats = machine.eventStats();
+    try std.testing.expectEqual(@as(u64, 3), stats.dispatches);
+    try std.testing.expectEqual(@as(u64, 3), stats.handler_returns);
+    try std.testing.expectEqual(@as(u8, 3), stats.maximum_pending);
+}
+
+test "KEY STOP remembers one repeated trap and ON delivers it without duplicating INKEY" {
+    const source =
+        \\DEFINT A-Z
+        \\ON KEY(1) GOSUB KeyTrap
+        \\ON UEVENT GOSUB UserTrap
+        \\KEY(1) STOP
+        \\UEVENT ON
+        \\SLEEP 10
+        \\Done = 1
+        \\END
+        \\KeyTrap:
+        \\KeyCount = KeyCount + 1
+        \\RETURN
+        \\UserTrap:
+        \\UserCount = UserCount + 1
+        \\KEY(1) ON
+        \\RETURN
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "event-stop.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runSlice(256).status);
+    try std.testing.expect(machine.acceptVirtualScanCode(59, 0, .{ .sequence = 1, .tick = 1 }).accepted);
+    try std.testing.expect(machine.acceptVirtualScanCode(59, 0, .{ .sequence = 2, .tick = 2 }).accepted);
+    try std.testing.expectEqual(@as(usize, 0), machine.queuedInputBytes());
+    try std.testing.expect(machine.signalUserEvent());
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(256, 16));
+    try expectInteger(&machine, "KeyCount", 1);
+    try expectInteger(&machine, "UserCount", 1);
+    try expectInteger(&machine, "Done", 1);
+    const stats = machine.eventStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.coalesced);
+    try std.testing.expectEqual(@as(u64, 2), stats.dispatches);
+}
+
+test "event bindings pending state and handler activity are isolated per VM" {
+    const source =
+        \\DEFINT A-Z
+        \\ON UEVENT GOSUB UserTrap
+        \\UEVENT ON
+        \\SLEEP
+        \\END
+        \\UserTrap:
+        \\Count = Count + 1
+        \\RETURN
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "event-isolation.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var first = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer first.deinit();
+    var second = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer second.deinit();
+    try std.testing.expectEqual(core.vm.Status.waiting, first.runSlice(128).status);
+    try std.testing.expectEqual(core.vm.Status.waiting, second.runSlice(128).status);
+    try std.testing.expect(first.signalUserEvent());
+    try std.testing.expectEqual(core.vm.Status.waiting, first.runSlice(128).status);
+    try std.testing.expectEqual(core.vm.Status.waiting, second.runSlice(128).status);
+    try expectInteger(&first, "Count", 1);
+    try expectInteger(&second, "Count", 0);
+    try std.testing.expectEqual(@as(u64, 1), first.eventStats().dispatches);
+    try std.testing.expectEqual(@as(u64, 0), second.eventStats().dispatches);
+}
+
+test "KEY OFF passes exact extended INKEY bytes and user macros expand atomically" {
+    const source =
+        \\DEFINT A-Z
+        \\ON KEY(1) GOSUB KeyTrap
+        \\KEY(1) OFF
+        \\SLEEP 10
+        \\First$ = INKEY$
+        \\Second$ = INKEY$
+        \\KEY 2, "RUN" + CHR$(13)
+        \\Third$ = INKEY$
+        \\Fourth$ = INKEY$
+        \\Fifth$ = INKEY$
+        \\Sixth$ = INKEY$
+        \\END
+        \\KeyTrap:
+        \\Trapped = Trapped + 1
+        \\RETURN
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "key-inkey.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runSlice(256).status);
+    const f1 = machine.acceptVirtualScanCode(59, 0, .{ .sequence = 1, .tick = 10 });
+    try std.testing.expect(f1.accepted);
+    try std.testing.expectEqual(@as(u8, 2), f1.accepted_bytes);
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(256, 16));
+    try expectString(&machine, "First$", "\x00;");
+    try expectString(&machine, "Second$", "");
+    try expectInteger(&machine, "Trapped", 0);
+
+    var macro_program = try core.compiler.compile(
+        std.testing.allocator,
+        "key-macro.bas",
+        "KEY 2, \"RUN\" + CHR$(13)\nSLEEP 10\nA$=INKEY$\nB$=INKEY$\nC$=INKEY$\nD$=INKEY$\nEND\n",
+    );
+    defer macro_program.deinit();
+    try expectProgramOk(&macro_program);
+    var macro_machine = try core.vm.Vm.init(std.testing.allocator, &macro_program, .{});
+    defer macro_machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.waiting, macro_machine.runSlice(128).status);
+    const f2 = macro_machine.acceptVirtualScanCode(60, 0, .{ .sequence = 2, .tick = 20 });
+    try std.testing.expect(f2.accepted);
+    try std.testing.expectEqual(@as(u8, 4), f2.accepted_bytes);
+    try std.testing.expectEqual(core.vm.Status.halted, macro_machine.runToCompletion(128, 16));
+    try expectString(&macro_machine, "A$", "R");
+    try expectString(&macro_machine, "B$", "U");
+    try expectString(&macro_machine, "C$", "N");
+    try expectString(&macro_machine, "D$", "\r");
+}
+
+test "KEY ON OFF LIST display exact bounded soft-key values and macro overflow is atomic" {
+    const display_source =
+        \\KEY 1, "ABCDEFG"
+        \\KEY 2, "Z"
+        \\KEY ON
+        \\END
+    ;
+    var display_program = try core.compiler.compile(std.testing.allocator, "key-display.bas", display_source);
+    defer display_program.deinit();
+    try expectProgramOk(&display_program);
+    var display_machine = try core.vm.Vm.init(std.testing.allocator, &display_program, .{});
+    defer display_machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, display_machine.runToCompletion(64, 8));
+    try expectScreenRow(&display_machine, display_machine.textScreen().rowCount() - 1, "ABCDEFZ");
+
+    const list_source =
+        \\KEY 1, "12345678901234567890"
+        \\KEY 2, "SECOND"
+        \\KEY LIST
+        \\END
+    ;
+    var list_program = try core.compiler.compile(std.testing.allocator, "key-list.bas", list_source);
+    defer list_program.deinit();
+    try expectProgramOk(&list_program);
+    var list_machine = try core.vm.Vm.init(std.testing.allocator, &list_program, .{});
+    defer list_machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, list_machine.runToCompletion(128, 8));
+    try expectScreenRow(&list_machine, 0, "KEY 1: 123456789012345");
+    try expectScreenRow(&list_machine, 1, "KEY 2: SECOND");
+    try expectScreenRow(&list_machine, 10, "KEY 30:");
+
+    var overflow_program = try core.compiler.compile(
+        std.testing.allocator,
+        "key-macro-overflow.bas",
+        "KEY 2, \"ABCD\"\nSLEEP\nEND\n",
+    );
+    defer overflow_program.deinit();
+    try expectProgramOk(&overflow_program);
+    var overflow_machine = try core.vm.Vm.init(std.testing.allocator, &overflow_program, .{});
+    defer overflow_machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.waiting, overflow_machine.runSlice(64).status);
+    for (0..core.vm.maximum_keyboard_bytes - 2) |_| {
+        try std.testing.expect(overflow_machine.acceptTextCodepoint('Q', .{}).accepted);
+    }
+    const before = overflow_machine.queuedInputBytes();
+    const result = overflow_machine.acceptVirtualScanCode(60, 0, .{});
+    try std.testing.expect(!result.accepted);
+    try std.testing.expectEqual(core.vm.InputDropReason.queue_full, result.reason);
+    try std.testing.expectEqual(before, overflow_machine.queuedInputBytes());
+}
+
+test "COM event source is externally signalled and isolated by selector" {
+    const source =
+        \\DEFINT A-Z
+        \\ON COM(2) GOSUB SerialTrap
+        \\COM(2) ON
+        \\SLEEP
+        \\END
+        \\SerialTrap:
+        \\Count = Count + 1
+        \\RETURN
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "com-event.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runSlice(64).status);
+    try std.testing.expect(!machine.signalComEvent(1));
+    try std.testing.expect(machine.signalComEvent(2));
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runSlice(64).status);
+    try expectInteger(&machine, "Count", 1);
+}
+
 test "PLAY MML parses stateful commands and rejects invalid ranges atomically" {
     var engine = core.audio.Engine.init(std.testing.allocator);
     defer engine.deinit();
@@ -2974,6 +3332,145 @@ test "PLAY MML parses stateful commands and rejects invalid ranges atomically" {
     try std.testing.expectEqual(@as(u64, core.audio.maximum_events), maximum_engine.stats.direct_play_events);
     try std.testing.expectEqual(@as(u64, core.audio.maximum_events), maximum_engine.stats.phase_table_lookups);
     try std.testing.expectEqual(@as(u32, 1), maximum_engine.stats.play_capacity_grows);
+}
+
+test "PLAY expands bounded numeric and string variables and enforces the 32-note background queue" {
+    const source =
+        \\DEFINT A-Z
+        \\Octave = 3
+        \\Tune$ = "L64C"
+        \\PLAY "MBT255O=Octave;XTune$;D"
+        \\Queued = PLAY(0)
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "play-variables.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 16));
+    try expectInteger(&machine, "Queued", 2);
+    try std.testing.expectEqual(@as(u32, 2), machine.audioStats().notes);
+
+    var engine = core.audio.Engine.init(std.testing.allocator);
+    defer engine.deinit();
+    var full = [_]u8{'C'} ** core.audio.maximum_background_notes;
+    _ = try engine.play("MB", 0);
+    _ = try engine.play(&full, 0);
+    const frames_before = engine.pendingFrames();
+    const statements_before = engine.stats.play_statements;
+    try std.testing.expectError(error.InvalidCommand, engine.play("C", 0));
+    try std.testing.expectEqual(frames_before, engine.pendingFrames());
+    try std.testing.expectEqual(statements_before, engine.stats.play_statements);
+    try std.testing.expectEqual(core.audio.maximum_background_notes, engine.playFunctionValue());
+}
+
+test "PLAY event fires once when accepted source frames cross the configured queue fence" {
+    const source =
+        \\DEFINT A-Z
+        \\ON PLAY(2) GOSUB PlayTrap
+        \\PLAY ON
+        \\PLAY "MBT240L64CCC"
+        \\SLEEP
+        \\Done = 1
+        \\END
+        \\PlayTrap:
+        \\PlayCount = PlayCount + 1
+        \\RETURN
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "play-event.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runSlice(256).status);
+    try expectInteger(&machine, "PlayCount", 0);
+
+    var note_pcm: [core.audio.frame_bytes * 375]u8 = undefined;
+    try std.testing.expectEqual(@as(i32, @intCast(note_pcm.len)), machine.renderAudio(&note_pcm));
+    try std.testing.expect(!machine.noteAudioProgress(375, 0, 0, false));
+    try std.testing.expectEqual(@as(i32, @intCast(note_pcm.len)), machine.renderAudio(&note_pcm));
+    try std.testing.expect(machine.noteAudioProgress(375, 0, 0, false));
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runSlice(256).status);
+    try expectInteger(&machine, "PlayCount", 1);
+    try std.testing.expectEqual(@as(i32, @intCast(note_pcm.len)), machine.renderAudio(&note_pcm));
+    try std.testing.expect(!machine.noteAudioProgress(375, 0, 0, false));
+    try std.testing.expect(try machine.enqueueTextCodepoint('X'));
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 16));
+    try expectInteger(&machine, "PlayCount", 1);
+    try expectInteger(&machine, "Done", 1);
+}
+
+test "SOUND follows MB MF source-frame fences and zero duration silences the active tone" {
+    const source =
+        \\DEFINT A-Z
+        \\PLAY "MB"
+        \\SOUND 440, 18
+        \\BackgroundDone = 1
+        \\SOUND 440, 0
+        \\Stopped = 1
+        \\PLAY "MF"
+        \\SOUND 880, 1
+        \\ForegroundDone = 1
+        \\END
+    ;
+    var program = try core.compiler.compile(std.testing.allocator, "sound-fences.bas", source);
+    defer program.deinit();
+    try expectProgramOk(&program);
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    try std.testing.expectEqual(core.vm.Status.waiting, machine.runToCompletion(256, 16));
+    try expectInteger(&machine, "BackgroundDone", 1);
+    try expectInteger(&machine, "Stopped", 1);
+    try expectInteger(&machine, "ForegroundDone", 0);
+
+    var pcm: [core.audio.frame_bytes * 480]u8 = undefined;
+    var heard_tone = false;
+    var woke = false;
+    for (0..128) |_| {
+        const count = machine.renderAudio(&pcm);
+        if (count <= 0) break;
+        const bytes: usize = @intCast(count);
+        if (std.mem.indexOfNone(u8, pcm[0..bytes], &[_]u8{0}) != null) heard_tone = true;
+        if (machine.noteAudioProgress(bytes / core.audio.frame_bytes, 0, 0, false)) {
+            woke = true;
+            break;
+        }
+    }
+    try std.testing.expect(heard_tone);
+    try std.testing.expect(woke);
+    try std.testing.expectEqual(core.vm.Status.halted, machine.runToCompletion(128, 16));
+    try expectInteger(&machine, "ForegroundDone", 1);
+    const stats = machine.audioStats();
+    try std.testing.expectEqual(@as(u32, 3), stats.sound_statements);
+    try std.testing.expectEqual(@as(u32, 1), stats.sound_stops);
+    try std.testing.expectEqual(@as(u32, 1), stats.foreground_waits);
+    try std.testing.expectEqual(@as(u32, 1), stats.foreground_wakes);
+}
+
+test "SOUND uses 18.2 Hz ticks and rejects every numeric boundary before queue mutation" {
+    var engine = core.audio.Engine.init(std.testing.allocator);
+    defer engine.deinit();
+    const result = try engine.sound(440, 182, 0);
+    try std.testing.expectEqual(@as(u64, core.audio.sample_rate * 10), result.fence_frames);
+    try std.testing.expectEqual(@as(u64, core.audio.sample_rate * 10), engine.pendingFrames());
+
+    const vectors = [_][]const u8{
+        "SOUND 36,1\nEND\n",
+        "SOUND 32768,1\nEND\n",
+        "SOUND 440,-1\nEND\n",
+        "SOUND 440,65536\nEND\n",
+    };
+    for (vectors) |source| {
+        var program = try core.compiler.compile(std.testing.allocator, "sound-boundary.bas", source);
+        defer program.deinit();
+        try expectProgramOk(&program);
+        var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+        defer machine.deinit();
+        try std.testing.expectEqual(core.vm.Status.runtime_error, machine.runToCompletion(32, 4));
+        try std.testing.expectEqual(core.vm.RuntimeCode.illegal_function_call, machine.runtime_diagnostic.?.code);
+        try std.testing.expectEqual(@as(u64, 0), machine.pendingAudioFrames());
+    }
 }
 
 test "MB continues while MF and BEEP wait on resolved transport frames" {

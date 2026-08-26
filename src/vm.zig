@@ -1,12 +1,13 @@
 const std = @import("std");
 const audio = @import("audio.zig");
 const bytecode = @import("bytecode.zig");
+const event_dispatcher = @import("event_dispatcher.zig");
 const frontend = @import("frontend.zig");
 const graphics_screen = @import("graphics_screen.zig");
 const text_screen = @import("text_screen.zig");
 const values = @import("value.zig");
 
-pub const contract_version = "2.7.0";
+pub const contract_version = "2.8.0";
 pub const default_instruction_budget: u32 = 262_144;
 pub const timer_poll_interval_ns: u64 = std.time.ns_per_ms;
 pub const maximum_value_stack: usize = 16_384;
@@ -33,6 +34,8 @@ pub const maximum_environment_entries: usize = 64;
 pub const maximum_draw_expansion_bytes: usize = values.maximum_string_bytes;
 pub const maximum_draw_commands: usize = 16_384;
 pub const maximum_draw_expansion_depth: usize = 16;
+pub const maximum_play_expansion_bytes: usize = values.maximum_string_bytes;
+pub const maximum_play_expansion_depth: usize = 16;
 pub const maximum_guest_linear_bytes: usize = 0x10FFF0;
 pub const memory_image_header_bytes: usize = 7;
 pub const maximum_memory_image_payload_bytes: usize = 65_535;
@@ -776,6 +779,32 @@ const StackItem = union(enum) {
 const GosubEntry = struct {
     return_ip: u32,
     frame_depth: usize,
+    event_slot: u8 = no_event_slot,
+};
+
+const no_event_slot: u8 = std.math.maxInt(u8);
+
+const SoftKey = struct {
+    bytes: [15]u8 = .{0} ** 15,
+    len: u8 = 0,
+};
+
+const PenState = struct {
+    present: bool = false,
+    down: bool = false,
+    pressed_since_poll: bool = false,
+    press_x: i32 = 0,
+    press_y: i32 = 0,
+    x: i32 = 0,
+    y: i32 = 0,
+};
+
+const JoystickState = struct {
+    present: [2]bool = .{ false, false },
+    axes: [4]u8 = .{ 100, 100, 100, 100 },
+    latched_axes: [4]u8 = .{ 100, 100, 100, 100 },
+    buttons: [4]bool = .{ false, false, false, false },
+    pressed_since_poll: [4]bool = .{ false, false, false, false },
 };
 
 const ActiveError = struct {
@@ -1006,6 +1035,7 @@ pub const Vm = struct {
     input_line: std.ArrayList(u8) = .empty,
     numeric_scratch: std.ArrayList(u8) = .empty,
     format_scratch: std.ArrayList(u8) = .empty,
+    play_scratch: std.ArrayList(u8) = .empty,
     pending_input_instruction: u32 = bytecode.invalid_index,
     guest_now_ns: u64 = 0,
     wait_wake_ns: u64 = 0,
@@ -1017,6 +1047,11 @@ pub const Vm = struct {
     audio_engine: audio.Engine,
     pending_audio_instruction: u32 = bytecode.invalid_index,
     audio_fence_frames: u64 = 0,
+    events: event_dispatcher.Dispatcher = .{},
+    soft_keys: [32]SoftKey = [_]SoftKey{.{}} ** 32,
+    soft_key_display: bool = false,
+    pen: PenState = .{},
+    joystick: JoystickState = .{},
     random_state: u32 = default_random_seed,
     random_last: f32 = 0,
     open_files: std.ArrayList(FileSlot) = .empty,
@@ -1091,6 +1126,7 @@ pub const Vm = struct {
         self.input_line.deinit(self.allocator);
         self.numeric_scratch.deinit(self.allocator);
         self.format_scratch.deinit(self.allocator);
+        self.play_scratch.deinit(self.allocator);
         self.audio_engine.deinit();
         self.discardFiles();
         self.open_files.deinit(self.allocator);
@@ -1174,12 +1210,55 @@ pub const Vm = struct {
         discarded_frames: u64,
         abandon_pending: bool,
     ) bool {
+        const notes_before = self.audio_engine.backgroundQueueNotes();
         self.audio_engine.acceptTransportProgress(accepted_frames, suppressed_frames, discarded_frames);
         if (abandon_pending) self.audio_engine.abandonPending();
+        const event_ready = self.events.notePlayTransition(notes_before, self.audio_engine.backgroundQueueNotes());
         const foreground_ready = self.pending_audio_instruction != bytecode.invalid_index and
             self.audio_engine.fenceResolved(self.audio_fence_frames);
         const terminal_drain_ready = self.status == .halted and self.audio_engine.unresolvedFrames() == 0;
-        return foreground_ready or terminal_drain_ready;
+        return event_ready or foreground_ready or terminal_drain_ready;
+    }
+
+    pub fn eventStats(self: *const Vm) event_dispatcher.Stats {
+        return self.events.stats;
+    }
+
+    pub fn signalUserEvent(self: *Vm) bool {
+        return self.events.signal(.uevent, 0) catch false;
+    }
+
+    pub fn signalComEvent(self: *Vm, port: u8) bool {
+        return self.events.signal(.com, port) catch false;
+    }
+
+    pub fn setVirtualJoystick(
+        self: *Vm,
+        joystick: u8,
+        x: u8,
+        y: u8,
+        lower_down: bool,
+        upper_down: bool,
+    ) bool {
+        if (joystick > 1 or x < 1 or x > 200 or y < 1 or y > 200) return false;
+        const axis = @as(usize, joystick) * 2;
+        self.joystick.present[joystick] = true;
+        self.joystick.axes[axis] = x;
+        self.joystick.axes[axis + 1] = y;
+        const lower = @as(usize, joystick);
+        const upper = @as(usize, joystick) + 2;
+        self.noteJoystickButton(lower, lower_down);
+        self.noteJoystickButton(upper, upper_down);
+        return true;
+    }
+
+    fn noteJoystickButton(self: *Vm, index: usize, down: bool) void {
+        if (index >= self.joystick.buttons.len) return;
+        if (down and !self.joystick.buttons[index]) {
+            self.joystick.pressed_since_poll[index] = true;
+            _ = self.events.signal(.strig, @as(i32, @intCast(index * 2))) catch false;
+        }
+        self.joystick.buttons[index] = down;
     }
 
     pub fn setInputFocused(self: *Vm, focused: bool) void {
@@ -1197,15 +1276,28 @@ pub const Vm = struct {
     }
 
     pub fn acceptTextCodepoint(self: *Vm, codepoint: u32, stamp: InputStamp) InputResult {
+        return self.acceptTextEvent(codepoint, 0, stamp);
+    }
+
+    pub fn acceptTextEvent(self: *Vm, codepoint: u32, modifiers: u32, stamp: InputStamp) InputResult {
         self.recordInputAttempt(stamp);
         if (!self.input_focused) return self.recordInputDrop(stamp, .unfocused);
         if (codepoint < 0x20 or codepoint > 0xFF or codepoint == 0x7F) {
             return self.recordInputDrop(stamp, .invalid_codepoint);
         }
+        if (scanForCodepoint(@intCast(codepoint))) |scan| {
+            if (self.trapUserDefinedKey(scan, quickBasicKeyboardFlag(modifiers))) {
+                return self.recordTrappedKey(stamp);
+            }
+        }
         return self.appendInput(@intCast(codepoint), stamp);
     }
 
     pub fn acceptKeyCode(self: *Vm, code: u32, stamp: InputStamp) InputResult {
+        return self.acceptKeyEvent(code, 0, stamp);
+    }
+
+    pub fn acceptKeyEvent(self: *Vm, code: u32, modifiers: u32, stamp: InputStamp) InputResult {
         self.recordInputAttempt(stamp);
         if (!self.input_focused) return self.recordInputDrop(stamp, .unfocused);
         const byte: ?u8 = switch (code) {
@@ -1213,23 +1305,37 @@ pub const Vm = struct {
             10, 13 => 13,
             else => null,
         };
-        if (byte) |value| return self.appendInput(value, stamp);
-        const scan: u8 = switch (code) {
-            0x7F => 83,
-            0x80 => 72,
-            0x81 => 80,
-            0x82 => 61,
-            0x84 => 15,
-            0x88 => 75,
-            0x89 => 77,
-            0x8A => 71,
-            0x8B => 79,
-            0x8D => 73,
-            0x8E => 81,
-            0x90 => 68,
-            else => return self.recordInputDrop(stamp, .unsupported_key),
-        };
-        return self.appendExtendedInput(scan, stamp);
+        if (byte) |value| {
+            if (scanForCodepoint(value)) |scan| {
+                if (self.trapUserDefinedKey(scan, quickBasicKeyboardFlag(modifiers))) return self.recordTrappedKey(stamp);
+            }
+            return self.appendInput(value, stamp);
+        }
+        const mapping = keyMappingForR4osCode(code) orelse return self.recordInputDrop(stamp, .unsupported_key);
+        return self.acceptMappedScan(mapping.scan, mapping.key_number, quickBasicKeyboardFlag(modifiers), stamp);
+    }
+
+    pub fn acceptVirtualScanCode(self: *Vm, scan: u8, keyboard_flag: u8, stamp: InputStamp) InputResult {
+        self.recordInputAttempt(stamp);
+        if (!self.input_focused) return self.recordInputDrop(stamp, .unfocused);
+        return self.acceptMappedScan(scan, keyNumberForScan(scan), keyboard_flag, stamp);
+    }
+
+    pub fn acceptPenPointer(self: *Vm, x: i32, y: i32, down: bool, stamp: InputStamp) InputResult {
+        self.recordInputAttempt(stamp);
+        if (!self.input_focused) return self.recordInputDrop(stamp, .unfocused);
+        self.pen.present = true;
+        self.pen.x = @max(0, x);
+        self.pen.y = @max(0, y);
+        if (down and !self.pen.down) {
+            self.pen.pressed_since_poll = true;
+            self.pen.press_x = self.pen.x;
+            self.pen.press_y = self.pen.y;
+            _ = self.events.signal(.pen, 0) catch false;
+        }
+        self.pen.down = down;
+        self.input_stats.control_events +%= 1;
+        return .{ .accepted = true };
     }
 
     pub fn enqueueTextCodepoint(self: *Vm, codepoint: u32) std.mem.Allocator.Error!bool {
@@ -1266,6 +1372,63 @@ pub const Vm = struct {
             @as(u64, @intCast(self.keyboard.items.len - self.keyboard_head)),
         );
         return .{ .accepted = true, .accepted_bytes = 1 };
+    }
+
+    fn appendInputBytes(self: *Vm, bytes: []const u8, stamp: InputStamp) InputResult {
+        if (bytes.len > std.math.maxInt(u8) or
+            self.keyboard.items.len - self.keyboard_head > maximum_keyboard_bytes -| bytes.len)
+        {
+            return self.recordInputDrop(stamp, .queue_full);
+        }
+        self.keyboard.ensureUnusedCapacity(self.allocator, bytes.len) catch return self.recordInputDrop(stamp, .out_of_memory);
+        for (bytes) |byte| self.keyboard.appendAssumeCapacity(.{
+            .value = byte,
+            .sequence = stamp.sequence,
+            .tick = stamp.tick,
+        });
+        self.keyboard_generation +%= 1;
+        self.input_stats.accepted_bytes +%= bytes.len;
+        self.input_stats.last_accepted_sequence = stamp.sequence;
+        self.input_stats.last_accepted_tick = stamp.tick;
+        self.input_stats.maximum_queue_depth = @max(
+            self.input_stats.maximum_queue_depth,
+            @as(u64, @intCast(self.keyboard.items.len - self.keyboard_head)),
+        );
+        return .{ .accepted = true, .accepted_bytes = @intCast(bytes.len) };
+    }
+
+    fn acceptMappedScan(self: *Vm, scan: u8, key_number: ?u8, keyboard_flag: u8, stamp: InputStamp) InputResult {
+        if (key_number) |selector| {
+            if (self.events.detects(.key, selector)) {
+                _ = self.events.signal(.key, selector) catch false;
+                return self.recordTrappedKey(stamp);
+            }
+            if (isSoftKeyNumber(selector)) {
+                const macro = self.soft_keys[selector];
+                if (macro.len != 0) return self.appendInputBytes(macro.bytes[0..macro.len], stamp);
+            }
+        } else if (self.trapUserDefinedKey(scan, keyboard_flag)) {
+            return self.recordTrappedKey(stamp);
+        }
+        return self.appendExtendedInput(scan, stamp);
+    }
+
+    fn trapUserDefinedKey(self: *Vm, scan: u8, keyboard_flag: u8) bool {
+        for (15..26) |selector| {
+            const definition = self.soft_keys[selector];
+            if (definition.len < 2 or !keyFlagsMatch(definition.bytes[0], keyboard_flag) or definition.bytes[1] != scan) continue;
+            if (!self.events.detects(.key, @intCast(selector))) return false;
+            _ = self.events.signal(.key, @intCast(selector)) catch false;
+            return true;
+        }
+        return false;
+    }
+
+    fn recordTrappedKey(self: *Vm, stamp: InputStamp) InputResult {
+        self.keyboard_generation +%= 1;
+        self.input_stats.last_accepted_sequence = stamp.sequence;
+        self.input_stats.last_accepted_tick = stamp.tick;
+        return .{ .accepted = true };
     }
 
     fn appendExtendedInput(self: *Vm, scan: u8, stamp: InputStamp) InputResult {
@@ -1452,6 +1615,7 @@ pub const Vm = struct {
         self.input_line.clearRetainingCapacity();
         self.numeric_scratch.clearRetainingCapacity();
         self.format_scratch.clearRetainingCapacity();
+        self.play_scratch.clearRetainingCapacity();
         self.pending_input_instruction = bytecode.invalid_index;
         self.guest_now_ns = 0;
         self.wait_wake_ns = 0;
@@ -1462,6 +1626,11 @@ pub const Vm = struct {
         self.audio_engine.reset();
         self.pending_audio_instruction = bytecode.invalid_index;
         self.audio_fence_frames = 0;
+        self.events.reset();
+        self.soft_keys = [_]SoftKey{.{}} ** 32;
+        self.soft_key_display = false;
+        self.pen = .{};
+        self.joystick = .{};
         self.random_state = normalizeRandomSeed(self.host.initial_random_seed);
         self.random_last = randomValue(self.random_state);
         self.discardPendingFileTransfer();
@@ -1507,9 +1676,12 @@ pub const Vm = struct {
             self.status = .waiting;
             return .{ .status = .waiting, .instructions = 0 };
         }
+        const resumed_wait = self.status == .waiting;
         self.status = .ready;
         self.wait_wake_ns = 0;
+        self.events.pollTimer(self.guest_now_ns);
         var executed: u32 = 0;
+        var may_dispatch_waiting_event = resumed_wait;
         while (executed < instruction_budget) {
             self.cancel_flag_checks +%= 1;
             if (self.cancel_requested) {
@@ -1522,6 +1694,14 @@ pub const Vm = struct {
                 return .{ .status = self.status, .instructions = executed };
             }
 
+            if (may_dispatch_waiting_event or self.atEventBoundary()) {
+                may_dispatch_waiting_event = false;
+                self.dispatchPendingEvent() catch |fault| {
+                    self.recordError(runtimeCode(fault), self.instruction_pointer);
+                    return .{ .status = self.status, .instructions = executed };
+                };
+            }
+
             const instruction_index = self.instruction_pointer;
             const instruction = self.program.instructions[instruction_index];
             self.enterInstructionStatement(instruction_index);
@@ -1530,6 +1710,7 @@ pub const Vm = struct {
                 if (fault == error.WouldBlock) {
                     self.instruction_pointer = instruction_index;
                     self.status = .waiting;
+                    self.includeEventWakeDeadline();
                     return .{
                         .status = .waiting,
                         .instructions = executed,
@@ -1573,6 +1754,36 @@ pub const Vm = struct {
         }
         self.status = .yielded;
         return .{ .status = .yielded, .instructions = executed };
+    }
+
+    fn atEventBoundary(self: *const Vm) bool {
+        if (self.current_statement_start == bytecode.invalid_index) return true;
+        return self.instruction_pointer < self.current_statement_start or
+            self.instruction_pointer >= self.current_statement_next;
+    }
+
+    fn dispatchPendingEvent(self: *Vm) ExecutionError!void {
+        const delivery = self.events.take() orelse return;
+        errdefer self.events.finishHandler(delivery.slot);
+        if (delivery.kind == .strig) {
+            self.joystick.pressed_since_poll[delivery.selector / 2] = false;
+        }
+        if (self.gosub_stack.items.len >= maximum_gosub_depth) return error.StackOverflow;
+        try self.gosub_stack.append(self.allocator, .{
+            .return_ip = self.instruction_pointer,
+            .frame_depth = self.frames.items.len,
+            .event_slot = delivery.slot,
+        });
+        self.instruction_pointer = delivery.target;
+        self.current_statement_start = bytecode.invalid_index;
+        self.current_statement_next = bytecode.invalid_index;
+        self.statement_stack_base = self.stack.items.len;
+    }
+
+    fn includeEventWakeDeadline(self: *Vm) void {
+        const event_deadline = self.events.nextTimerDeadline();
+        if (event_deadline == 0) return;
+        if (self.wait_wake_ns == 0 or event_deadline < self.wait_wake_ns) self.wait_wake_ns = event_deadline;
     }
 
     pub fn runToCompletion(self: *Vm, slice_budget: u32, maximum_slices: u32) Status {
@@ -1962,6 +2173,12 @@ pub const Vm = struct {
             .process_shell,
             .audio_beep,
             .audio_play,
+            .audio_sound,
+            .event_bind,
+            .event_control,
+            .event_compat,
+            .key_macro,
+            .key_display,
             .call_builtin,
             => .host,
         };
@@ -2072,6 +2289,12 @@ pub const Vm = struct {
             .system_exit => try self.systemExit(),
             .audio_beep => try self.audioBeep(instruction_index),
             .audio_play => try self.audioPlay(instruction_index),
+            .audio_sound => try self.audioSound(instruction_index),
+            .event_bind => try self.eventBind(instruction.a, instruction.b),
+            .event_control => try self.eventControl(instruction.a, instruction.b),
+            .event_compat => try self.eventCompat(instruction.a, instruction.b),
+            .key_macro => try self.keyMacro(),
+            .key_display => try self.keyDisplay(instruction.a),
             .convert => try self.convertTop(bytecode.decodeValueType(instruction.a)),
             .negate => try self.unaryNegate(bytecode.decodeValueType(instruction.a)),
             .logical_not => try self.unaryLogicalNot(),
@@ -4302,16 +4525,187 @@ pub const Vm = struct {
             var command = try self.popValue();
             defer command.deinit(self.allocator);
             if (command != .string) return error.TypeMismatch;
-            const result = self.audio_engine.play(command.string, self.guest_now_ns) catch |fault| switch (fault) {
+            self.play_scratch.clearRetainingCapacity();
+            try self.expandPlayMacroBytes(command.string, 0);
+            const result = self.audio_engine.play(self.play_scratch.items, self.guest_now_ns) catch |fault| switch (fault) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvalidCommand => return error.IllegalFunctionCall,
             };
-            if (result.mode == .background or result.event_count == 0) return;
+            if (!result.requires_wait) return;
             self.pending_audio_instruction = instruction_index;
             self.audio_fence_frames = result.fence_frames;
             self.audio_engine.noteForegroundWait();
         }
         try self.waitForForegroundAudio();
+    }
+
+    fn expandPlayMacroBytes(self: *Vm, macro: []const u8, depth: usize) ExecutionError!void {
+        if (depth > maximum_play_expansion_depth) return error.IllegalFunctionCall;
+        var index: usize = 0;
+        while (index < macro.len) {
+            const symbol = std.ascii.toUpper(macro[index]);
+            if (symbol == 'X') {
+                index += 1;
+                const name = try parsePlayVariableName(macro, &index);
+                const value = try self.drawVariableValue(name);
+                const substring = switch (value.*) {
+                    .string => |bytes| bytes,
+                    else => return error.TypeMismatch,
+                };
+                try self.expandPlayMacroBytes(substring, depth + 1);
+                continue;
+            }
+            if (symbol == '=') {
+                index += 1;
+                const name = try parsePlayVariableName(macro, &index);
+                const value = try self.drawVariableValue(name);
+                const number = try values.asLong(value.*);
+                var storage: [16]u8 = undefined;
+                const formatted = std.fmt.bufPrint(&storage, "{d}", .{number}) catch return error.Overflow;
+                try self.appendPlayExpansion(formatted);
+                continue;
+            }
+            try self.appendPlayExpansion(macro[index .. index + 1]);
+            index += 1;
+        }
+    }
+
+    fn appendPlayExpansion(self: *Vm, bytes: []const u8) ExecutionError!void {
+        if (bytes.len > maximum_play_expansion_bytes -| self.play_scratch.items.len) {
+            return error.IllegalFunctionCall;
+        }
+        try self.play_scratch.appendSlice(self.allocator, bytes);
+    }
+
+    fn audioSound(self: *Vm, instruction_index: u32) ExecutionError!void {
+        if (self.pending_audio_instruction != instruction_index) {
+            var duration_value = try self.popValue();
+            defer duration_value.deinit(self.allocator);
+            var frequency_value = try self.popValue();
+            defer frequency_value.deinit(self.allocator);
+            const frequency = try values.asLong(frequency_value);
+            const duration = try values.asLong(duration_value);
+            if (frequency < 37 or frequency > 32_767 or duration < 0 or duration > 65_535) {
+                return error.IllegalFunctionCall;
+            }
+            const result = self.audio_engine.sound(
+                @intCast(frequency),
+                @intCast(duration),
+                self.guest_now_ns,
+            ) catch |fault| switch (fault) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidCommand => return error.IllegalFunctionCall,
+            };
+            if (!result.requires_wait) return;
+            self.pending_audio_instruction = instruction_index;
+            self.audio_fence_frames = result.fence_frames;
+            self.audio_engine.noteForegroundWait();
+        }
+        try self.waitForForegroundAudio();
+    }
+
+    fn eventBind(self: *Vm, target: u32, encoded_kind: u32) ExecutionError!void {
+        if (target != bytecode.invalid_index and target >= self.program.instructions.len) return error.InvalidInstruction;
+        const kind = try decodeEventKind(encoded_kind);
+        var selector: i32 = 0;
+        var parameter: i32 = 0;
+        switch (kind) {
+            .key, .com, .strig => {
+                var value = try self.popValue();
+                defer value.deinit(self.allocator);
+                selector = try values.asLong(value);
+            },
+            .timer, .play => {
+                var value = try self.popValue();
+                defer value.deinit(self.allocator);
+                parameter = try values.asLong(value);
+            },
+            .pen, .uevent => {},
+        }
+        self.events.bind(kind, selector, parameter, target, self.guest_now_ns) catch return error.IllegalFunctionCall;
+    }
+
+    fn eventControl(self: *Vm, encoded_kind: u32, encoded_action: u32) ExecutionError!void {
+        const kind = try decodeEventKind(encoded_kind);
+        const action = try decodeEventAction(encoded_action);
+        var selector: i32 = 0;
+        switch (kind) {
+            .key, .com, .strig => {
+                var value = try self.popValue();
+                defer value.deinit(self.allocator);
+                selector = try values.asLong(value);
+            },
+            else => {},
+        }
+        self.events.control(kind, selector, action, self.guest_now_ns) catch return error.IllegalFunctionCall;
+    }
+
+    fn eventCompat(self: *Vm, encoded_kind: u32, encoded_action: u32) ExecutionError!void {
+        _ = self;
+        const kind = try decodeEventKind(encoded_kind);
+        const action = try decodeEventAction(encoded_action);
+        if (kind != .strig or action == .stop) return error.InvalidInstruction;
+        // QuickBASIC accepts these BASICA compatibility statements but ignores
+        // them. Event trapping is controlled exclusively by STRIG(n) ON/OFF/STOP.
+    }
+
+    fn keyMacro(self: *Vm) ExecutionError!void {
+        var macro_value = try self.popValue();
+        defer macro_value.deinit(self.allocator);
+        if (macro_value != .string) return error.TypeMismatch;
+        var selector_value = try self.popValue();
+        defer selector_value.deinit(self.allocator);
+        const selector = try values.asLong(selector_value);
+        if (!((selector >= 1 and selector <= 10) or (selector >= 15 and selector <= 25) or
+            selector == 30 or selector == 31)) return error.IllegalFunctionCall;
+        if (selector >= 15 and selector <= 25 and macro_value.string.len != 0 and macro_value.string.len < 2) {
+            return error.IllegalFunctionCall;
+        }
+        const used = @min(macro_value.string.len, @as(usize, 15));
+        var definition = SoftKey{};
+        @memcpy(definition.bytes[0..used], macro_value.string[0..used]);
+        definition.len = @intCast(used);
+        self.soft_keys[@intCast(selector)] = definition;
+        if (self.soft_key_display) self.refreshSoftKeyDisplay();
+    }
+
+    fn keyDisplay(self: *Vm, encoded_action: u32) ExecutionError!void {
+        if (encoded_action > @intFromEnum(bytecode.KeyDisplayAction.list)) return error.InvalidInstruction;
+        const action: bytecode.KeyDisplayAction = @enumFromInt(@as(u8, @intCast(encoded_action)));
+        switch (action) {
+            .on => {
+                self.soft_key_display = true;
+                self.refreshSoftKeyDisplay();
+            },
+            .off => {
+                self.soft_key_display = false;
+                self.text.writeBottomLine("");
+            },
+            .list => {
+                for ([_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 30, 31 }) |selector| {
+                    var prefix_storage: [16]u8 = undefined;
+                    const prefix = std.fmt.bufPrint(&prefix_storage, "KEY {d}: ", .{selector}) catch return error.Overflow;
+                    self.text.write(prefix);
+                    const definition = self.soft_keys[selector];
+                    self.text.write(definition.bytes[0..definition.len]);
+                    self.text.write("\r\n");
+                }
+            },
+        }
+        self.host_display_requested = true;
+    }
+
+    fn refreshSoftKeyDisplay(self: *Vm) void {
+        const selectors = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 30, 31 };
+        var line: [selectors.len * 6]u8 = .{' '} ** (selectors.len * 6);
+        for (selectors, 0..) |selector, index| {
+            const offset = index * 6;
+            const definition = self.soft_keys[selector];
+            const used = @min(@as(usize, definition.len), @as(usize, 6));
+            @memcpy(line[offset .. offset + used], definition.bytes[0..used]);
+        }
+        self.text.writeBottomLine(&line);
+        self.host_display_requested = true;
     }
 
     fn waitForForegroundAudio(self: *Vm) ExecutionError!void {
@@ -6161,7 +6555,11 @@ pub const Vm = struct {
         const entry = self.gosub_stack.items[self.gosub_stack.items.len - 1];
         if (entry.frame_depth != self.frames.items.len) return error.GosubWithoutReturn;
         _ = self.gosub_stack.pop();
+        if (entry.event_slot != no_event_slot) self.events.finishHandler(entry.event_slot);
         self.instruction_pointer = if (target == bytecode.invalid_index) entry.return_ip else target;
+        self.current_statement_start = bytecode.invalid_index;
+        self.current_statement_next = bytecode.invalid_index;
+        self.statement_stack_base = self.stack.items.len;
     }
 
     fn callBuiltin(self: *Vm, builtin: bytecode.Builtin, argument_count: u32) ExecutionError!void {
@@ -6249,9 +6647,13 @@ pub const Vm = struct {
             .err => self.errorNumber(),
             .erl => self.errorLine(),
             .inkey_string => self.inkeyString(),
+            .play => .{ .integer = @intCast(@min(self.audio_engine.playFunctionValue(), @as(u32, std.math.maxInt(i16)))) },
+            .pen => self.penValue(arguments[0]),
             .rnd => self.randomNumber(arguments),
             .sgn => signum(arguments[0]),
             .timer => self.timerValue(),
+            .stick => self.stickValue(arguments[0]),
+            .strig => self.strigValue(arguments[0]),
             .command_string => .{ .string = try self.allocator.dupe(u8, self.command_line) },
             .date_string => self.dateString(),
             .environ_string => self.environmentString(arguments[0]),
@@ -6271,6 +6673,69 @@ pub const Vm = struct {
                 try values.asLong(arguments[1]),
             )) },
         };
+    }
+
+    fn penValue(self: *Vm, selector_value: values.Value) ExecutionError!values.Value {
+        const selector = try values.asLong(selector_value);
+        if (selector < 0 or selector > 9) return error.IllegalFunctionCall;
+        if ((self.events.mode(.pen, 0) catch return error.IllegalFunctionCall) == .off) {
+            return error.IllegalFunctionCall;
+        }
+        const result: i32 = switch (selector) {
+            0 => blk: {
+                const pressed = self.pen.pressed_since_poll;
+                self.pen.pressed_since_poll = false;
+                break :blk truthInteger(pressed);
+            },
+            1 => if (self.pen.present) self.pen.press_x else 0,
+            2 => if (self.pen.present) self.pen.press_y else 0,
+            3 => truthInteger(self.pen.present and self.pen.down),
+            4 => if (self.pen.present) self.pen.x else 0,
+            5 => if (self.pen.present) self.pen.y else 0,
+            6 => if (self.pen.present) self.penCharacterRow(self.pen.press_y) else 0,
+            7 => if (self.pen.present) self.penCharacterColumn(self.pen.press_x) else 0,
+            8 => if (self.pen.present) self.penCharacterRow(self.pen.y) else 0,
+            9 => if (self.pen.present) self.penCharacterColumn(self.pen.x) else 0,
+            else => unreachable,
+        };
+        return .{ .integer = @intCast(result) };
+    }
+
+    fn penCharacterRow(self: *Vm, y: i32) i32 {
+        const height: i32 = if (self.graphics.view()) |view| @intCast(view.height) else @intCast(self.text.rowCount() * 16);
+        if (height <= 0) return 0;
+        return @min(
+            @as(i32, @intCast(self.text.rowCount())),
+            @max(@as(i32, 1), @divTrunc(@max(y, 0) * @as(i32, @intCast(self.text.rowCount())), height) + 1),
+        );
+    }
+
+    fn penCharacterColumn(self: *Vm, x: i32) i32 {
+        const width: i32 = if (self.graphics.view()) |view| @intCast(view.width) else @intCast(self.text.columnCount() * 8);
+        if (width <= 0) return 0;
+        return @min(
+            @as(i32, @intCast(self.text.columnCount())),
+            @max(@as(i32, 1), @divTrunc(@max(x, 0) * @as(i32, @intCast(self.text.columnCount())), width) + 1),
+        );
+    }
+
+    fn stickValue(self: *Vm, selector_value: values.Value) ExecutionError!values.Value {
+        const selector = try values.asLong(selector_value);
+        if (selector < 0 or selector > 3) return error.IllegalFunctionCall;
+        if (selector == 0) self.joystick.latched_axes = self.joystick.axes;
+        return .{ .integer = self.joystick.latched_axes[@intCast(selector)] };
+    }
+
+    fn strigValue(self: *Vm, selector_value: values.Value) ExecutionError!values.Value {
+        const selector = try values.asLong(selector_value);
+        if (selector < 0 or selector > 7) return error.IllegalFunctionCall;
+        const button: usize = @intCast(@divTrunc(selector, 2));
+        const active = if ((selector & 1) == 0) blk: {
+            const pressed = self.joystick.pressed_since_poll[button];
+            self.joystick.pressed_since_poll[button] = false;
+            break :blk pressed;
+        } else self.joystick.buttons[button];
+        return .{ .integer = truthInteger(active) };
     }
 
     fn endOfFile(self: *Vm, file_number_value: values.Value) ExecutionError!values.Value {
@@ -6905,6 +7370,147 @@ fn validMemoryImageLength(buffer: []const u8, expected: usize) bool {
         buffer[buffer.len - 1] == 0x1A;
 }
 
+const KeyMapping = struct {
+    scan: u8,
+    key_number: ?u8 = null,
+};
+
+fn truthInteger(value: bool) i16 {
+    return if (value) -1 else 0;
+}
+
+fn decodeEventKind(encoded: u32) ExecutionError!event_dispatcher.Kind {
+    if (encoded > @intFromEnum(bytecode.EventKind.uevent)) return error.InvalidInstruction;
+    return switch (@as(bytecode.EventKind, @enumFromInt(@as(u8, @intCast(encoded))))) {
+        .key => .key,
+        .timer => .timer,
+        .play => .play,
+        .com => .com,
+        .pen => .pen,
+        .strig => .strig,
+        .uevent => .uevent,
+    };
+}
+
+fn decodeEventAction(encoded: u32) ExecutionError!event_dispatcher.Action {
+    if (encoded > @intFromEnum(bytecode.EventAction.stop)) return error.InvalidInstruction;
+    return switch (@as(bytecode.EventAction, @enumFromInt(@as(u8, @intCast(encoded))))) {
+        .on => .on,
+        .off => .off,
+        .stop => .stop,
+    };
+}
+
+fn keyMappingForR4osCode(code: u32) ?KeyMapping {
+    return switch (code) {
+        0x7F => .{ .scan = 83 },
+        0x80 => .{ .scan = 72, .key_number = 11 },
+        0x81 => .{ .scan = 80, .key_number = 14 },
+        0x82 => .{ .scan = 61, .key_number = 3 },
+        0x83 => .{ .scan = 1 },
+        0x84 => .{ .scan = 15 },
+        0x88 => .{ .scan = 75, .key_number = 12 },
+        0x89 => .{ .scan = 77, .key_number = 13 },
+        0x8A => .{ .scan = 71 },
+        0x8B => .{ .scan = 79 },
+        0x8D => .{ .scan = 73 },
+        0x8E => .{ .scan = 81 },
+        else => null,
+    };
+}
+
+fn keyNumberForScan(scan: u8) ?u8 {
+    if (scan >= 59 and scan <= 68) return scan - 58;
+    return switch (scan) {
+        72 => 11,
+        75 => 12,
+        77 => 13,
+        80 => 14,
+        133 => 30,
+        134 => 31,
+        else => null,
+    };
+}
+
+fn isSoftKeyNumber(selector: u8) bool {
+    return (selector >= 1 and selector <= 10) or selector == 30 or selector == 31;
+}
+
+fn quickBasicKeyboardFlag(modifiers: u32) u8 {
+    var result: u8 = 0;
+    if ((modifiers & 1) != 0) result |= 1;
+    if ((modifiers & 2) != 0) result |= 4;
+    if ((modifiers & 4) != 0) result |= 8;
+    return result;
+}
+
+fn keyFlagsMatch(defined: u8, actual: u8) bool {
+    if ((defined & 0xFC) != (actual & 0xFC)) return false;
+    return (defined & 0x03 == 0) == (actual & 0x03 == 0);
+}
+
+fn scanForCodepoint(codepoint: u8) ?u8 {
+    const upper = std.ascii.toUpper(codepoint);
+    if (upper >= 'A' and upper <= 'Z') return switch (upper) {
+        'A' => 30,
+        'B' => 48,
+        'C' => 46,
+        'D' => 32,
+        'E' => 18,
+        'F' => 33,
+        'G' => 34,
+        'H' => 35,
+        'I' => 23,
+        'J' => 36,
+        'K' => 37,
+        'L' => 38,
+        'M' => 50,
+        'N' => 49,
+        'O' => 24,
+        'P' => 25,
+        'Q' => 16,
+        'R' => 19,
+        'S' => 31,
+        'T' => 20,
+        'U' => 22,
+        'V' => 47,
+        'W' => 17,
+        'X' => 45,
+        'Y' => 21,
+        'Z' => 44,
+        else => unreachable,
+    };
+    return switch (codepoint) {
+        27 => 1,
+        '1', '!' => 2,
+        '2', '@' => 3,
+        '3', '#' => 4,
+        '4', '$' => 5,
+        '5', '%' => 6,
+        '6', '^' => 7,
+        '7', '&' => 8,
+        '8', '*' => 9,
+        '9', '(' => 10,
+        '0', ')' => 11,
+        '-', '_' => 12,
+        '=', '+' => 13,
+        8 => 14,
+        9 => 15,
+        '[', '{' => 26,
+        ']', '}' => 27,
+        13 => 28,
+        ';', ':' => 39,
+        '\'', '"' => 40,
+        '`', '~' => 41,
+        '\\', '|' => 43,
+        ',', '<' => 51,
+        '.', '>' => 52,
+        '/', '?' => 53,
+        ' ' => 57,
+        else => null,
+    };
+}
+
 fn skipDrawSeparators(macro: []const u8, index: *usize) void {
     while (true) {
         skipDrawSpaces(macro, index);
@@ -6930,6 +7536,23 @@ fn parseDrawVariableName(macro: []const u8, index: *usize, _: bool) ExecutionErr
     }
     const name = macro[start..index.*];
     if (name.len > frontend.maximum_identifier_bytes + 1) return error.IllegalFunctionCall;
+    return name;
+}
+
+fn parsePlayVariableName(macro: []const u8, index: *usize) ExecutionError![]const u8 {
+    skipDrawSpaces(macro, index);
+    const start = index.*;
+    if (start == macro.len or !std.ascii.isAlphabetic(macro[start])) return error.IllegalFunctionCall;
+    index.* += 1;
+    while (index.* < macro.len and std.ascii.isAlphanumeric(macro[index.*])) index.* += 1;
+    if (index.* < macro.len and (macro[index.*] == '$' or macro[index.*] == '%' or
+        macro[index.*] == '&' or macro[index.*] == '!' or macro[index.*] == '#'))
+    {
+        index.* += 1;
+    }
+    const name = macro[start..index.*];
+    if (name.len > frontend.maximum_identifier_bytes + 1) return error.IllegalFunctionCall;
+    if (index.* < macro.len and macro[index.*] == ';') index.* += 1;
     return name;
 }
 

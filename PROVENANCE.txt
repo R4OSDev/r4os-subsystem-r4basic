@@ -34,6 +34,10 @@ Primaere Sprachreferenz:
   grosser Header direkt aus der Language Reference und dem Grafikkapitel von
   Programming in BASIC ausgewertet. Die drei zulaessigen BSAVE-Dateiendungen
   wurden zusaetzlich gegen Microsoft Knowledge Base Q34407 abgeglichen.
+- Fuer VM-Vertrag 2.8 wurden ON event, KEY/KEY(n), TIMER-, PLAY-, COM-, PEN-,
+  STRIG- und UEVENT-Steuerung, PEN/STICK/STRIG-Funktionen, die vollstaendige
+  PLAY-Makrosprache, SOUND und BEEP unmittelbar aus der lokalen Microsoft-
+  QuickBASIC-4.5-Language-Reference ausgewertet.
 - Daraus uebernommen wurden ausschliesslich Sprachsemantik und Grenzen;
   Parser-, Speicher-, Alias-, Bytecode- und Fehlerflusscode sind eine neue
   eigenstaendige R4OS-Implementierung.

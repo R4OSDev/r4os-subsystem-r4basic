@@ -11,24 +11,24 @@ maximizable window. The logical QuickBASIC `SCREEN` modes 0, 1, 2, and 7
 through 13 are presented as whole or damaged indexed raster frames through
 `r4os.subsystem_host`.
 
-`BEEP` and the supported QuickBASIC `PLAY` Music Macro Language generate
-24 kHz stereo PCM through the buffered subsystem runtime; HDA converts it to
-the 48 kHz hardware format. Foreground and background playback follow `MF`
-and `MB`. No service session is opened until the first non-silent source
-quantum. The productive host buffers four 40 ms source quanta, but performs
-at most one open, write, or close operation after video publication in each
-host cycle. Busy retries use an independent 10 ms deadline and late prefill
-is interleaved instead of emitted as one synchronous burst. Foreground BASIC
-waits resolve on accepted, deliberately suppressed, or explicitly discarded
-source frames—not elapsed guest time. The platform exposes no per-stream
-hardware playback cursor, and R4BASIC does not infer one from service
-acceptance. Unavailable audio degrades visibly without stopping guest time,
-input, or graphics.
+`BEEP`, `SOUND`, and the complete bounded QuickBASIC `PLAY` Music Macro
+Language generate 24 kHz stereo PCM through the buffered subsystem runtime;
+HDA converts it to the 48 kHz hardware format. Foreground and background
+playback follow `MF` and `MB`. No service session is opened until the first
+non-silent source quantum. The productive host buffers four 40 ms source
+quanta, but performs at most one open, write, or close operation after video
+publication in each host cycle. Busy retries use an independent 10 ms
+deadline and late prefill is interleaved instead of emitted as one synchronous
+burst. Foreground BASIC waits resolve on accepted, deliberately suppressed,
+or explicitly discarded source frames—not elapsed guest time. The platform
+exposes no per-stream hardware playback cursor, and R4BASIC does not infer one
+from service acceptance. Unavailable audio degrades visibly without stopping
+guest time, input, events, or graphics.
 
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.25`
+- Module version: `1.2.26`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -146,6 +146,24 @@ QuickBASIC memory-image format through the asynchronous Storage facade. Each
 VM owns its real-mode guest address space; only active packed `A000`/`B800`
 video ranges are mapped, and no guest address is ever a host pointer. Input
 also accepts the validated BASICA and GW-BASIC trailer variants atomically.
+
+R4BASIC 1.2.26 completes audio, keyboard, timer, and device-event behavior.
+One fixed, VM-local dispatcher implements `ON ... GOSUB` and `ON`/`OFF`/`STOP`
+for `KEY`, `TIMER`, `PLAY`, `COM`, `PEN`, `STRIG`, and `UEVENT`, including
+coalescing, stable cross-source priority, nested handlers, and reference
+`RETURN` reactivation. Event checks happen only at safe statement boundaries;
+monotonic TIMER deadlines and input activity wake the cooperative scheduler
+without polling.
+
+Function-key traps, cursor and extended keys, user-defined modifier/scancode
+keys, 15-byte soft-key macros, `KEY ON`/`OFF`/`LIST`, and exact one- or
+two-byte `INKEY$` input share one bounded queue. Pointer input feeds a private
+ten-value `PEN` device; two optional virtual joysticks feed `STICK` and
+`STRIG`, while absent devices return deterministic neutral values. `PLAY`
+now includes numeric and string-variable expansion, all note/rest/tempo/
+octave/length/articulation commands, a 32-note background bound, `PLAY(n)`
+events, and `PLAY(n)` queue inspection. `SOUND` uses the documented 18.2-Hz
+tick duration and the same transport-confirmed `MF`/`MB` fences as `BEEP`.
 
 R4BASIC 1.2.22 uses a shared 262,144-instruction ceiling with adaptive bounded
 clock blocks and an 8-ms production time boundary. Active work requests a

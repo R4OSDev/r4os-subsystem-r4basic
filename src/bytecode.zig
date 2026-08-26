@@ -1,7 +1,7 @@
 const std = @import("std");
 const frontend = @import("frontend.zig");
 
-pub const contract_version = "2.7.0";
+pub const contract_version = "2.8.0";
 pub const invalid_index: u32 = std.math.maxInt(u32);
 pub const unknown_dimensions: u8 = std.math.maxInt(u8);
 
@@ -143,6 +143,28 @@ pub const FileLock = enum(u8) {
     read,
     write,
     read_write,
+};
+
+pub const EventKind = enum(u8) {
+    key,
+    timer,
+    play,
+    com,
+    pen,
+    strig,
+    uevent,
+};
+
+pub const EventAction = enum(u8) {
+    on,
+    off,
+    stop,
+};
+
+pub const KeyDisplayAction = enum(u8) {
+    on,
+    off,
+    list,
 };
 
 pub const file_open_has_length: u32 = 1 << 0;
@@ -312,6 +334,12 @@ pub const OpCode = enum(u8) {
     system_exit,
     audio_beep,
     audio_play,
+    audio_sound,
+    event_bind,
+    event_control,
+    event_compat,
+    key_macro,
+    key_display,
     convert,
     negate,
     logical_not,
@@ -405,11 +433,15 @@ pub const Builtin = enum(u8) {
     err,
     erl,
     inkey_string,
+    play,
+    pen,
     point,
     pmap,
     rnd,
     sgn,
     timer,
+    stick,
+    strig,
     command_string,
     date_string,
     environ_string,

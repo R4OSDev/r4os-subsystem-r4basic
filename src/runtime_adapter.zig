@@ -182,20 +182,32 @@ pub const Adapter = struct {
                     self.machine.noteInputControl(stamp);
                     break :blk self.makeDelivery(.control, .none, stamp);
                 }
-                break :blk self.deliveryFromVm(self.machine.acceptKeyCode(key.code, stamp), stamp);
+                break :blk self.deliveryFromVm(self.machine.acceptKeyEvent(key.code, key.modifiers, stamp), stamp);
             },
             .text => |text_event| blk: {
                 if (self.machine.continueStopped()) {
                     self.machine.noteInputControl(stamp);
                     break :blk self.makeDelivery(.control, .none, stamp);
                 }
-                break :blk self.deliveryFromVm(self.machine.acceptTextCodepoint(text_event.codepoint, stamp), stamp);
+                break :blk self.deliveryFromVm(self.machine.acceptTextEvent(text_event.codepoint, text_event.modifiers, stamp), stamp);
             },
             .resize => blk: {
                 self.machine.noteInputControl(stamp);
                 break :blk self.makeDelivery(.control, .none, stamp);
             },
-            .mouse => self.deliveryFromVm(self.machine.noteInputDrop(stamp, .unsupported_event), stamp),
+            .mouse => |mouse| blk: {
+                const point = mouse.guest orelse break :blk self.deliveryFromVm(
+                    self.machine.noteInputDrop(stamp, .unsupported_event),
+                    stamp,
+                );
+                const down = mouse.action == .down or (mouse.action == .move and mouse.buttons != 0);
+                break :blk self.deliveryFromVm(self.machine.acceptPenPointer(
+                    @intCast(point.x),
+                    @intCast(point.y),
+                    down,
+                    stamp,
+                ), stamp);
+            },
         };
         switch (delivery.status) {
             .accepted => self.performance.input_accepted_bytes +%= delivery.accepted_bytes,

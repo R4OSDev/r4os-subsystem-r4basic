@@ -6,7 +6,7 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.70.11
+Stand 0.70.12
 ------------
 
 Diese Ausbaustufe ergaenzt das Vertragsfundament des produktiven R4BASIC-v2-
@@ -45,6 +45,15 @@ Tile-PAINT, die begrenzte DRAW-Makrosprache sowie GET/PUT in jedem Modus,
 jedem numerischen Arraytyp und allen fuenf Aktionsarten. BLOAD/BSAVE arbeitet
 asynchron auf privaten Gastsegmenten und dem modusgerecht gepackten aktiven
 Videosegment; kein Gastzeiger erreicht Host- oder R4OS-Speicher.
+0.70.12 vervollstaendigt Audio, Tastatur und Ereignisse. Ein fester
+instanzlokaler Dispatcher traegt KEY, TIMER, PLAY, COM, PEN, STRIG und UEVENT
+mit gemeinsamer ON/OFF/STOP-, Prioritaets-, Verschachtelungs- und RETURN-
+Semantik. Funktionstastenmakros, benutzerdefinierte Flag-/Scancode-Tasten,
+Softkeyanzeige, Pointer-PEN und virtuelle Joysticks bleiben begrenzt und
+VM-lokal. PLAY umfasst die vollstaendige Makrosprache, Variablenexpansion,
+Hintergrundqueue und Ereignisfences; SOUND und BEEP teilen dieselben
+transportbestaetigten MF-/MB-Regeln. TIMER-Ereignisse und SLEEP verwenden
+monotone Gastfristen, waehrend die TIMER-Funktion getrennt die Wanduhr liest.
 Explorer uebergibt eine absolute BAS-Datei ueber `R4SUBSYS1`; das R4X liest
 sie und relative `$INCLUDE`-Quellen durch die Storage-Fassade jeweils exakt
 einmal, baut daraus einen begrenzten Quellgraphen und fuehrt eine getrennte VM in
@@ -301,7 +310,7 @@ beendet beides. Reset leert Pause und Trace.
 Die SCREEN-Modusabfrage ist als injizierbarer Hostaufruf vorhanden. Ein nicht
 verfuegbarer Modus erzeugt BASIC-Fehler 5, ohne den bisherigen Bildschirm zu
 ersetzen; der normale ON-ERROR-Fallback von SCREEN 9 auf SCREEN 1 bleibt
-dadurch echt. BEEP und PLAY sind dagegen echte Bytecodeoperationen. Eine
+dadurch echt. BEEP, SOUND und PLAY sind dagegen echte Bytecodeoperationen. Eine
 ungueltige MML-Sequenz erzeugt BASIC-Fehler 5, ohne Warteschlange oder
 persistente Musikparameter teilweise zu veraendern.
 
@@ -361,14 +370,23 @@ eingebettete Quotes; derselbe INPUT-#-Decoder liest diese Ausgabe wieder ein.
 
 Pro VM existiert ein fokussierter Tastaturpuffer fuer hoechstens 4.096 Byte.
 R4BASIC konfiguriert den gastneutralen Subsystemhost explizit fuer genau ein
-Text-Ereignis je druckbarer Taste, einzelne Key-Ereignisse fuer Steuerzeichen
-und atomare Nullbyte-/Scancodepaare fuer unterstuetzte erweiterte Tasten,
-weiterhin ohne Mausabbildung. Jedes gelieferte Ereignis behaelt seine
+Text-Ereignis je druckbarer Taste, einzelne Key-Ereignisse fuer Steuerzeichen,
+atomare Nullbyte-/Scancodepaare fuer unterstuetzte erweiterte Tasten und
+gemappte Pointerkoordinaten ohne Tastaturbyte. Jedes gelieferte Ereignis behaelt seine
 Raw-Sequenz und seinen Tick bis zur VM; angenommene Bytes tragen beides bis
 zur Entnahme. Unfokussiert, ungueltiger Codepoint, nicht unterstuetzter Key
 oder Event, volle Queue und Speichermangel bleiben getrennte Dropgruende.
 INKEY$ entnimmt ein komplettes Ein- oder Zweibyte-Ereignis und kehrt bei
 leerem Puffer sofort mit einer leeren Zeichenkette zurueck.
+
+KEY(1 bis 25, 30 und 31) faengt F1 bis F12, Richtungstasten oder elf private
+Flag-/Scancode-Kombinationen. Gefangene Tasten gelangen nicht zusaetzlich in
+INKEY$; STOP merkt eine Ausloesung, OFF verwirft sie. KEY n,string speichert
+fuer Funktionstasten hoechstens 15 Byte und reiht das ganze Makro atomar oder
+gar nicht ein. KEY ON zeigt die ersten sechs Zeichen aller zwoelf Softkeys in
+der physischen Schlusszeile, KEY OFF leert nur diese Anzeige und KEY LIST gibt
+die vollstaendigen Werte aus. Fokus, Wiederholung und Queueueberlauf bleiben
+deterministisch.
 
 INPUT$ liest von Konsole oder sequentieller Datei exakt die verlangte Anzahl
 Bytes, behaelt Teilfortschritt und gibt waehrend des Wartens kooperativ an den
@@ -546,9 +564,10 @@ Anfrage ab und schliessen ihre Bindung, bevor der VM-Puffer freigegeben wird.
 Fehlende oder bereits vorhandene Dateien, falsche Modi, doppelte Slots,
 FIELD-Zustand und -Ueberlauf, ungueltige Recordlaenge oder -nummer, Disk Full,
 zu viele Dateien, Sperrkonflikte, EOF-Ueberlauf sowie Namens-, Pfad- und
-Zugriffsfehler behalten getrennte, fangbare QBasic-Fehlernummern. Drucker,
-COM-Ports, Loeschen und Verzeichnisveraenderungen sind nicht Bestandteil
-dieses Stands.
+Zugriffsfehler behalten getrennte, fangbare QBasic-Fehlernummern. Loeschen
+und Verzeichnisveraenderungen sind implementiert; Drucker- und serielle
+Datenkanaele folgen in 0.70.13. COM(1/2)-Ereignisse besitzen bereits den
+getrennten VM-lokalen Signaleingang, aber noch keinen seriellen Bytekanal.
 Die Dateinummern 0 bis 255 werden ueber einen festen 256-Byte-Index in O(1)
 aufgeloest; nur wirklich offene Dateien besitzen einen dynamischen Slot samt
 Puffer. Dadurch entfallen 256 eingebettete optionale Dateizustaende pro VM.
@@ -557,13 +576,22 @@ Audio und Music Macro Language
 ------------------------------
 
 Jede VM besitzt eigene Musikparameter, Ereignisse, Oszillatorphase und
-kumulative Quellframe-Fences. PLAY versteht O0 bis O6, Oktavwechsel, L1 bis L64, T32 bis T255,
-MB/MF, MN/ML/MS, Noten A bis G mit Vorzeichen und optionaler Laenge sowie
-Pausen, Punkte und N0 bis N84. MB laesst BASIC nach dem Einreihen sofort
-weiterlaufen; ein unmittelbar folgendes END laesst den Hosttransport aber bis
-zur Aufloesung der geplanten Frames auslaufen. MF und der 800-Hz-/200-ms-BEEP
-warten ereignisgesteuert auf angenommene, als Stille unterdrueckte oder
-explizit verworfene Quellframes. Gastzeit allein beendet diesen Wait nicht.
+kumulative Quellframe-Fences. PLAY versteht O0 bis O6, Oktavwechsel, L1 bis
+L64, T32 bis T255, MB/MF, MN/ML/MS, Noten A bis G mit Vorzeichen und optionaler
+Laenge, Pausen, Punkte und N0 bis N84. `=name;` setzt einen Zahlenparameter aus
+einer numerischen Variable ein, `Xname$;` expandiert eine Stringvariable
+rekursiv innerhalb fester Tiefen- und Bytegrenzen. Fehlerhafte Makros aendern
+weder Queue noch persistente Parameter teilweise.
+
+MB laesst BASIC nach dem Einreihen sofort weiterlaufen; ein unmittelbar
+folgendes END laesst den Hosttransport aber bis zur Aufloesung der geplanten
+Frames auslaufen. Hoechstens 32 nicht aufgeloeste Hintergrundnoten sind
+zulaessig. PLAY(n) liefert ihre Zahl und ON PLAY(n) wird genau beim
+transportbestaetigten Uebergang unter die Grenze aktiv. MF, SOUND und der
+800-Hz-/200-ms-BEEP warten ereignisgesteuert auf angenommene, als Stille
+unterdrueckte oder explizit verworfene Quellframes. SOUND akzeptiert 37 bis
+32.767 Hz und 0 bis 65.535 Ticks zu 18,2 Hz; Dauer 0 schaltet laufende
+SOUND-Toene stumm. Gastzeit allein beendet keinen Audio-Wait.
 
 Der Generator liefert erkennbares, absichtlich einfaches 24-kHz-Stereo-PCM
 in S16LE. Ein Servicepaket enthaelt 960 Frames beziehungsweise 40 ms; HDA
@@ -591,6 +619,39 @@ Degradation, loest offene BASIC-Fences durch expliziten Discard auf und laesst
 Gastzeit, Eingabe und Grafik weiterlaufen. Ende und Close verwenden denselben
 idempotenten Abbau.
 
+Ereignisdispatcher und virtuelle Geraete
+-----------------------------------------
+
+Jede VM besitzt 41 feste Quellslots fuer KEY, TIMER, PLAY, COM, PEN, STRIG und
+UEVENT. ON event GOSUB bindet ausschliesslich Modulziele. Wiederholte
+Aktivitaet wird je Quelle einmal gemerkt. Die stabile Prioritaet lautet
+UEVENT, COM, KEY, PEN, STRIG, PLAY, TIMER; gleichartige Quellen behalten ihre
+Ankunftsfolge. Geprueft wird nur vor einem neuen BASIC-Statement oder beim
+Fortsetzen eines kooperativen Waits, nie mitten in einer Teilmutation.
+
+ON erlaubt die Auslieferung, OFF deaktiviert und verwirft, STOP hemmt und
+merkt eine Ausloesung. Beim Eintritt wird die Quelle implizit gestoppt;
+RETURN aktiviert sie wieder, sofern der Handler nicht ausdruecklich OFF
+ausgefuehrt hat. Andere Quellen duerfen an der naechsten sicheren Grenze
+verschachteln, dieselbe aktive Quelle nicht rekursiv. Ereignis-Rueckspruenge
+verwenden denselben auf 1.024 Eintraege begrenzten GOSUB-Stapel.
+
+ON TIMER(n) akzeptiert 1 bis 86.400 Sekunden und plant nur die naechste
+monotone, pausenbereinigte Gastfrist. Verpasste Perioden koaleszieren; es gibt
+keine periodische Pollschleife. Die TIMER-Funktion bleibt davon getrennt und
+liefert Wanduhrsekunden modulo Tag mit monotonem Subsekundenanteil. SLEEP
+wartet ebenfalls auf genau eine Gastfrist beziehungsweise neue Eingabe.
+
+PEN bildet den fokussierten R4OS-Pointer in zehn private Poll-, Press-,
+Button-, Pixel- und Zeichenwerte ab; bei PEN OFF meldet die Funktion Fehler 5.
+STICK(0) tastet vier Achsen zweier optionaler virtueller Joysticks ab,
+STICK(1 bis 3) liest den Snapshot, und fehlende Achsen bleiben neutral bei
+100. Gerade STRIG-Selektoren lesen und loeschen einen Press-Latch, ungerade
+lesen den aktuellen Buttonzustand. Ein STRIG-Ereignis zerstoert seinen Latch
+vor dem Handler. UEVENT und COM(1/2) bieten begrenzte instanzlokale
+Signaleingaenge fuer optionale R4OS-Produzenten; fehlen diese, bleiben die
+Quellen neutral statt zu pollen oder Hostzeiger offenzulegen.
+
 Produktiver Fensterhost
 -----------------------
 
@@ -617,7 +678,8 @@ Grafik auf `r4os.subsystem_host` und PCM auf dessen Audiopumpe ab. Pro
 Hostzyklus wird hoechstens eine gepacte BASIC-Scheibe ausgefuehrt. Fenster-
 und Close-Ereignisse werden davor verarbeitet; veraenderte Bilder werden auf
 hoechstens etwa 30 Praesentationen pro Gastsekunde begrenzt. Reset leert
-Stapel, Text, Grafik, Audio, Eingabe, Wartezustand, Zufall und offene Dateien;
+Stapel, Text, Grafik, Audio, Eingabe, Dispatcher, Softkeys, virtuelle Geraete,
+Wartezustand, Zufall und offene Dateien;
 Fehler, normales Ende und Fenster-Close verwenden denselben idempotenten
 Ressourcenabbau.
 
@@ -721,6 +783,13 @@ alle numerischen Arraytypen und ein Element jenseits 64 KiB. Die
 Memory-Image-Vektoren erzwingen Ein-Byte-Teiltransfers, alle drei gueltigen
 Trailerformen, atomare Ablehnung defekter Bilder, private Segmentisolation und
 den gepackten Videoroundtrip.
+Die 0.70.12-Vektoren pruefen alle sieben Dispatcherquellen und ihre Prioritaet,
+verschachteltes RETURN, OFF/STOP/Koaleszierung, monotone TIMER-Wakes,
+exakte erweiterte Tasten, Modifikatorkombinationen, Makros, Softkeyanzeige,
+LIST und atomaren Queueueberlauf. Hinzu kommen vollstaendige MML- und
+Variablenexpansion, 32-Noten- und PLAY-Fences, SOUND-Ticks und -Grenzen,
+degradierter Audiotransport, PEN-Pointermapping, neutraler STICK,
+zerstoerende STRIG-Latches, COM/UEVENT sowie Reset- und Zwei-VM-Trennung.
 Der Grafikhosttest behaelt pixelidentische Integer- und Fractionalbilder,
 Indexed8-ABI- und XRGB-Fallbackpfad, bounded 128x128-Tiles, getrennte sparse
 Damage-Regionen, Unterdrueckung unveraenderter Frames, mindestens 20 Bilder

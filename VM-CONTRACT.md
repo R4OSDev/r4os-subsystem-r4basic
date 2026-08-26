@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 execution foundation
 
-Contract version: `2.7.0`
+Contract version: `2.8.0`
 
 This document freezes the executable R4BASIC foundation and its non-regression
 invariants while the complete v2 target in `COMPATIBILITY.md` and
@@ -240,7 +240,11 @@ The VM executes:
   with every reference action;
 - asynchronous `BLOAD` and `BSAVE` over private guest segments and the
   active packed video segment;
-- `BEEP` and `PLAY` with the bounded Music Macro Language described below;
+- `BEEP`, `SOUND`, and `PLAY` with the bounded Music Macro Language described
+  below;
+- `ON ... GOSUB` and `ON`/`OFF`/`STOP` for `KEY`, `TIMER`, `PLAY`, `COM`,
+  `PEN`, `STRIG`, and `UEVENT`, plus soft-key `KEY`/`KEY LIST` and the ignored
+  BASICA `STRIG ON`/`OFF` compatibility forms;
 - `RANDOMIZE`, `SLEEP`, and sequential `OPEN`/`CLOSE`;
 - `END`.
 
@@ -284,11 +288,11 @@ partially changing the queue or persistent music settings.
 The executable built-ins include `ABS`, `ASC`, `ATN`, `CDBL`, `CHR$`,
 `CINT`, `CLNG`, `COS`, `CSNG`, `CSRLIN`, all IEEE/MBF `CV*` and `MK*`
 conversions, `EOF`, `ERR`, `ERL`, `EXP`, `FIX`, `HEX$`, `INKEY$`, `INPUT$`,
-`INSTR`, `INT`, `LCASE$`, `LEFT$`, `LEN`, `LOG`, `LTRIM$`, `MID$`, `OCT$`,
-coordinate `POINT`, `POS`, `RIGHT$`, `RND`, `RTRIM$`, text-query `SCREEN`,
-`SGN`, `SIN`, `SPACE$`, `SQR`, `STR$`, `STRING$`, `TAN`, `TIMER`, `UCASE$`,
-and `VAL` with the arities and type categories defined by the source
-contract.
+`INSTR`, `INT`, `LCASE$`, `LEFT$`, `LEN`, `LOG`, `LTRIM$`, `MID$`,
+`OCT$`, `PEN`, `PLAY`, coordinate `POINT`, `POS`, `RIGHT$`, `RND`, `RTRIM$`,
+text-query `SCREEN`, `SGN`, `SIN`, `SPACE$`, `SQR`, `STICK`, `STR$`, `STRIG`,
+`STRING$`, `TAN`, `TIMER`, `UCASE$`, and `VAL` with the arities and type
+categories defined by the source contract.
 
 `ERR` returns the exact trapped QuickBASIC number. `ERL` returns the latest numbered line preceding the trapped instruction, or
 zero when no numbered line precedes it. Its identity comes from immutable
@@ -372,9 +376,10 @@ reset, cancellation, or teardown.
   queued byte retains the stable host-input sequence and raw tick until it is
   consumed. Printable text, Enter, and Backspace are accepted only while
   focused.
-- R4BASIC requests text-only printable keys and no pointer mapping from the
-  generic subsystem host. Printable keys therefore enter the guest exactly
-  once; Enter and Backspace retain their key form. Unfocused, invalid
+- R4BASIC requests text-only printable keys plus mapped pointer coordinates
+  from the generic subsystem host. Printable keys therefore enter the guest
+  exactly once; Enter and Backspace retain their key form. Pointer input does
+  not create keyboard bytes and is admitted only while focused. Unfocused, invalid
   codepoint, unsupported key/event, full-queue, and allocation failures are
   distinct bounded drop results. Passive counters preserve raw/logical/
   accepted/consumed counts, queue high water and the last accepted, dropped,
@@ -383,6 +388,14 @@ reset, cancellation, or teardown.
   extended-key pair and returns an allocated empty string immediately when
   the queue is empty. The pair is admitted and removed atomically so queue
   pressure cannot expose a lone prefix or scan byte.
+- `KEY(1..25|30|31)` traps function, cursor, or user-defined keys. A trapped
+  key is destroyed instead of also reaching `INKEY$`; `STOP` remembers one
+  coalesced occurrence and `OFF` discards it. User keys 15 through 25 match
+  their private modifier/scancode pair, treating either SHIFT key equally.
+  `KEY n,string` keeps at most 15 bytes for F1 through F12 and inserts the
+  complete macro atomically or not at all. `KEY ON` writes six bytes per
+  soft key to the physical bottom row, `KEY OFF` clears it without disabling
+  macros, and `KEY LIST` prints every complete value.
 - Console `INPUT` and `LINE INPUT` retry the same instruction without
   blocking the host. Editing echoes printable bytes, erases one byte on
   Backspace, and completes on Enter. A line is limited to 255 bytes. All
@@ -490,14 +503,24 @@ reset, cancellation, or teardown.
 - `PLAY` accepts case-insensitive `O0` through `O6`, `<`, `>`, `L1` through
   `L64`, `T32` through `T255`, `MB`, `MF`, `MN`, `ML`, `MS`, notes `A` through
   `G` with `#`, `+`, or `-`, optional note lengths and dots, `P` pauses, and
-  numeric notes `N0` through `N84`. Octave, default length, tempo, mode, and
-  articulation persist within one VM.
+  numeric notes `N0` through `N84`. `=name;` expands a numeric variable and
+  `Xname$;` recursively expands a string variable within fixed depth and byte
+  limits. Octave, default length, tempo, mode, and articulation persist within
+  one VM; a failed parse commits none of them and no event.
 - `MB` queues a sequence and lets the next BASIC instruction continue. A
   normal fast `END` keeps only the host transport alive until those frames
   have been accepted, suppressed as silence, or explicitly discarded. `MF`
   and the 800 Hz, 200 ms `BEEP` wait on the same cumulative source-frame
   fence. These are event-only waits; elapsed guest time cannot complete them,
   and neither wait spins or blocks host event polling.
+- Background `PLAY` admits at most 32 unresolved notes. `PLAY(n)` returns that
+  count, or zero in foreground mode. `ON PLAY(n)` signals once when accepted,
+  suppressed, or discarded source-frame fences move the count from at least
+  `n` to below `n`; transport acceptance is never reported as hardware play.
+- `SOUND frequency,duration` accepts 37 through 32,767 Hz and 0 through
+  65,535 ticks at 18.2 Hz. A zero duration silences queued SOUND tones, while
+  a positive duration emits deterministic PCM and follows the persistent
+  `MF`/`MB` mode. Invalid arguments change neither queue nor settings.
 - The generator emits deterministic 24,000 Hz, stereo, signed 16-bit little-
   endian square-wave PCM. HDA converts the stream to its 48 kHz hardware
   format. Hardware timbre is deliberately approximate; note, rest,
@@ -530,11 +553,42 @@ reset, cancellation, or teardown.
   cycles/bytes plus accepted, suppressed, discarded, resolved and unresolved
   source frames.
 
+## Event dispatcher and virtual devices
+
+- Every VM owns one fixed 41-slot dispatcher for `KEY`, `TIMER`, `PLAY`,
+  `COM`, `PEN`, `STRIG`, and `UEVENT`. Handler targets are module labels.
+  Sources coalesce repeated activity into one remembered occurrence and use
+  the stable priority UEVENT, COM, KEY, PEN, STRIG, PLAY, TIMER; equal-source
+  occurrences retain arrival order.
+- `ON` permits dispatch, `OFF` disables and forgets activity, and `STOP`
+  inhibits while remembering one occurrence. Dispatch implicitly stops its
+  source. `RETURN` re-enables it unless the handler explicitly executed
+  `OFF`; another source may nest at the next safe statement boundary, but a
+  source cannot recursively dispatch its active handler.
+- Event handling is admitted only before a new BASIC statement or while a
+  cooperative wait resumes. The dispatcher never interrupts an opcode or
+  partially committed statement. Its GOSUB entries share the bounded VM
+  stack and unwind through the ordinary validated `RETURN` path.
+- `ON TIMER(n)` validates 1 through 86,400 seconds and uses a monotonic,
+  pause-adjusted guest deadline. It returns only the next required scheduler
+  wake; overdue periods coalesce and do not create a polling loop. The
+  settable wall-clock `TIMER` function remains a separate value source.
+- `PEN` maps optional focused R4OS pointer input into private last-use,
+  last-press, current-button, pixel, and character-coordinate state. `PEN`
+  values require `PEN ON`; absent input remains deterministic. `STICK(0)`
+  snapshots two optional private joystick axes and `STICK(1..3)` reads that
+  snapshot; an absent axis is neutral at 100. Even `STRIG` selectors read and
+  clear a press latch, odd selectors read current state, and an event destroys
+  its latch before entering the handler.
+- `UEVENT` and `COM(1|2)` expose instance-local signal entry points for a
+  future or optional R4OS producer. No host pointer, serial buffer, or device
+  handle enters the VM; an absent producer is simply inactive.
+
 ## Guest time, pacing, and random state
 
-- `TIMER` is a SINGLE number of guest seconds modulo 86,400. Its source is
-  the monotonic guest clock supplied by `r4os.subsystem_runtime`, not a host
-  wall clock. Paused host time therefore cannot advance it.
+- `TIMER` is a SINGLE number of injected wall seconds modulo 86,400 plus a
+  monotonic subsecond fraction. Wall-date changes affect this query but never
+  move scheduler deadlines, event timers, SLEEP, or pause-adjusted guest time.
 - `SLEEP` records a guest-time deadline and returns `waiting`; it never spins
   inside one slice. No argument or zero waits for a newly arriving key.
   Positive values also wake for a new key. Host input and lifecycle commands
@@ -702,7 +756,8 @@ cursor, error handlers, compatibility byte, text cells and cursor, graphics
 mode, current point, palette, pixels and damage, keyboard
 and pending input, guest time and sleep deadline, random generator, music
 settings, audio events and oscillator state, open files, evaluation stack,
-frames, GOSUB stack, instruction pointer,
+event bindings/pending/activity state, soft-key definitions, PEN and joystick
+state, frames, GOSUB stack, instruction pointer,
 instruction count, status, diagnostic, cancellation flag, and exit code.
 Mutating, cancelling, resetting, completing, or faulting one instance cannot
 change another instance.
@@ -799,6 +854,12 @@ The permanent general fixtures below are part of this contract:
 - `vm_audio.bas`: stateful MML commands, MB continuation, transport-fenced MF
   and BEEP waits, PCM generation, buffering, sink teardown, and degraded
   audio.
+- Inline 0.70.12 vectors cover every dispatcher source and priority, nested
+  RETURN reactivation, OFF/STOP/coalescing, monotonic TIMER wakes, exact
+  extended keys and macros, KEY display/list/overflow, full variable-expanded
+  MML, the 32-note PLAY fence, SOUND tick/range behavior, degraded transport,
+  PEN pointer mapping, neutral STICK, destructive STRIG latches, COM/UEVENT,
+  reset, and two-VM isolation.
 
 `Tests/compiler_test.zig` also fixes negative binding cases, exact runtime
 positions, QBasic error numbers, string overflow, host failure, and

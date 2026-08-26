@@ -4,6 +4,7 @@ pub const sample_rate: u32 = 24_000;
 pub const channels: u16 = 2;
 pub const frame_bytes: usize = channels * @sizeOf(i16);
 pub const maximum_events: usize = 4096;
+pub const maximum_background_notes: u32 = 32;
 pub const beep_frequency_millihz: u32 = 800_000;
 pub const beep_duration_ms: u32 = 200;
 pub const amplitude: i16 = 6000;
@@ -35,6 +36,8 @@ pub const Settings = struct {
 pub const Stats = struct {
     play_statements: u32 = 0,
     beep_statements: u32 = 0,
+    sound_statements: u32 = 0,
+    sound_stops: u32 = 0,
     notes: u32 = 0,
     rests: u32 = 0,
     rendered_frames: u64 = 0,
@@ -60,12 +63,17 @@ pub const PlayResult = struct {
     deadline_ns: u64,
     fence_frames: u64,
     event_count: u32,
+    requires_wait: bool,
 };
+
+const EventKind = enum { music, beep, sound };
 
 const Event = struct {
     phase_step: u32,
     duration_frames: u32,
     tone_frames: u32,
+    kind: EventKind,
+    background: bool,
 };
 
 const ParseResult = struct {
@@ -74,6 +82,8 @@ const ParseResult = struct {
     notes: u32 = 0,
     rests: u32 = 0,
     event_count: u32 = 0,
+    foreground_events: u32 = 0,
+    background_events: u32 = 0,
     phase_table_lookups: u32 = 0,
 };
 
@@ -81,6 +91,8 @@ pub const Engine = struct {
     allocator: std.mem.Allocator,
     settings: Settings = .{},
     events: std.ArrayList(Event) = .empty,
+    music_fences: std.ArrayList(u64) = .empty,
+    music_fence_head: usize = 0,
     event_head: usize = 0,
     event_frame: u32 = 0,
     phase: u32 = 0,
@@ -96,11 +108,14 @@ pub const Engine = struct {
 
     pub fn deinit(self: *Engine) void {
         self.events.deinit(self.allocator);
+        self.music_fences.deinit(self.allocator);
         self.* = undefined;
     }
 
     pub fn reset(self: *Engine) void {
         self.events.clearRetainingCapacity();
+        self.music_fences.clearRetainingCapacity();
+        self.music_fence_head = 0;
         self.settings = .{};
         self.event_head = 0;
         self.event_frame = 0;
@@ -125,15 +140,35 @@ pub const Engine = struct {
     pub fn play(self: *Engine, command: []const u8, guest_now_ns: u64) Error!PlayResult {
         self.setGuestTime(guest_now_ns);
         self.compactEvents();
+        self.compactMusicFences();
         const event_start = self.events.items.len;
+        const fence_start = self.music_fences.items.len;
         const queue_was_empty = event_start == 0;
         const capacity_before = self.events.capacity;
         const reserve = @min(command.len, maximum_events - event_start);
         try self.events.ensureUnusedCapacity(self.allocator, reserve);
+        try self.music_fences.ensureUnusedCapacity(self.allocator, reserve);
         if (self.events.capacity != capacity_before) self.stats.play_capacity_grows +%= 1;
         self.stats.play_reserved_events +%= reserve;
-        errdefer self.events.items.len = event_start;
+        errdefer {
+            self.events.items.len = event_start;
+            self.music_fences.items.len = fence_start;
+        }
         const sequence = try parseSequenceInto(&self.events, self.settings, command);
+        if (sequence.background_events > maximum_background_notes -| self.backgroundQueueNotes()) {
+            return error.InvalidCommand;
+        }
+
+        var cumulative_frames = self.scheduled_frames;
+        var foreground_fence = self.resolved_frames;
+        for (self.events.items[event_start..]) |event| {
+            cumulative_frames +|= event.duration_frames;
+            if (event.background) {
+                self.music_fences.appendAssumeCapacity(cumulative_frames);
+            } else {
+                foreground_fence = cumulative_frames;
+            }
+        }
 
         const start_ns = @max(guest_now_ns, self.timeline_end_ns);
         if (queue_was_empty and sequence.event_count != 0) self.render_cursor_ns = start_ns;
@@ -146,12 +181,13 @@ pub const Engine = struct {
         self.stats.scheduled_frames +%= sequence.total_frames;
         self.stats.direct_play_events +%= sequence.event_count;
         self.stats.phase_table_lookups +%= sequence.phase_table_lookups;
-        if (sequence.settings.mode == .background) self.stats.background_statements +%= 1;
+        if (sequence.background_events != 0) self.stats.background_statements +%= 1;
         return .{
             .mode = sequence.settings.mode,
             .deadline_ns = self.timeline_end_ns,
-            .fence_frames = self.scheduled_frames,
+            .fence_frames = if (sequence.foreground_events == 0) self.scheduled_frames else foreground_fence,
             .event_count = sequence.event_count,
+            .requires_wait = sequence.foreground_events != 0,
         };
     }
 
@@ -165,6 +201,8 @@ pub const Engine = struct {
             .phase_step = phaseStepFromMillihertz(beep_frequency_millihz),
             .duration_frames = frames,
             .tone_frames = frames,
+            .kind = .beep,
+            .background = false,
         });
         const start_ns = @max(guest_now_ns, self.timeline_end_ns);
         if (queue_was_empty) self.render_cursor_ns = start_ns;
@@ -178,6 +216,54 @@ pub const Engine = struct {
             .deadline_ns = self.timeline_end_ns,
             .fence_frames = self.scheduled_frames,
             .event_count = 1,
+            .requires_wait = true,
+        };
+    }
+
+    pub fn sound(self: *Engine, frequency_hz: u16, duration_ticks: u16, guest_now_ns: u64) Error!PlayResult {
+        self.setGuestTime(guest_now_ns);
+        self.compactEvents();
+        self.stats.sound_statements +%= 1;
+        if (duration_ticks == 0) {
+            var muted = false;
+            for (self.events.items[self.event_head..], 0..) |*event, offset| {
+                if (event.kind != .sound) continue;
+                event.tone_frames = if (offset == 0) @min(event.tone_frames, self.event_frame) else 0;
+                event.phase_step = 0;
+                muted = true;
+            }
+            if (muted) self.stats.sound_stops +%= 1;
+            return .{
+                .mode = self.settings.mode,
+                .deadline_ns = guest_now_ns,
+                .fence_frames = self.resolved_frames,
+                .event_count = 0,
+                .requires_wait = false,
+            };
+        }
+        if (self.events.items.len >= maximum_events) return error.InvalidCommand;
+        const queue_was_empty = self.events.items.len == 0;
+        const numerator = @as(u64, sample_rate) * @as(u64, duration_ticks) * 10;
+        const frames: u32 = @intCast(@max(@as(u64, 1), (numerator + 181) / 182));
+        try self.events.append(self.allocator, .{
+            .phase_step = phaseStepFromMillihertz(@as(u32, frequency_hz) * 1000),
+            .duration_frames = frames,
+            .tone_frames = frames,
+            .kind = .sound,
+            .background = self.settings.mode == .background,
+        });
+        const start_ns = @max(guest_now_ns, self.timeline_end_ns);
+        if (queue_was_empty) self.render_cursor_ns = start_ns;
+        self.timeline_end_ns = start_ns +| framesToNanoseconds(frames);
+        self.scheduled_frames +|= frames;
+        self.stats.notes +%= 1;
+        self.stats.scheduled_frames +%= frames;
+        return .{
+            .mode = self.settings.mode,
+            .deadline_ns = self.timeline_end_ns,
+            .fence_frames = self.scheduled_frames,
+            .event_count = 1,
+            .requires_wait = self.settings.mode == .foreground,
         };
     }
 
@@ -217,6 +303,14 @@ pub const Engine = struct {
         var result: u64 = self.events.items[self.event_head].duration_frames - self.event_frame;
         for (self.events.items[self.event_head + 1 ..]) |event| result +|= event.duration_frames;
         return result;
+    }
+
+    pub fn backgroundQueueNotes(self: *const Engine) u32 {
+        return @intCast(self.music_fences.items.len - self.music_fence_head);
+    }
+
+    pub fn playFunctionValue(self: *const Engine) u32 {
+        return if (self.settings.mode == .background) self.backgroundQueueNotes() else 0;
     }
 
     pub fn unresolvedFrames(self: *const Engine) u64 {
@@ -264,6 +358,11 @@ pub const Engine = struct {
         counter.* +%= resolved;
         self.resolved_frames +|= resolved;
         self.stats.resolved_frames = self.resolved_frames;
+        while (self.music_fence_head < self.music_fences.items.len and
+            self.music_fences.items[self.music_fence_head] <= self.resolved_frames)
+        {
+            self.music_fence_head += 1;
+        }
     }
 
     fn compactEvents(self: *Engine) void {
@@ -283,6 +382,19 @@ pub const Engine = struct {
         self.event_head = 0;
         self.event_frame = 0;
         self.phase = 0;
+    }
+
+    fn compactMusicFences(self: *Engine) void {
+        if (self.music_fence_head == 0) return;
+        if (self.music_fence_head >= self.music_fences.items.len) {
+            self.music_fences.clearRetainingCapacity();
+            self.music_fence_head = 0;
+            return;
+        }
+        const remaining = self.music_fences.items.len - self.music_fence_head;
+        std.mem.copyForwards(u64, self.music_fences.items[0..remaining], self.music_fences.items[self.music_fence_head..]);
+        self.music_fences.items.len = remaining;
+        self.music_fence_head = 0;
     }
 };
 
@@ -392,9 +504,16 @@ fn appendEvent(
         .phase_step = if (rest) 0 else phaseStep(note),
         .duration_frames = duration,
         .tone_frames = tone_frames,
+        .kind = .music,
+        .background = sequence.settings.mode == .background,
     });
     sequence.total_frames +|= duration;
     sequence.event_count +%= 1;
+    if (sequence.settings.mode == .background) {
+        sequence.background_events +%= 1;
+    } else {
+        sequence.foreground_events +%= 1;
+    }
     if (rest) {
         sequence.rests +%= 1;
     } else {

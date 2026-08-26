@@ -894,7 +894,14 @@ const Builder = struct {
             .shell => self.parseShell(),
             .system => self.parseSimpleOp(.system_exit),
             .beep => self.parseAudioBeep(),
-            .play => self.parseAudioPlay(),
+            .sound => self.parseAudioSound(),
+            .play => if (eventActionForKeyword(self.peek(1).keyword) != null) self.parseEventControl(.play, false) else self.parseAudioPlay(),
+            .timer => self.parseEventControl(.timer, false),
+            .com => self.parseEventControl(.com, true),
+            .key => self.parseKeyStatement(),
+            .pen => self.parseEventControl(.pen, false),
+            .strig => self.parseStrigStatement(),
+            .uevent => self.parseEventControl(.uevent, false),
             .return_ => self.parseReturn(),
             .exit => self.parseExit(),
             .end => self.parseEnd(),
@@ -1320,6 +1327,14 @@ const Builder = struct {
         try self.label_fixups.append(self.allocator, .{
             .name = name,
             .procedure = self.currentScope(),
+            .instruction = instruction,
+        });
+    }
+
+    fn addModuleLabelFixup(self: *Builder, name: frontend.Span, instruction: u32) !void {
+        try self.label_fixups.append(self.allocator, .{
+            .name = name,
+            .procedure = bytecode.invalid_index,
             .instruction = instruction,
         });
     }
@@ -2181,6 +2196,7 @@ const Builder = struct {
     fn parseOn(self: *Builder) !bool {
         const statement = self.advance();
         if (self.consumeKeyword(.error_)) return self.parseOnErrorSuffix(statement);
+        if (eventKindForKeyword(self.current().keyword)) |kind| return self.parseOnEventSuffix(statement, kind);
 
         const selector_type = (try self.parseExpression()) orelse return false;
         if (!selector_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
@@ -2210,6 +2226,30 @@ const Builder = struct {
             if (!self.consume(.comma)) break;
         }
         _ = try self.emit(op, first_target, @intCast(count), statement.span);
+        return true;
+    }
+
+    fn parseOnEventSuffix(self: *Builder, statement: frontend.Token, kind: bytecode.EventKind) !bool {
+        _ = self.advance();
+        switch (kind) {
+            .key, .timer, .play, .com, .strig => {
+                if (!try self.expect(.left_paren)) return false;
+                const value_type = (try self.parseExpression()) orelse return false;
+                if (!value_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+                if (!try self.expect(.right_paren)) return false;
+            },
+            .pen, .uevent => {},
+        }
+        if (!try self.expectKeyword(.gosub)) return false;
+        const target = (try self.expectLabelTarget()) orelse return false;
+        const disabled = target.kind == .number and std.mem.eql(u8, self.tokenText(target), "0");
+        const instruction = try self.emit(
+            .event_bind,
+            bytecode.invalid_index,
+            @intFromEnum(kind),
+            statement.span,
+        );
+        if (!disabled) try self.addModuleLabelFixup(target.span, instruction);
         return true;
     }
 
@@ -3108,6 +3148,84 @@ const Builder = struct {
     fn parseAudioBeep(self: *Builder) !bool {
         const statement = self.advance();
         _ = try self.emit(.audio_beep, 0, 0, statement.span);
+        return true;
+    }
+
+    fn parseAudioSound(self: *Builder) !bool {
+        const statement = self.advance();
+        const frequency_type = (try self.parseExpression()) orelse return false;
+        if (!frequency_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        if (!try self.expect(.comma)) return false;
+        const duration_type = (try self.parseExpression()) orelse return false;
+        if (!duration_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        _ = try self.emit(.audio_sound, 0, 0, statement.span);
+        return true;
+    }
+
+    fn parseEventControl(self: *Builder, kind: bytecode.EventKind, has_selector: bool) !bool {
+        const statement = self.advance();
+        if (has_selector) {
+            if (!try self.expect(.left_paren)) return false;
+            const selector_type = (try self.parseExpression()) orelse return false;
+            if (!selector_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            if (!try self.expect(.right_paren)) return false;
+        }
+        const action = eventActionForKeyword(self.current().keyword) orelse return self.fail(.expected_token);
+        _ = self.advance();
+        _ = try self.emit(.event_control, @intFromEnum(kind), @intFromEnum(action), statement.span);
+        return true;
+    }
+
+    fn parseKeyStatement(self: *Builder) !bool {
+        const statement = self.advance();
+        if (self.consume(.left_paren)) {
+            const selector_type = (try self.parseExpression()) orelse return false;
+            if (!selector_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            if (!try self.expect(.right_paren)) return false;
+            const action = eventActionForKeyword(self.current().keyword) orelse return self.fail(.expected_token);
+            _ = self.advance();
+            _ = try self.emit(.event_control, @intFromEnum(bytecode.EventKind.key), @intFromEnum(action), statement.span);
+            return true;
+        }
+        if (self.consumeKeyword(.list)) {
+            _ = try self.emit(.key_display, @intFromEnum(bytecode.KeyDisplayAction.list), 0, statement.span);
+            return true;
+        }
+        if (eventActionForKeyword(self.current().keyword)) |action| {
+            if (action == .stop) return self.fail(.unexpected_token);
+            _ = self.advance();
+            _ = try self.emit(
+                .key_display,
+                @intFromEnum(if (action == .on) bytecode.KeyDisplayAction.on else bytecode.KeyDisplayAction.off),
+                0,
+                statement.span,
+            );
+            return true;
+        }
+        const key_type = (try self.parseExpression()) orelse return false;
+        if (!key_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+        if (!try self.expect(.comma)) return false;
+        const value_type = (try self.parseExpression()) orelse return false;
+        if (value_type != .string) try self.addDiagnostic(.type_mismatch, statement.span);
+        _ = try self.emit(.key_macro, 0, 0, statement.span);
+        return true;
+    }
+
+    fn parseStrigStatement(self: *Builder) !bool {
+        const statement = self.advance();
+        if (self.consume(.left_paren)) {
+            const selector_type = (try self.parseExpression()) orelse return false;
+            if (!selector_type.isNumeric()) try self.addDiagnostic(.type_mismatch, statement.span);
+            if (!try self.expect(.right_paren)) return false;
+            const action = eventActionForKeyword(self.current().keyword) orelse return self.fail(.expected_token);
+            _ = self.advance();
+            _ = try self.emit(.event_control, @intFromEnum(bytecode.EventKind.strig), @intFromEnum(action), statement.span);
+            return true;
+        }
+        const action = eventActionForKeyword(self.current().keyword) orelse return self.fail(.expected_token);
+        if (action == .stop) return self.fail(.unexpected_token);
+        _ = self.advance();
+        _ = try self.emit(.event_compat, @intFromEnum(bytecode.EventKind.strig), @intFromEnum(action), statement.span);
         return true;
     }
 
@@ -4222,7 +4340,25 @@ const Builder = struct {
             => .string,
             .inkey_string => .string,
             .command_string, .date_string, .environ_string, .time_string => .string,
-            .asc, .cint, .cvi, .csrlin, .err, .instr, .len, .eof, .fileattr, .freefile, .peek, .pos, .screen, .sgn => .integer,
+            .asc,
+            .cint,
+            .cvi,
+            .csrlin,
+            .err,
+            .instr,
+            .len,
+            .eof,
+            .fileattr,
+            .freefile,
+            .peek,
+            .pos,
+            .screen,
+            .sgn,
+            .play,
+            .pen,
+            .stick,
+            .strig,
+            => .integer,
             .erl, .loc, .lof, .seek => .long,
             .fix, .int => arguments[0],
             .val => .double,
@@ -4239,6 +4375,10 @@ const Builder = struct {
             .hex_string,
             .oct_string,
             .peek,
+            .play,
+            .pen,
+            .stick,
+            .strig,
             .eof,
             .loc,
             .lof,
@@ -5326,6 +5466,28 @@ fn typesCompatible(target: bytecode.ValueType, source: bytecode.ValueType) bool 
     return (target == .string) == (source == .string);
 }
 
+fn eventKindForKeyword(keyword: frontend.Keyword) ?bytecode.EventKind {
+    return switch (keyword) {
+        .key => .key,
+        .timer => .timer,
+        .play => .play,
+        .com => .com,
+        .pen => .pen,
+        .strig => .strig,
+        .uevent => .uevent,
+        else => null,
+    };
+}
+
+fn eventActionForKeyword(keyword: frontend.Keyword) ?bytecode.EventAction {
+    return switch (keyword) {
+        .on => .on,
+        .off => .off,
+        .stop => .stop,
+        else => null,
+    };
+}
+
 fn builtinForKeyword(keyword: frontend.Keyword) ?bytecode.Builtin {
     return switch (keyword) {
         .abs => .abs,
@@ -5382,11 +5544,15 @@ fn builtinForKeyword(keyword: frontend.Keyword) ?bytecode.Builtin {
         .err => .err,
         .erl => .erl,
         .inkey_string => .inkey_string,
+        .play => .play,
+        .pen => .pen,
         .point => .point,
         .pmap => .pmap,
         .rnd => .rnd,
         .sgn => .sgn,
         .timer => .timer,
+        .stick => .stick,
+        .strig => .strig,
         .command_string => .command_string,
         .date_string => .date_string,
         .environ_string => .environ_string,

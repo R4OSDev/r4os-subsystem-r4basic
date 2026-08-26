@@ -116,7 +116,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         if (trace.baseline) return writeBaselineFailure(&files, trace, "compile-window", error_host_video);
         return error_host_video;
     };
-    window_host.setInputPolicy(.text_only_no_pointer);
+    window_host.setInputPolicy(.{ .key_text_mode = .text_only, .pointer_mode = .mapped });
     _ = window_host.setMinimumSize(320, 200);
     var compile_progress = CompileProgressView.init(
         sys,
@@ -1596,7 +1596,7 @@ fn showStatus(
     const surface = host_api.Surface.initIndexed8(view.pixels, view.palette, view.width, view.height) catch return error_host_video;
     var scratch: [host_api.tile_max_pixels]u32 = undefined;
     var window = host_api.Host.init(desk, draw, surface, scratch[0..]) catch return error_host_video;
-    window.setInputPolicy(.text_only_no_pointer);
+    window.setInputPolicy(.{ .key_text_mode = .text_only, .pointer_mode = .mapped });
     _ = window.setTitle(title);
     _ = window.setMinimumSize(320, 200);
     window.video.invalidateAll();

@@ -213,10 +213,8 @@ test "all known keywords use bounded case-insensitive lexical lookup" {
 
 test "remaining QuickBASIC appendix-E words are reserved" {
     const reference_words = [_][]const u8{
-        "ALIAS",   "ENDIF",  "SETMEM", "SIGNAL",
-        "ERDEV",   "ERDEV$", "CALLS",  "OFF",
-        "CDECL",   "PEN",    "COM",    "UEVENT",
-        "VARPTR$", "LIST",   "LOCAL",
+        "ALIAS",  "ENDIF", "SETMEM", "SIGNAL",  "ERDEV",
+        "ERDEV$", "CALLS", "CDECL",  "VARPTR$", "LOCAL",
     };
     for (reference_words) |word| {
         const result = frontend.tokenizeNamed("appendix-e.bas", word, tokens[0..], diagnostics[0..]);
@@ -224,6 +222,22 @@ test "remaining QuickBASIC appendix-E words are reserved" {
         try std.testing.expectEqual(frontend.TokenKind.keyword, tokens[0].kind);
         try std.testing.expectEqual(frontend.Keyword.unsupported, tokens[0].keyword);
         try std.testing.expectEqualStrings(word, tokens[0].text(word));
+    }
+}
+
+test "event and soft-key appendix-E words are implemented keywords" {
+    const reference_words = [_]struct { text: []const u8, keyword: frontend.Keyword }{
+        .{ .text = "OFF", .keyword = .off },
+        .{ .text = "PEN", .keyword = .pen },
+        .{ .text = "COM", .keyword = .com },
+        .{ .text = "UEVENT", .keyword = .uevent },
+        .{ .text = "LIST", .keyword = .list },
+    };
+    for (reference_words) |entry| {
+        const result = frontend.tokenizeNamed("appendix-e.bas", entry.text, tokens[0..], diagnostics[0..]);
+        try std.testing.expect(result.ok());
+        try std.testing.expectEqual(frontend.TokenKind.keyword, tokens[0].kind);
+        try std.testing.expectEqual(entry.keyword, tokens[0].keyword);
     }
 }
 

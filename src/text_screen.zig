@@ -416,6 +416,31 @@ pub const Screen = struct {
         return @intCast(self.cursor_column + 1);
     }
 
+    pub fn columnCount(self: *const Screen) usize {
+        return self.active_columns;
+    }
+
+    pub fn rowCount(self: *const Screen) usize {
+        return self.active_rows;
+    }
+
+    /// Replaces the visible function-key legend without moving the BASIC
+    /// cursor or changing the configured print viewport.
+    pub fn writeBottomLine(self: *Screen, bytes: []const u8) void {
+        const row = self.active_rows - 1;
+        const first = row * columns;
+        const active_cells = self.activeCells() orelse return;
+        for (active_cells[first .. first + self.active_columns], 0..) |*cell_value, column| {
+            cell_value.* = .{
+                .character = if (column < bytes.len) bytes[column] else ' ',
+                .foreground = self.foreground,
+                .background = self.background,
+            };
+        }
+        self.markDirty(.{ .x = 0, .y = row, .w = self.active_columns, .h = 1 });
+        self.revision +%= 1;
+    }
+
     pub fn screenValue(self: *const Screen, requested_row: i32, requested_column: i32, color: bool) Error!i16 {
         if (requested_row < 1 or requested_row > self.active_rows or requested_column < 1 or requested_column > self.active_columns) {
             return error.IllegalFunctionCall;
