@@ -100,7 +100,7 @@ test "first guest output prepares the display only after BASIC has executed" {
     try std.testing.expectEqual(@as(u64, 1), adapter.performance.display_prepares);
 }
 
-test "console input uses an event-only wake deadline" {
+test "console input schedules a deferred echo frame without another host event" {
     var program = try core.compiler.compile(std.testing.allocator, "event-input.bas", "INPUT A%\nEND\n");
     defer program.deinit();
     try std.testing.expect(program.ok());
@@ -114,9 +114,23 @@ test "console input uses an event-only wake deadline" {
     try std.testing.expectEqual(@as(u64, 0), waiting.wake_guest_ns);
     try std.testing.expect(waiting.frame_ready);
 
+    const initial_view = machine.graphicsView().?;
+    adapter.presented_mode_revision = initial_view.mode_revision;
+    adapter.presented_content_revision = initial_view.content_revision;
+
     try std.testing.expect(try machine.enqueueTextCodepoint('7'));
+    const deferred = adapter.driver().step(core.vm.default_instruction_budget, std.time.ns_per_ms);
+    try std.testing.expectEqual(core.runtime_adapter.api.StepStatus.waiting, deferred.status);
+    try std.testing.expect(!deferred.frame_ready);
+    try std.testing.expectEqual(core.runtime_adapter.frame_interval_ns, deferred.wake_guest_ns);
+
+    const visible = adapter.driver().step(core.vm.default_instruction_budget, deferred.wake_guest_ns);
+    try std.testing.expectEqual(core.runtime_adapter.api.StepStatus.waiting, visible.status);
+    try std.testing.expect(visible.frame_ready);
+    try std.testing.expectEqual(@as(u64, 1), adapter.performance.cadence_deferred_steps);
+
     try std.testing.expect(try machine.enqueueKeyCode(13));
-    const completed = adapter.driver().step(core.vm.default_instruction_budget, 0);
+    const completed = adapter.driver().step(core.vm.default_instruction_budget, deferred.wake_guest_ns);
     try std.testing.expectEqual(core.runtime_adapter.api.StepStatus.completed, completed.status);
 }
 

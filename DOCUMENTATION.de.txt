@@ -6,7 +6,7 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.70.15
+Stand 0.70.16
 ------------
 
 Diese Ausbaustufe ergaenzt das Vertragsfundament des produktiven R4BASIC-v2-
@@ -81,6 +81,12 @@ Headless-GORILLA-Abnahme endet nicht mehr bereits nach dem ersten Gastframe,
 sondern verlangt echten Intro-PCM-Transport und einen erfolgreichen
 Idle-Close zurueck in den Zustand `ready`. `disabled` oder `degraded` ist ein
 expliziter Abnahmefehler.
+0.70.16 korrigiert die sichtbare Konsoleneingabe. Faellt ein von INPUT oder
+LINE INPUT gespiegeltes Zeichen in die laufende 33-ms-Bildkadenz, liefert der
+Adapter deren Grenze nun als eigenen Gast-Wecktermin. Der zurueckgestellte
+Textframe erscheint damit ohne weitere Taste, Mausbewegung oder
+Fensteraktivitaet; die Begrenzung auf etwa 30 Praesentationen pro
+Gastsekunde bleibt erhalten.
 Explorer uebergibt eine absolute BAS-Datei ueber `R4SUBSYS1`; das R4X liest
 sie und relative `$INCLUDE`-Quellen durch die Storage-Fassade jeweils exakt
 einmal, baut daraus einen begrenzten Quellgraphen und fuehrt eine getrennte VM in

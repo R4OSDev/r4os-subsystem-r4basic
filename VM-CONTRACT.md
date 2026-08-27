@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 execution contract
 
-Contract version: `2.10.1`
+Contract version: `2.10.2`
 
 This document freezes the complete executable R4BASIC runtime and its
 non-regression invariants. `COMPATIBILITY.md` defines the language surface;
@@ -763,6 +763,11 @@ an explicit baseline failure.
   of busy-polling. Active execution requests a cooperative scheduler yield no
   more often than once per eight host milliseconds; paused and event-only
   states block on the existing Desktop activity sequence.
+- If a changed frame is deferred by the 33-ms presentation cadence while the
+  VM enters an event-only input wait, the adapter supplies that cadence
+  deadline as the guest wake deadline. The deferred edit is therefore
+  published without requiring another key, pointer, or window event; an
+  existing earlier VM deadline retains precedence.
 - The initial VM owns no pixel allocation. Text output or an explicit SCREEN
   mode prepares the first surface after guest execution; a still-running
   display-silent guest receives a delayed SCREEN 0 fallback, and an immediate

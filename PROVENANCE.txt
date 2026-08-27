@@ -51,6 +51,9 @@ Primaere Sprachreferenz:
 - Vertrag 2.10.1 korrigiert ausschliesslich das Timeout des normalen
   AUDSVC/HDA-Drain-Close und verschaerft die produktive GORILLA-Abnahme; es
   wurde keine weitere Sprachreferenz oder fremde Implementierung ausgewertet.
+- Vertrag 2.10.2 korrigiert ausschliesslich den eigenen Gast-Wecktermin eines
+  durch die Bildkadenz zurueckgestellten Eingabe-Echos; es wurde keine weitere
+  Sprachreferenz oder fremde Implementierung ausgewertet.
 - Daraus uebernommen wurden ausschliesslich Sprachsemantik und Grenzen;
   Parser-, Speicher-, Alias-, Bytecode- und Fehlerflusscode sind eine neue
   eigenstaendige R4OS-Implementierung.

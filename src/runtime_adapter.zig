@@ -14,6 +14,11 @@ pub const slice_clock_max_instructions: u32 = 16_384;
 pub const initial_display_delay_ns: u64 = 33 * @import("std").time.ns_per_ms;
 pub const frame_interval_ns: u64 = 33 * @import("std").time.ns_per_ms;
 
+const FrameReadiness = struct {
+    ready: bool = false,
+    wake_guest_ns: u64 = 0,
+};
+
 pub const PresentFeedback = enum {
     presented,
     unchanged,
@@ -359,17 +364,22 @@ fn step(context: *anyopaque, budget: u32, guest_now_ns: u64) runtime.StepResult 
     if (time_limited) self.performance.time_limited_steps +%= 1 else if (result.status == .yielded and executed == allowed) self.performance.budget_limited_steps +%= 1;
     if (result.status == .waiting) self.performance.waiting_steps +%= 1;
     const terminal = result.status == .halted or result.status == .cancelled or result.status == .runtime_error or result.status == .transition;
-    const frame_ready = frameReady(
+    const frame = frameReadiness(
         self,
         guest_now_ns,
         if (uses_nanoseconds) last_ns else 0,
         result.status == .waiting,
         terminal,
     ) catch return runtime.StepResult.fail(display_error_out_of_memory).withOperations(executed);
+    const frame_ready = frame.ready;
     if (frame_ready) self.performance.frame_ready_steps +%= 1;
+    var wake_guest_ns = result.wake_guest_ns;
+    if (frame.wake_guest_ns != 0 and (wake_guest_ns == 0 or frame.wake_guest_ns < wake_guest_ns)) {
+        wake_guest_ns = frame.wake_guest_ns;
+    }
     return switch (result.status) {
         .ready, .yielded => runtime.StepResult.progress(frame_ready).withOperations(executed),
-        .waiting => runtime.StepResult.waitUntil(result.wake_guest_ns, frame_ready).withOperations(executed),
+        .waiting => runtime.StepResult.waitUntil(wake_guest_ns, frame_ready).withOperations(executed),
         .halted => if (self.machine.unresolvedAudioFrames() != 0)
             runtime.StepResult.waitUntil(0, frame_ready).withOperations(executed)
         else
@@ -414,23 +424,23 @@ fn systemNanoseconds(context: *anyopaque) ?u64 {
     return system.monotonicNanoseconds();
 }
 
-fn frameReady(self: *Adapter, guest_now_ns: u64, host_now_ns: u64, waiting: bool, terminal: bool) vm.InitError!bool {
+fn frameReadiness(self: *Adapter, guest_now_ns: u64, host_now_ns: u64, waiting: bool, terminal: bool) vm.InitError!FrameReadiness {
     if (!self.machine.hasHostDisplay()) {
         var prepared = try self.machine.prepareRequestedHostDisplay();
         if (!prepared and !terminal and (waiting or guest_now_ns >= initial_display_delay_ns)) {
             try self.machine.prepareHostDisplay();
             prepared = true;
         }
-        if (!prepared) return false;
+        if (!prepared) return .{};
         self.performance.display_prepares +%= 1;
     }
-    const view = self.machine.graphicsView() orelse return false;
+    const view = self.machine.graphicsView() orelse return .{};
     const changed = self.presented_mode_revision != view.mode_revision or
         self.presented_content_revision != view.content_revision;
-    if (!changed) return false;
+    if (!changed) return .{};
     if (!terminal and guest_now_ns < self.next_video_guest_ns) {
         self.performance.cadence_deferred_steps +%= 1;
-        return false;
+        return .{ .wake_guest_ns = if (waiting) self.next_video_guest_ns else 0 };
     }
 
     const due_guest_ns = if (self.next_video_guest_ns == 0) guest_now_ns else self.next_video_guest_ns;
@@ -443,7 +453,7 @@ fn frameReady(self: *Adapter, guest_now_ns: u64, host_now_ns: u64, waiting: bool
     else
         host_now_ns -| (guest_now_ns -| due_guest_ns);
     self.next_video_guest_ns = due_guest_ns +| ((backlog + 1) *| frame_interval_ns);
-    return true;
+    return .{ .ready = true };
 }
 
 fn reset(context: *anyopaque) i32 {

@@ -1,7 +1,7 @@
 const std = @import("std");
 const frontend = @import("frontend.zig");
 
-pub const contract_version = "2.10.1";
+pub const contract_version = "2.10.2";
 pub const invalid_index: u32 = std.math.maxInt(u32);
 pub const unknown_dimensions: u8 = std.math.maxInt(u8);
 

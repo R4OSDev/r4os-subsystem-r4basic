@@ -28,7 +28,7 @@ guest time, input, events, or graphics.
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.29`
+- Module version: `1.2.30`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -194,6 +194,12 @@ Volume retain their 25 ms interactive limit, while normal Close has a separate
 500 ms budget for the documented AUDSVC/HDA drain. The headless GORILLA gate
 now waits beyond the first frame for real intro PCM and a successful idle
 Close in `ready`; unavailable or degraded audio fails the baseline.
+
+R4BASIC 1.2.30 corrects deferred console-input presentation. If an echoed
+`INPUT` or `LINE INPUT` character arrives inside the 33 ms video cadence, the
+adapter now schedules that cadence boundary as its own guest wake deadline.
+The edited name becomes visible without another key, pointer, or window event
+while the existing presentation limit remains unchanged.
 
 R4BASIC 1.2.22 uses a shared 262,144-instruction ceiling with adaptive bounded
 clock blocks and an 8-ms production time boundary. Active work requests a

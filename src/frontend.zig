@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const contract_version = "2.10.1";
+pub const contract_version = "2.10.2";
 pub const maximum_source_bytes: usize = 256 * 1024;
 pub const maximum_identifier_bytes: usize = 40;
 pub const maximum_expression_depth: usize = 128;
