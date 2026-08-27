@@ -21,6 +21,7 @@ const audio_quantum_frames: u32 = runtime_api.default_quantum_frames * 2;
 const audio_target_quanta: u16 = 4;
 const audio_queue_frames: usize = @as(usize, audio_quantum_frames) * audio_target_quanta;
 const audio_service_timeout_ns: u64 = 25 * std.time.ns_per_ms;
+const audio_close_timeout_ns: u64 = 500 * std.time.ns_per_ms;
 const canonical_baseline_path = "C:\\TEMP\\GORILLA.BAS";
 const baseline_report_path = "C:\\TEMP\\R4BASIC.BASELINE";
 const gui_report_path = "C:\\TEMP\\R4BASIC.LAST";
@@ -360,7 +361,7 @@ fn runGuestRuntime(
     var audio_sink_storage: runtime_api.R4AudioSink = undefined;
     var sink: ?runtime_api.AudioSink = null;
     if (app.audio()) |app_audio| {
-        audio_sink_storage = runtime_api.R4AudioSink.initWithTimeout(app_audio, audio_service_timeout_ns);
+        audio_sink_storage = runtime_api.R4AudioSink.initWithTimeouts(app_audio, audio_service_timeout_ns, audio_close_timeout_ns);
         sink = audio_sink_storage.sink();
     }
     var audio_queue: [audio.frame_bytes * audio_queue_frames]u8 = undefined;
@@ -1020,6 +1021,29 @@ const RuntimeHost = struct {
         const self: *RuntimeHost = @ptrCast(@alignCast(context));
         self.observeRuntime();
         if (self.snapshot_pending) {
+            if (self.trace.baseline) {
+                const runtime = self.runtime orelse return .{ .failure = error_trace_write };
+                switch (runtime.audio.state) {
+                    .disabled => {
+                        self.snapshot_pending = false;
+                        _ = writeBaselineFailure(self.files, self.trace, "audio-disabled", runtime_api.audio_error_unavailable);
+                        return .{ .failure = runtime_api.audio_error_unavailable };
+                    },
+                    .degraded => {
+                        self.snapshot_pending = false;
+                        _ = writeBaselineFailure(self.files, self.trace, "audio-degraded", runtime.audio.last_error);
+                        return .{ .failure = runtime.audio.last_error };
+                    },
+                    else => {},
+                }
+                if (runtime.audio.state != .ready or
+                    runtime.audio.stats.lazy_opens == 0 or
+                    runtime.audio.stats.writes == 0 or
+                    runtime.audio.stats.idle_closes == 0)
+                {
+                    return .idle;
+                }
+            }
             self.snapshot_pending = false;
             self.snapshot_written = self.writeSnapshot();
             if (!self.snapshot_written and self.trace.baseline) return .{ .failure = error_trace_write };

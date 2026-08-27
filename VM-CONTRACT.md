@@ -1,6 +1,6 @@
 ﻿# R4BASIC v2 execution contract
 
-Contract version: `2.10.0`
+Contract version: `2.10.1`
 
 This document freezes the complete executable R4BASIC runtime and its
 non-regression invariants. `COMPATIBILITY.md` defines the language surface;
@@ -564,8 +564,10 @@ reset, cancellation, or teardown.
   pending video presentation. Successful prefill writes are interleaved over
   fresh cycles. Busy retains the exact caller-owned PCM and uses an independent
   10 ms retry deadline rather than advancing a complete 40 ms quantum.
-  R4BASIC bounds one service call to 25 ms; a transient open timeout, full, or
-  service-start race still gets at most three retries separated by 50 ms.
+  R4BASIC bounds Open, Write, and Volume calls to 25 ms; a transient open
+  timeout, full, or service-start race still gets at most three retries
+  separated by 50 ms. Normal Close has its own 500 ms budget because AUDSVC
+  drains already accepted PCM and HDA permits that drain to take up to 400 ms.
 - If a host delay exceeds the complete catch-up window, queued source PCM is
   explicitly discarded before refill. The discarded frames resolve the same
   transport fence and are counted separately; unrendered note events are not
@@ -580,6 +582,11 @@ reset, cancellation, or teardown.
   count. Passive counters separately expose active, silent, paused and muted
   cycles/bytes plus accepted, suppressed, discarded, resolved and unresolved
   source frames.
+
+The productive headless GORILLA acceptance remains active after the first
+guest frame until the real intro audio has opened a stream, submitted PCM, and
+completed its idle Close back in `ready`. A disabled or degraded audio path is
+an explicit baseline failure.
 
 ## Event dispatcher and virtual devices
 

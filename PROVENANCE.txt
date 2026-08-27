@@ -48,6 +48,9 @@ Primaere Sprachreferenz:
 - Vertrag 2.10 schliesst den Katalog gegen die Implementierung und den
   permanenten allgemeinen Referenzkorpus. Es wurde kein weiterer fremder
   Quell- oder Beispielcode aufgenommen.
+- Vertrag 2.10.1 korrigiert ausschliesslich das Timeout des normalen
+  AUDSVC/HDA-Drain-Close und verschaerft die produktive GORILLA-Abnahme; es
+  wurde keine weitere Sprachreferenz oder fremde Implementierung ausgewertet.
 - Daraus uebernommen wurden ausschliesslich Sprachsemantik und Grenzen;
   Parser-, Speicher-, Alias-, Bytecode- und Fehlerflusscode sind eine neue
   eigenstaendige R4OS-Implementierung.

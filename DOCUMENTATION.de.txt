@@ -6,7 +6,7 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.70.14
+Stand 0.70.15
 ------------
 
 Diese Ausbaustufe ergaenzt das Vertragsfundament des produktiven R4BASIC-v2-
@@ -73,6 +73,14 @@ Metakommandos und 43 Fehlercodes in jeder Schicht den Status implementiert.
 Der allgemeine Positiv-/Negativkorpus, alle aggregierten VM-Familien,
 Gorilla-Vollrunde, Lebenszyklus-/Performanceproben, Full-/Testimages und
 produktive Ein-/Vier-CPU-Starts bilden gemeinsam die Freigabe.
+0.70.15 korrigiert den produktiven Audioabbau nach Ende einer Tonfolge. Open,
+Write und Volume behalten ihr kurzes 25-ms-Budget; das normal drainierende
+Close besitzt nun ein eigenes 500-ms-Budget und deckt damit den
+dokumentierten HDA-Drain von bis zu 400 ms samt Serviceantwort ab. Die
+Headless-GORILLA-Abnahme endet nicht mehr bereits nach dem ersten Gastframe,
+sondern verlangt echten Intro-PCM-Transport und einen erfolgreichen
+Idle-Close zurueck in den Zustand `ready`. `disabled` oder `degraded` ist ein
+expliziter Abnahmefehler.
 Explorer uebergibt eine absolute BAS-Datei ueber `R4SUBSYS1`; das R4X liest
 sie und relative `$INCLUDE`-Quellen durch die Storage-Fassade jeweils exakt
 einmal, baut daraus einen begrenzten Quellgraphen und fuehrt eine getrennte VM in
@@ -628,8 +636,10 @@ Pro Hostzyklus erfolgt nach einer anstehenden Bildpraesentation hoechstens
 ein synchroner Serviceaufruf: Open, ein Vorfuell-/Regelwrite oder ein Close.
 Vorfuellung und Resync werden ueber frische Hostzyklen verteilt. Busy behaelt
 das identische caller-eigene PCM und verwendet eine unabhaengige 10-ms-
-Wiederholungsfrist statt eines ganzen 40-ms-Quantums. R4Basic begrenzt den
-einzelnen Serviceaufruf auf 25 ms; beim Oeffnen bleiben hoechstens drei
+Wiederholungsfrist statt eines ganzen 40-ms-Quantums. R4Basic begrenzt Open,
+Write und Volume auf 25 ms. Das normal drainierende Close besitzt ein eigenes
+500-ms-Budget, da AUDSVC bereits angenommenes PCM ausspielt und der HDA-
+Vertrag dafuer bis zu 400 ms zulaesst. Beim Oeffnen bleiben hoechstens drei
 weitere Versuche im 50-ms-Abstand. Ueberschreitet eine Hostverzoegerung das
 gesamte Catch-up-Fenster, wird nur der bereits gerenderte Quellpuffer explizit
 verworfen und gezaehlt; Gastzeit ueberspringt keine ungerenderten Noten.
@@ -715,7 +725,8 @@ Nanosekundenachse zu. `RuntimeStats` trennt dabei angebotene Budgets von
 wirklich ausgefuehrten Instruktionen sowie Presentversuche von Publikationen
 und Skips. Im GUI-Modus entsteht einmalig `C:\TEMP\R4BASIC.LAST`; die
 Headless-Abnahme schreibt `C:\TEMP\R4BASIC.BASELINE` und beendet nur diese
-Instanz nach dem ersten produktiven Frame. Es gibt keine Ausgabe pro Frame.
+Instanz, nachdem der erste produktive Frame sowie echter GORILLA-Introton mit
+erfolgreichem Idle-Close nachgewiesen wurden. Es gibt keine Ausgabe pro Frame.
 Der Bericht enthaelt zusaetzlich den ersten sichtbaren Compileframe, die Zahl
 der Fortschrittsframes, die strukturellen Compilerzaehler sowie getrennte
 Damage-Regionen, Presenter-Voll-/Deltaframes, Indexed8-Bloecke und -Bytes,

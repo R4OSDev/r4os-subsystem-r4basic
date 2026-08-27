@@ -28,7 +28,7 @@ guest time, input, events, or graphics.
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.28`
+- Module version: `1.2.29`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -188,6 +188,12 @@ and 43 Appendix-B errors to be implemented at every contract layer. The
 general positive/negative corpus, all aggregated VM families, unchanged
 checksum-bound GORILLA full round, lifecycle/performance tests, Full/Test
 images, and one-/four-CPU productive boots form the release acceptance.
+
+R4BASIC 1.2.29 corrects the productive audio teardown. Open, Write, and
+Volume retain their 25 ms interactive limit, while normal Close has a separate
+500 ms budget for the documented AUDSVC/HDA drain. The headless GORILLA gate
+now waits beyond the first frame for real intro PCM and a successful idle
+Close in `ready`; unavailable or degraded audio fails the baseline.
 
 R4BASIC 1.2.22 uses a shared 262,144-instruction ceiling with adaptive bounded
 clock blocks and an 8-ms production time boundary. Active work requests a

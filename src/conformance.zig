@@ -2,7 +2,7 @@
 // This checked-in table is the machine-readable R4BASIC v2 target contract.
 const frontend = @import("frontend.zig");
 
-pub const contract_version = "2.10.0";
+pub const contract_version = "2.10.1";
 pub const part2_count: usize = 193;
 pub const part1_count: usize = 7;
 pub const metacommand_count: usize = 3;
