@@ -28,7 +28,7 @@ guest time, input, events, or graphics.
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.30`
+- Module version: `1.2.31`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
@@ -200,6 +200,16 @@ R4BASIC 1.2.30 corrects deferred console-input presentation. If an echoed
 adapter now schedules that cadence boundary as its own guest wake deadline.
 The edited name becomes visible without another key, pointer, or window event
 while the existing presentation limit remains unchanged.
+
+R4BASIC 1.2.31 makes consumed host input an immediate visibility boundary.
+Once `INPUT` or `LINE INPUT` has echoed a sequence-tagged character, that
+changed frame bypasses the current cadence exactly once and is published in
+the same guest slice. The 33 ms cadence restarts from that interactive frame;
+non-input deferred work keeps the existing wake-deadline fallback. The same
+release raises the bounded Open, Write, and Volume service-call budget to
+50 ms after the productive four-CPU gate showed that a healthy write could
+exceed 25 ms; Close retains its separate 500 ms drain budget. A degraded
+GORILLA baseline now records operation-specific audio counters.
 
 R4BASIC 1.2.22 uses a shared 262,144-instruction ceiling with adaptive bounded
 clock blocks and an 8-ms production time boundary. Active work requests a

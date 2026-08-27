@@ -20,7 +20,9 @@ const title_capacity: usize = 192;
 const audio_quantum_frames: u32 = runtime_api.default_quantum_frames * 2;
 const audio_target_quanta: u16 = 4;
 const audio_queue_frames: usize = @as(usize, audio_quantum_frames) * audio_target_quanta;
-const audio_service_timeout_ns: u64 = 25 * std.time.ns_per_ms;
+// The productive four-CPU gate can legitimately delay an accepted write
+// beyond 25 ms. Keep service work bounded without misclassifying that load.
+const audio_service_timeout_ns: u64 = 50 * std.time.ns_per_ms;
 const audio_close_timeout_ns: u64 = 500 * std.time.ns_per_ms;
 const canonical_baseline_path = "C:\\TEMP\\GORILLA.BAS";
 const baseline_report_path = "C:\\TEMP\\R4BASIC.BASELINE";
@@ -932,6 +934,32 @@ fn writeBaselineFailure(files: *const r4os.Files, trace: LaunchTrace, reason: []
     return if (code == 0) error_trace_write else code;
 }
 
+fn writeBaselineAudioFailure(files: *const r4os.Files, trace: LaunchTrace, pump: *const runtime_api.AudioPump) i32 {
+    var report_storage: [512]u8 = undefined;
+    const stats = pump.stats;
+    const report = std.fmt.bufPrint(report_storage[0..],
+        "R4BASIC baseline: FAILED id={s} reason=audio-degraded code={d}\r\n" ++
+            "R4BASIC audio-failure: state={s} opens={d} open_retries={d} lazy_opens={d} writes={d}/{d} write_failures={d} closes={d} idle_closes={d} service_ops={d}\r\n",
+        .{
+            trace.id,
+            pump.last_error,
+            @tagName(pump.state),
+            stats.open_operations,
+            stats.open_retries,
+            stats.lazy_opens,
+            stats.writes,
+            stats.write_operations,
+            stats.write_failures,
+            stats.close_operations,
+            stats.idle_closes,
+            stats.service_operations,
+        },
+    ) catch return if (pump.last_error == 0) error_trace_write else pump.last_error;
+    var path = r4os.AbsoluteFilePath.parse(baseline_report_path) catch return if (pump.last_error == 0) error_trace_write else pump.last_error;
+    _ = files.write(path.asZ(), report);
+    return if (pump.last_error == 0) error_trace_write else pump.last_error;
+}
+
 const RuntimeHost = struct {
     sys: r4os.r4sys.Context,
     files: *const r4os.Files,
@@ -1031,7 +1059,7 @@ const RuntimeHost = struct {
                     },
                     .degraded => {
                         self.snapshot_pending = false;
-                        _ = writeBaselineFailure(self.files, self.trace, "audio-degraded", runtime.audio.last_error);
+                        _ = writeBaselineAudioFailure(self.files, self.trace, &runtime.audio);
                         return .{ .failure = runtime.audio.last_error };
                     },
                     else => {},

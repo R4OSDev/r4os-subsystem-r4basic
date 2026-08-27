@@ -438,12 +438,20 @@ fn frameReadiness(self: *Adapter, guest_now_ns: u64, host_now_ns: u64, waiting: 
     const changed = self.presented_mode_revision != view.mode_revision or
         self.presented_content_revision != view.content_revision;
     if (!changed) return .{};
-    if (!terminal and guest_now_ns < self.next_video_guest_ns) {
+    const input = self.machine.inputStats();
+    const input_needs_visibility = input.last_consumed_sequence > self.performance.last_visible_input_sequence;
+    if (!terminal and !input_needs_visibility and guest_now_ns < self.next_video_guest_ns) {
         self.performance.cadence_deferred_steps +%= 1;
         return .{ .wake_guest_ns = if (waiting) self.next_video_guest_ns else 0 };
     }
 
-    const due_guest_ns = if (self.next_video_guest_ns == 0) guest_now_ns else self.next_video_guest_ns;
+    // Echoed keyboard input is interactive state, not background animation.
+    // Publish it in the consuming slice and restart the cadence from this
+    // frame so visibility never depends on a later timer or pointer event.
+    const due_guest_ns = if (input_needs_visibility or self.next_video_guest_ns == 0)
+        guest_now_ns
+    else
+        self.next_video_guest_ns;
     const backlog = (guest_now_ns -| due_guest_ns) / frame_interval_ns;
     self.performance.missed_frame_deadlines +%= backlog;
     self.performance.maximum_frame_backlog = @max(self.performance.maximum_frame_backlog, backlog);

@@ -134,6 +134,46 @@ test "console input schedules a deferred echo frame without another host event" 
     try std.testing.expectEqual(core.runtime_adapter.api.StepStatus.completed, completed.status);
 }
 
+test "consumed host input publishes its echo in the same guest slice" {
+    var program = try core.compiler.compile(std.testing.allocator, "visible-input.bas", "INPUT A%\nEND\n");
+    defer program.deinit();
+    try std.testing.expect(program.ok());
+
+    var machine = try core.vm.Vm.init(std.testing.allocator, &program, .{});
+    defer machine.deinit();
+    var adapter = core.runtime_adapter.Adapter.init(&machine);
+
+    const waiting = adapter.driver().step(core.vm.default_instruction_budget, 0);
+    try std.testing.expectEqual(core.runtime_adapter.api.StepStatus.waiting, waiting.status);
+    try std.testing.expect(waiting.frame_ready);
+
+    const initial_view = machine.graphicsView().?;
+    adapter.presented_mode_revision = initial_view.mode_revision;
+    adapter.presented_content_revision = initial_view.content_revision;
+
+    const delivery = adapter.handleInput(.{ .text = .{
+        .codepoint = '7',
+        .modifiers = 0,
+        .tick = 41,
+        .sequence = 9,
+    } });
+    try std.testing.expectEqual(core.runtime_adapter.InputDeliveryStatus.accepted, delivery.status);
+
+    const visible = adapter.driver().step(core.vm.default_instruction_budget, std.time.ns_per_ms);
+    try std.testing.expectEqual(core.runtime_adapter.api.StepStatus.waiting, visible.status);
+    try std.testing.expect(visible.frame_ready);
+    try std.testing.expectEqual(@as(u64, 0), visible.wake_guest_ns);
+    try std.testing.expectEqual(@as(u64, 0), adapter.performance.cadence_deferred_steps);
+    try std.testing.expectEqual(
+        std.time.ns_per_ms + core.runtime_adapter.frame_interval_ns,
+        adapter.next_video_guest_ns,
+    );
+
+    adapter.notePresent(.presented, 50, 60);
+    try std.testing.expectEqual(@as(u64, 9), adapter.performance.last_visible_input_sequence);
+    try std.testing.expectEqual(@as(u64, 41), adapter.performance.last_visible_input_tick);
+}
+
 test "paused runtime retains ordered input and reports ignored drops before resume" {
     var program = try core.compiler.compile(std.testing.allocator, "paused-input.bas", "First$ = INKEY$\nSecond$ = INKEY$\nEND\n");
     defer program.deinit();

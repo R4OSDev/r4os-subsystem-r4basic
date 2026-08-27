@@ -6,7 +6,7 @@ Modul bleibt ein normales GUI-R4X; `MODULE_ROLE=subsystem` beschreibt seine
 Aufgabe, `SUBSYSTEM_ID=r4os.basic` seine stabile logische Adresse und
 `GUEST_FORMAT=basic.qbasic-source` das angebotene Gastformat.
 
-Stand 0.70.16
+Stand 0.70.17
 ------------
 
 Diese Ausbaustufe ergaenzt das Vertragsfundament des produktiven R4BASIC-v2-
@@ -87,6 +87,21 @@ Adapter deren Grenze nun als eigenen Gast-Wecktermin. Der zurueckgestellte
 Textframe erscheint damit ohne weitere Taste, Mausbewegung oder
 Fensteraktivitaet; die Begrenzung auf etwa 30 Praesentationen pro
 Gastsekunde bleibt erhalten.
+0.70.17 zieht die produktive Sichtbarkeitsgrenze enger: Sobald INPUT oder
+LINE INPUT ein sequenzmarkiertes Hostzeichen tatsaechlich verbraucht und in
+den Textbildschirm gespiegelt hat, darf dieser Frame nicht mehr hinter der
+Bildkadenz warten. Er wird noch in derselben Gastscheibe publiziert; danach
+beginnt die 33-ms-Kadenz neu. Die allgemeine Deadline bleibt fuer
+nichtinteraktive, zurueckgestellte Frames erhalten. Die produktive Full-QEMU-
+Pixelprobe bestaetigt zwei aufeinanderfolgende Zeichen nach jeweils drei
+Sekunden ohne Mausbewegung direkt im BASIC-Client.
+Der abschliessende Vier-CPU-Produktivtest deckte daneben eine zweite
+Zeitgrenze auf: Nach 24 erfolgreichen Writes konnte ein weiterer gesunder
+AUDSVC-Write das bisherige 25-ms-Budget ueberschreiten. Open, Write und Volume
+verwenden deshalb nun ein weiterhin begrenztes 50-ms-Budget; das getrennte
+500-ms-Closebudget bleibt unveraendert. Bei einer Audio-Degradation schreibt
+die produktive GORILLA-Abnahme zusaetzlich Zustand und Operationszaehler, so
+dass Open-, Write- und Closefehler eindeutig voneinander trennbar sind.
 Explorer uebergibt eine absolute BAS-Datei ueber `R4SUBSYS1`; das R4X liest
 sie und relative `$INCLUDE`-Quellen durch die Storage-Fassade jeweils exakt
 einmal, baut daraus einen begrenzten Quellgraphen und fuehrt eine getrennte VM in
@@ -643,7 +658,7 @@ ein synchroner Serviceaufruf: Open, ein Vorfuell-/Regelwrite oder ein Close.
 Vorfuellung und Resync werden ueber frische Hostzyklen verteilt. Busy behaelt
 das identische caller-eigene PCM und verwendet eine unabhaengige 10-ms-
 Wiederholungsfrist statt eines ganzen 40-ms-Quantums. R4Basic begrenzt Open,
-Write und Volume auf 25 ms. Das normal drainierende Close besitzt ein eigenes
+Write und Volume auf 50 ms. Das normal drainierende Close besitzt ein eigenes
 500-ms-Budget, da AUDSVC bereits angenommenes PCM ausspielt und der HDA-
 Vertrag dafuer bis zu 400 ms zulaesst. Beim Oeffnen bleiben hoechstens drei
 weitere Versuche im 50-ms-Abstand. Ueberschreitet eine Hostverzoegerung das

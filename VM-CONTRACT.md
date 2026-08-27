@@ -564,10 +564,12 @@ reset, cancellation, or teardown.
   pending video presentation. Successful prefill writes are interleaved over
   fresh cycles. Busy retains the exact caller-owned PCM and uses an independent
   10 ms retry deadline rather than advancing a complete 40 ms quantum.
-  R4BASIC bounds Open, Write, and Volume calls to 25 ms; a transient open
+  R4BASIC bounds Open, Write, and Volume calls to 50 ms; a transient open
   timeout, full, or service-start race still gets at most three retries
   separated by 50 ms. Normal Close has its own 500 ms budget because AUDSVC
   drains already accepted PCM and HDA permits that drain to take up to 400 ms.
+  The productive GORILLA baseline records state and per-operation audio
+  counters on degradation so Open, Write, and Close failures remain distinct.
 - If a host delay exceeds the complete catch-up window, queued source PCM is
   explicitly discarded before refill. The discarded frames resolve the same
   transport fence and are counted separately; unrendered note events are not
@@ -763,11 +765,12 @@ an explicit baseline failure.
   of busy-polling. Active execution requests a cooperative scheduler yield no
   more often than once per eight host milliseconds; paused and event-only
   states block on the existing Desktop activity sequence.
-- If a changed frame is deferred by the 33-ms presentation cadence while the
-  VM enters an event-only input wait, the adapter supplies that cadence
-  deadline as the guest wake deadline. The deferred edit is therefore
-  published without requiring another key, pointer, or window event; an
-  existing earlier VM deadline retains precedence.
+- A changed frame containing newly consumed sequence-tagged host input is an
+  immediate visibility boundary: it bypasses the current 33-ms cadence once,
+  is published in the consuming guest slice, and restarts the cadence from
+  that frame. Other changed frames deferred while the VM enters an event-only
+  wait retain the cadence deadline as their guest wake deadline; an existing
+  earlier VM deadline retains precedence.
 - The initial VM owns no pixel allocation. Text output or an explicit SCREEN
   mode prepares the first surface after guest execution; a still-running
   display-silent guest receives a delayed SCREEN 0 fallback, and an immediate
