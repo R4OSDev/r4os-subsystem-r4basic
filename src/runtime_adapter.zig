@@ -189,6 +189,12 @@ pub const Adapter = struct {
                 }
                 break :blk self.deliveryFromVm(self.machine.acceptKeyEvent(key.code, key.modifiers, stamp), stamp);
             },
+            .physical_key_down, .physical_key_up => blk: {
+                break :blk self.deliveryFromVm(
+                    self.machine.noteInputDrop(stamp, .unsupported_event),
+                    stamp,
+                );
+            },
             .text => |text_event| blk: {
                 if (self.machine.continueStopped()) {
                     self.machine.noteInputControl(stamp);
