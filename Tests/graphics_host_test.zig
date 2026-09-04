@@ -155,6 +155,7 @@ test "R4BASIC publishes full damage and unchanged frames through the subsystem h
                     damage_frames += 1;
                     try std.testing.expectEqual(@as(u32, 1), info.raster_blocks);
                 },
+                .replace => return error.UnexpectedPresentMode,
             },
             else => return error.UnexpectedPresentResult,
         }
