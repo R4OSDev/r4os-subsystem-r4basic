@@ -907,3 +907,16 @@ direkt auf Kernel oder Hardware zu. IDE, interaktiver Debugger, nativer
 Compiler, Linker, Librarian und Editor sind getrennte moegliche Produkte;
 Notepad bleibt fuer BAS-Dateien ueber `Open With` als separater Editor
 verfuegbar.
+
+
+16-Bit-Kompatibilitaet ab 0.78.66 / R4BASIC 1.2.37
+-------------------------------------------------
+Praefixbytes und einzelne REP-Elemente unterliegen nun demselben begrenzten
+Arbeitsbudget wie normale Opcodes. executeSlice behaelt Register, Praefixe
+und REP-Teilfortschritt in ExecutionState; Budgetende oder Cancelled lassen
+sich mit demselben Zustand fortsetzen. Stop-Adressen gelten zwischen fertigen
+Instruktionen. CALL ABSOLUTE behaelt den bisherigen begrenzten synchronen
+Fehlervertrag bei. INC/DEC erhalten Carry in Register- und FE/FF-Formen.
+Zusaetzlich veraendert LODS nur SI und nicht mehr versehentlich DI.
+Drei kleine Hostgruppen, die vier bestehenden Maschinenfaelle und der
+Modulbuild bestehen. Allgemeine Gast-Scheiben und Compiler bleiben gleich.

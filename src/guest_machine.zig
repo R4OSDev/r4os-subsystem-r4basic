@@ -74,8 +74,22 @@ pub const ExecuteError = error{
 
 pub const ExecuteResult = struct {
     registers: Registers,
+    /// Bounded work units: prefix bytes, ordinary opcodes, and REP iterations.
     instructions: u32,
     halted: bool,
+    budget_exhausted: bool = false,
+};
+
+/// Retain this state with its Machine to resume after a budget or cancellation.
+/// Other execution errors terminate the call; reset the state before reuse.
+pub const ExecutionState = struct {
+    registers: Registers,
+    segment_override: ?u16 = null,
+    repeat: Repeat = .none,
+    decoding_prefixes: bool = false,
+    repeat_opcode: ?u8 = null,
+    finished: bool = false,
+    halted: bool = false,
 };
 
 pub const Machine = struct {
@@ -203,7 +217,33 @@ pub const Machine = struct {
     }
 
     pub fn execute(self: *Machine, initial: Registers, options: ExecuteOptions) ExecuteError!ExecuteResult {
-        var cpu = Cpu{ .machine = self, .registers = initial, .options = options };
+        var state = ExecutionState{ .registers = initial };
+        const result = try self.executeSlice(&state, options);
+        if (result.budget_exhausted) return error.InstructionBudget;
+        return result;
+    }
+
+    pub fn executeSlice(self: *Machine, state: *ExecutionState, options: ExecuteOptions) ExecuteError!ExecuteResult {
+        var cpu = Cpu{
+            .machine = self,
+            .options = options,
+            .registers = state.registers,
+            .segment_override = state.segment_override,
+            .repeat = state.repeat,
+            .decoding_prefixes = state.decoding_prefixes,
+            .repeat_opcode = state.repeat_opcode,
+            .finished = state.finished,
+            .halted = state.halted,
+        };
+        defer state.* = .{
+            .registers = cpu.registers,
+            .segment_override = cpu.segment_override,
+            .repeat = cpu.repeat,
+            .decoding_prefixes = cpu.decoding_prefixes,
+            .repeat_opcode = cpu.repeat_opcode,
+            .finished = cpu.finished,
+            .halted = cpu.halted,
+        };
         return cpu.run();
     }
 };
@@ -221,47 +261,64 @@ const Cpu = struct {
     instructions: u32 = 0,
     segment_override: ?u16 = null,
     repeat: Repeat = .none,
+    decoding_prefixes: bool = false,
+    repeat_opcode: ?u8 = null,
+    finished: bool = false,
+    halted: bool = false,
 
     fn run(self: *Cpu) ExecuteError!ExecuteResult {
         while (true) {
-            if (self.options.stop_address) |stop| {
-                if (self.registers.cs == stop.segment and self.registers.ip == stop.offset) {
-                    return .{ .registers = self.registers, .instructions = self.instructions, .halted = false };
+            if (!self.decoding_prefixes and self.repeat_opcode == null) {
+                if (self.options.stop_address) |stop| {
+                    if (self.registers.cs == stop.segment and self.registers.ip == stop.offset) self.finished = true;
                 }
+                self.segment_override = null;
+                self.repeat = .none;
             }
-            if (self.instructions >= self.options.instruction_budget) return error.InstructionBudget;
+            if (self.finished) return self.executionResult(false);
+            if (self.instructions >= self.options.instruction_budget) return self.executionResult(true);
             if (self.options.should_cancel(self.options.context)) return error.Cancelled;
             self.instructions += 1;
-            self.segment_override = null;
-            self.repeat = .none;
-            var opcode = try self.fetch8();
-            while (true) switch (opcode) {
-                0x26 => { self.segment_override = self.registers.es; opcode = try self.fetch8(); },
-                0x2E => { self.segment_override = self.registers.cs; opcode = try self.fetch8(); },
-                0x36 => { self.segment_override = self.registers.ss; opcode = try self.fetch8(); },
-                0x3E => { self.segment_override = self.registers.ds; opcode = try self.fetch8(); },
-                0xF0 => opcode = try self.fetch8(),
-                0xF2 => { self.repeat = .while_not_equal; opcode = try self.fetch8(); },
-                0xF3 => { self.repeat = .while_equal; opcode = try self.fetch8(); },
-                else => break,
-            };
+            if (self.repeat_opcode) |opcode| {
+                try self.stringInstruction(opcode);
+                continue;
+            }
+            const opcode = try self.fetch8();
+            self.decoding_prefixes = true;
+            switch (opcode) {
+                0x26 => self.segment_override = self.registers.es,
+                0x2E => self.segment_override = self.registers.cs,
+                0x36 => self.segment_override = self.registers.ss,
+                0x3E => self.segment_override = self.registers.ds,
+                0xF0 => {},
+                0xF2 => self.repeat = .while_not_equal,
+                0xF3 => self.repeat = .while_equal,
+                else => self.decoding_prefixes = false,
+            }
+            if (self.decoding_prefixes) continue;
             if (try self.step(opcode)) |halted| {
-                return .{ .registers = self.registers, .instructions = self.instructions, .halted = halted };
+                self.finished = true;
+                self.halted = halted;
+                return self.executionResult(false);
             }
         }
+    }
+
+    fn executionResult(self: *const Cpu, exhausted: bool) ExecuteResult {
+        return .{ .registers = self.registers, .instructions = self.instructions, .halted = self.halted, .budget_exhausted = exhausted };
     }
 
     fn step(self: *Cpu, opcode: u8) ExecuteError!?bool {
         if (opcode >= 0x40 and opcode <= 0x47) {
             const index: u3 = @truncate(opcode);
             const before = self.getReg16(index);
-            self.setReg16(index, self.add16(before, 1, false));
+            self.setReg16(index, self.count16(before, false));
             return null;
         }
         if (opcode >= 0x48 and opcode <= 0x4F) {
             const index: u3 = @truncate(opcode);
             const before = self.getReg16(index);
-            self.setReg16(index, self.sub16(before, 1, false));
+            self.setReg16(index, self.count16(before, true));
             return null;
         }
         if (opcode >= 0x50 and opcode <= 0x57) {
@@ -552,12 +609,26 @@ const Cpu = struct {
         else { const value = try self.read16(operand); switch (operation) { 0, 1 => self.logicalFlags16(value & try self.fetch16()), 2 => try self.write16(operand, ~value), 3 => try self.write16(operand, self.sub16(0, value, false)), 4 => { const product = @as(u32, self.registers.ax) * value; self.registers.ax = @truncate(product); self.registers.dx = @truncate(product >> 16); self.setFlag(flag_carry, self.registers.dx != 0); self.setFlag(flag_overflow, self.registers.dx != 0); }, 5 => { const product = @as(i32, @as(i16, @bitCast(self.registers.ax))) * @as(i32, @as(i16, @bitCast(value))); self.registers.ax = @bitCast(@as(i16, @truncate(product))); self.registers.dx = @bitCast(@as(i16, @truncate(product >> 16))); const fits = product >= -32768 and product <= 32767; self.setFlag(flag_carry, !fits); self.setFlag(flag_overflow, !fits); }, 6 => { if (value == 0) return error.DivideError; const dividend = (@as(u32, self.registers.dx) << 16) | self.registers.ax; const quotient = dividend / value; if (quotient > 0xFFFF) return error.DivideError; self.registers.ax = @truncate(quotient); self.registers.dx = @truncate(dividend % value); }, 7 => { const divisor: i16 = @bitCast(value); if (divisor == 0) return error.DivideError; const dividend: i32 = @bitCast((@as(u32, self.registers.dx) << 16) | self.registers.ax); const quotient = @divTrunc(dividend, divisor); if (quotient < -32768 or quotient > 32767) return error.DivideError; self.registers.ax = @bitCast(@as(i16, @intCast(quotient))); self.registers.dx = @bitCast(@as(i16, @intCast(@rem(dividend, divisor)))); } } }
     }
 
+    fn count8(self: *Cpu, value: u8, decrement: bool) u8 {
+        const carry = self.flag(flag_carry);
+        const result = if (decrement) self.sub8(value, 1, false) else self.add8(value, 1, false);
+        self.setFlag(flag_carry, carry);
+        return result;
+    }
+
+    fn count16(self: *Cpu, value: u16, decrement: bool) u16 {
+        const carry = self.flag(flag_carry);
+        const result = if (decrement) self.sub16(value, 1, false) else self.add16(value, 1, false);
+        self.setFlag(flag_carry, carry);
+        return result;
+    }
+
     fn controlGroup(self: *Cpu, byte: bool) ExecuteError!void {
         const modrm = try self.fetch8(); const operation: u3 = @truncate(modrm >> 3); const operand = try self.decodeOperand(modrm);
-        if (byte) { const value = try self.read8(operand); const result = switch (operation) { 0 => self.add8(value, 1, false), 1 => self.sub8(value, 1, false), else => return error.InvalidInstruction }; try self.write8(operand, result); return; }
+        if (byte) { const value = try self.read8(operand); const result = switch (operation) { 0 => self.count8(value, false), 1 => self.count8(value, true), else => return error.InvalidInstruction }; try self.write8(operand, result); return; }
         switch (operation) {
-            0 => try self.write16(operand, self.add16(try self.read16(operand), 1, false)),
-            1 => try self.write16(operand, self.sub16(try self.read16(operand), 1, false)),
+            0 => try self.write16(operand, self.count16(try self.read16(operand), false)),
+            1 => try self.write16(operand, self.count16(try self.read16(operand), true)),
             2 => { const target = try self.read16(operand); try self.push16(self.registers.ip); self.registers.ip = target; },
             3 => { const address = switch (operand) { .memory => |value| value, .register => return error.InvalidInstruction }; const ip = self.machine.readWord(address) catch return error.OutOfMemory; const cs = self.machine.readWord(.{ .segment = address.segment, .offset = address.offset +% 2 }) catch return error.OutOfMemory; try self.push16(self.registers.cs); try self.push16(self.registers.ip); self.registers.cs = cs; self.registers.ip = ip; },
             4 => self.registers.ip = try self.read16(operand),
@@ -569,28 +640,35 @@ const Cpu = struct {
 
     fn condition(self: *const Cpu, code: u4) bool { const of = self.flag(flag_overflow); const cf = self.flag(flag_carry); const zf = self.flag(flag_zero); const sf = self.flag(flag_sign); const pf = self.flag(flag_parity); return switch (code) { 0 => of, 1 => !of, 2 => cf, 3 => !cf, 4 => zf, 5 => !zf, 6 => cf or zf, 7 => !cf and !zf, 8 => sf, 9 => !sf, 10 => pf, 11 => !pf, 12 => sf != of, 13 => sf == of, 14 => zf or sf != of, 15 => !zf and sf == of }; }
 
+    // Exactly one element; Cpu.run checks budget and cancellation before each one.
     fn stringInstruction(self: *Cpu, opcode: u8) ExecuteError!void {
-        const word = (opcode & 1) != 0; var iterations: u32 = if (self.repeat == .none) 1 else self.registers.cx;
-        while (iterations != 0) : (iterations -= 1) {
-            const source = Address{ .segment = self.dataSegment(), .offset = self.registers.si }; const destination = Address{ .segment = self.registers.es, .offset = self.registers.di };
-            switch (opcode) {
-                0xA4 => self.machine.writeByte(destination, self.machine.readByte(source) catch return error.OutOfMemory) catch return error.OutOfMemory,
-                0xA5 => self.machine.writeWord(destination, self.machine.readWord(source) catch return error.OutOfMemory) catch return error.OutOfMemory,
-                0xA6 => _ = self.sub8(self.machine.readByte(source) catch return error.OutOfMemory, self.machine.readByte(destination) catch return error.OutOfMemory, false),
-                0xA7 => _ = self.sub16(self.machine.readWord(source) catch return error.OutOfMemory, self.machine.readWord(destination) catch return error.OutOfMemory, false),
-                0xAA => self.machine.writeByte(destination, self.getReg8(0)) catch return error.OutOfMemory,
-                0xAB => self.machine.writeWord(destination, self.registers.ax) catch return error.OutOfMemory,
-                0xAC => self.setReg8(0, self.machine.readByte(source) catch return error.OutOfMemory),
-                0xAD => self.registers.ax = self.machine.readWord(source) catch return error.OutOfMemory,
-                0xAE => _ = self.sub8(self.getReg8(0), self.machine.readByte(destination) catch return error.OutOfMemory, false),
-                0xAF => _ = self.sub16(self.registers.ax, self.machine.readWord(destination) catch return error.OutOfMemory, false),
-                else => unreachable,
-            }
-            const amount: u16 = if (word) 2 else 1; const delta: u16 = if (self.flag(flag_direction)) 0 -% amount else amount;
-            if (opcode <= 0xA7 or opcode == 0xAC or opcode == 0xAD) self.registers.si +%= delta;
-            if ((opcode >= 0xA4 and opcode <= 0xA7) or opcode >= 0xAA) self.registers.di +%= delta;
-            if (self.repeat != .none) { self.registers.cx -%= 1; if ((opcode == 0xA6 or opcode == 0xA7 or opcode == 0xAE or opcode == 0xAF) and ((self.repeat == .while_equal and !self.flag(flag_zero)) or (self.repeat == .while_not_equal and self.flag(flag_zero)))) break; }
+        self.repeat_opcode = null;
+        if (self.repeat != .none and self.registers.cx == 0) return;
+        const source = Address{ .segment = self.dataSegment(), .offset = self.registers.si };
+        const destination = Address{ .segment = self.registers.es, .offset = self.registers.di };
+        switch (opcode) {
+            0xA4 => self.machine.writeByte(destination, self.machine.readByte(source) catch return error.OutOfMemory) catch return error.OutOfMemory,
+            0xA5 => self.machine.writeWord(destination, self.machine.readWord(source) catch return error.OutOfMemory) catch return error.OutOfMemory,
+            0xA6 => _ = self.sub8(self.machine.readByte(source) catch return error.OutOfMemory, self.machine.readByte(destination) catch return error.OutOfMemory, false),
+            0xA7 => _ = self.sub16(self.machine.readWord(source) catch return error.OutOfMemory, self.machine.readWord(destination) catch return error.OutOfMemory, false),
+            0xAA => self.machine.writeByte(destination, self.getReg8(0)) catch return error.OutOfMemory,
+            0xAB => self.machine.writeWord(destination, self.registers.ax) catch return error.OutOfMemory,
+            0xAC => self.setReg8(0, self.machine.readByte(source) catch return error.OutOfMemory),
+            0xAD => self.registers.ax = self.machine.readWord(source) catch return error.OutOfMemory,
+            0xAE => _ = self.sub8(self.getReg8(0), self.machine.readByte(destination) catch return error.OutOfMemory, false),
+            0xAF => _ = self.sub16(self.registers.ax, self.machine.readWord(destination) catch return error.OutOfMemory, false),
+            else => unreachable,
         }
+        const amount: u16 = if ((opcode & 1) != 0) 2 else 1;
+        const delta: u16 = if (self.flag(flag_direction)) 0 -% amount else amount;
+        if (opcode <= 0xA7 or opcode == 0xAC or opcode == 0xAD) self.registers.si +%= delta;
+        if (opcode <= 0xA7 or opcode == 0xAA or opcode == 0xAB or opcode >= 0xAE) self.registers.di +%= delta;
+        if (self.repeat == .none) return;
+        self.registers.cx -= 1;
+        if (self.registers.cx == 0) return;
+        const compare = opcode == 0xA6 or opcode == 0xA7 or opcode == 0xAE or opcode == 0xAF;
+        if (compare and ((self.repeat == .while_equal) != self.flag(flag_zero))) return;
+        self.repeat_opcode = opcode;
     }
 
     fn interrupt(self: *Cpu, number: u8) ExecuteError!void { if (self.options.interrupt(self.options.context, number, &self.registers, self.machine) == .unavailable) return error.InterruptUnavailable; }

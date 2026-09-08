@@ -289,3 +289,31 @@ Reference and implementation provenance is recorded in `PROVENANCE.txt`.
 
 Original R4OS material is licensed under Apache License 2.0. See `LICENSE`
 and `NOTICE`. Reference provenance is recorded in `THIRD_PARTY_NOTICES.md`.
+
+
+16-bit compatibility execution (0.78.66)
+-----------------------------------------
+R4BASIC 1.2.37 counts each prefix byte, ordinary opcode and REP element as
+one bounded work unit. Budget and cancellation checks precede every unit,
+including prefixes that wrap the 16-bit instruction pointer. executeSlice
+retains registers, segment overrides, repeat conditions and the pending
+string opcode in caller-owned ExecutionState. Budget exhaustion returns
+budget_exhausted; cancellation returns Cancelled with completed work retained.
+Resume either case with the same state and Machine. Other execution errors
+require a fresh state. A stop address applies between completed instructions;
+finished or halted states do not execute again. Zero-count REP touches no data.
+
+The existing synchronous execute/CALL ABSOLUTE path remains bounded and maps
+an exhausted budget to its existing InstructionBudget/error 73 result. This
+does not add a second host scheduler or change general subsystem slices.
+INC/DEC preserve CF for short register and FE/FF byte/word forms; OF, SF, ZF,
+AF and PF still follow the result. LODS advances SI only, leaving DI unchanged.
+Intel instruction reference: INC and DEC, Volume 2A:
+https://cdrdv2-public.intel.com/671110/325383-sdm-vol-2abcd.pdf
+
+Validation: three focused host groups cover all ten string opcodes, both
+repeat conditions and directions, zero counts, segmented one/three-unit
+slices, cancellation and prefix wrap, and counter edge values with both CF
+states. The four existing guest-machine tests, including CALL ABSOLUTE, pass.
+The R4BASIC artifact builds. No full BASIC, graphics or performance profile
+is required for this private interpreter change.
