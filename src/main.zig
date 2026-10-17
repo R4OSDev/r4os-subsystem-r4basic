@@ -937,7 +937,8 @@ fn writeBaselineFailure(files: *const r4os.Files, trace: LaunchTrace, reason: []
 fn writeBaselineAudioFailure(files: *const r4os.Files, trace: LaunchTrace, pump: *const runtime_api.AudioPump) i32 {
     var report_storage: [512]u8 = undefined;
     const stats = pump.stats;
-    const report = std.fmt.bufPrint(report_storage[0..],
+    const report = std.fmt.bufPrint(
+        report_storage[0..],
         "R4BASIC baseline: FAILED id={s} reason=audio-degraded code={d}\r\n" ++
             "R4BASIC audio-failure: state={s} opens={d} open_retries={d} lazy_opens={d} writes={d}/{d} write_failures={d} closes={d} idle_closes={d} service_ops={d}\r\n",
         .{
@@ -1491,11 +1492,12 @@ const RuntimeHost = struct {
             vm_stats.maximum_file_output_buffer_bytes,
         }) catch return false;
         report_len += file_io_line.len;
-        const presenter_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC presenter: published_frames={d} skipped_frames={d} full_frames={d} damage_frames={d} compacted_frames={d} damage_regions={d} indexed8_frames={d} indexed8_blocks={d} indexed8_resource_bytes={d} xrgb_fallback_frames={d} raster_blocks={d} sampled_pixels={d}\r\n", .{
+        const presenter_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC presenter: published_frames={d} skipped_frames={d} full_frames={d} damage_frames={d} replacement_frames={d} compacted_frames={d} damage_regions={d} indexed8_frames={d} indexed8_blocks={d} indexed8_resource_bytes={d} xrgb_fallback_frames={d} raster_blocks={d} sampled_pixels={d}\r\n", .{
             presenter.published_frames,
             presenter.skipped_frames,
             presenter.full_frames,
             presenter.damage_frames,
+            presenter.replacement_frames,
             presenter.compacted_frames,
             presenter.damage_regions,
             presenter.indexed8_frames,
