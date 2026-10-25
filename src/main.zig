@@ -1025,7 +1025,7 @@ const RuntimeHost = struct {
             .context = self,
             .poll_fn = poll,
             .present_fn = present,
-            .wait_fn = if (self.window.desk.hasFn("desktop_activity_wait")) wait else null,
+            .wait_fn = wait,
             .should_close_fn = shouldClose,
         };
     }
@@ -1106,7 +1106,7 @@ const RuntimeHost = struct {
     fn wait(context: *anyopaque, timeout_ticks: u64) i32 {
         const self: *RuntimeHost = @ptrCast(@alignCast(context));
         var sequence = self.activity_sequence;
-        const raw = self.window.desk.desktopActivityWait(self.activity_sequence, timeout_ticks, &sequence);
+        const raw = self.window.desk.guiActivityWait(self.activity_sequence, timeout_ticks, 0, &sequence);
         self.activity_sequence = sequence;
         return raw;
     }
@@ -1678,14 +1678,10 @@ fn showStatus(
             }
         }
         if (event_count == runtime_api.default_max_input_events) continue;
-        if (desk.hasFn("desktop_activity_wait")) {
-            var sequence = activity_sequence;
-            const raw = desk.desktopActivityWait(activity_sequence, r4os.abi.io_wait_forever, &sequence);
-            activity_sequence = sequence;
-            if (raw < 0) return raw;
-        } else {
-            sys.sleepTicks(1);
-        }
+        var sequence = activity_sequence;
+        const raw = desk.guiActivityWait(activity_sequence, r4os.abi.io_wait_forever, 0, &sequence);
+        if (raw < 0) return raw;
+        activity_sequence = sequence;
     }
     return 0;
 }
