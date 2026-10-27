@@ -4,6 +4,18 @@ R4BASIC is the QBasic-compatible subsystem host for R4OS. It is a normal GUI
 R4X module with the subsystem identity `r4os.basic` and the guest format
 `basic.qbasic-source`.
 
+R4BASIC1.2.44 binds SDK0.64.102: active null audio retains its stream and
+duration until explicit producer idle/stop; native Close still retires its
+owned request and terminal drain. Interpreter/core clocks and guest state
+semantics are unchanged. Workspace Audio/PlaybackProgress.txt records the
+0.87.54 runtime qualification and remaining physical observation limits.
+
+The explicit headless baseline witness confirms producer idle once all guest
+audio is resolved and owned writes/PCM queues are empty. It requests terminal
+Close and writes its report after actual stream retirement, with exact closed
+resource/error/queue/pending/sink evidence. It no longer waits for the removed
+automatic silence Close. Original core/PCM/state/timing thresholds remain.
+
 The installed R4X is the complete productive R4BASIC v2 interpreter. Explorer passes one
 absolute `.BAS` path through `R4SUBSYS1`; R4BASIC loads it through the storage
 facade, compiles it once, and runs an isolated VM in a movable, resizable, and

@@ -407,7 +407,17 @@ fn runGuestRuntime(
     _ = window_host.setMinimumSize(320, 200);
     runtime_host.trace_armed = true;
     timeline.runtime_begin_ns = monotonicNow(sys);
-    const exit_code = runtime.run(&sys, guest_adapter.driver(), runtime_host.driver());
+    var exit_code = runtime.run(&sys, guest_adapter.driver(), runtime_host.driver());
+    // The baseline witness confirms producer idle; it no longer waits for
+    // sample values to imply Close. Capture only after the explicit terminal
+    // request has retired the real async stream and all accepted PCM.
+    if (trace.baseline and runtime_host.snapshot_pending) {
+        runtime_host.snapshot_pending = false;
+        if (exit_code == 0 and runtime.state == .closed and runtime.resources_closed and runtime.audio.close_error == 0) {
+            runtime_host.snapshot_written = runtime_host.writeSnapshot();
+        }
+        if (!runtime_host.snapshot_written and exit_code == 0) exit_code = error_trace_write;
+    }
     const outcome = RuntimeOutcome{
         .exit_code = exit_code,
         .state = runtime.state,
@@ -1065,13 +1075,15 @@ const RuntimeHost = struct {
                     },
                     else => {},
                 }
-                if (runtime.audio.state != .ready or
-                    runtime.audio.stats.lazy_opens == 0 or
+                if (runtime.audio.stats.lazy_opens == 0 or
                     runtime.audio.stats.writes == 0 or
-                    runtime.audio.stats.idle_closes == 0)
+                    runtime.audio.queue.available() != 0 or
+                    runtime.audio.pending_operation != null or
+                    self.guest.machine.unresolvedAudioFrames() != 0)
                 {
                     return .idle;
                 }
+                return .{ .command = .close };
             }
             self.snapshot_pending = false;
             self.snapshot_written = self.writeSnapshot();
@@ -1534,6 +1546,17 @@ const RuntimeHost = struct {
             runtime.audio.stats.late_resyncs,
         }) catch return false;
         report_len += audio_line.len;
+        if (self.trace.baseline) {
+            const ended = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC audio-end: producer-idle=baseline-witness closed={d} resources={d} close_error={d} queued_bytes={d} pending={d} sink_open={d}\r\n", .{
+                @as(u8, @intFromBool(runtime.audio.state == .closed)),
+                @as(u8, @intFromBool(runtime.resources_closed)),
+                runtime.audio.close_error,
+                runtime.audio.queue.available(),
+                @as(u8, @intFromBool(runtime.audio.pending_operation != null)),
+                @as(u8, @intFromBool(runtime.audio.sink_open)),
+            }) catch return false;
+            report_len += ended.len;
+        }
         const audio_guest_line = std.fmt.bufPrint(report_storage[report_len..], "R4BASIC audio-guest: scheduled_frames={d} accepted_frames={d} suppressed_frames={d} discarded_frames={d} resolved_frames={d} unresolved_frames={d} foreground_waits={d} foreground_wakes={d} background={d} direct_events={d} reserve_grows={d} phase_lookups={d}\r\n", .{
             audio_stats.scheduled_frames,
             audio_stats.accepted_frames,
