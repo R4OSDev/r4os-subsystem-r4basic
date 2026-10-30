@@ -4,6 +4,12 @@ R4BASIC is the QBasic-compatible subsystem host for R4OS. It is a normal GUI
 R4X module with the subsystem identity `r4os.basic` and the guest format
 `basic.qbasic-source`.
 
+R4BASIC 1.2.47 uses SDK 0.64.116. The shared runtime evaluates absolute
+guest/audio deadlines after guest, presentation and I/O work, immediately
+before waiting. Newly started retries retain their full interval. Interpreter
+work, PCM generation, pause behavior and owned terminal Close remain unchanged.
+Qualification is recorded in the workspace Audio/README.txt, section 0.88.58.
+
 R4BASIC1.2.44 binds SDK0.64.102: active null audio retains its stream and
 duration until explicit producer idle/stop; native Close still retires its
 owned request and terminal drain. Interpreter/core clocks and guest state
@@ -32,15 +38,15 @@ quanta, but performs at most one open, write, or close operation after video
 publication in each host cycle. Busy retries use an independent 10 ms
 deadline and late prefill is interleaved instead of emitted as one synchronous
 burst. Foreground BASIC waits resolve on accepted, deliberately suppressed,
-or explicitly discarded source frames—not elapsed guest time. The platform
-exposes no per-stream hardware playback cursor, and R4BASIC does not infer one
-from service acceptance. Unavailable audio degrades visibly without stopping
+or explicitly discarded source frames. Service acceptance alone does not prove
+hardware playback. Unavailable consumed progress stays unavailable.
+Unavailable audio degrades visibly without stopping
 guest time, input, events, or graphics.
 
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.31`
+- Module version: `1.2.47`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`
