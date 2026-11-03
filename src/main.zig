@@ -20,9 +20,10 @@ const title_capacity: usize = 192;
 const audio_quantum_frames: u32 = runtime_api.default_quantum_frames * 2;
 const audio_target_quanta: u16 = 4;
 const audio_queue_frames: usize = @as(usize, audio_quantum_frames) * audio_target_quanta;
-// The productive four-CPU gate can legitimately delay an accepted write
-// beyond 25 ms. Keep service work bounded without misclassifying that load.
-const audio_service_timeout_ns: u64 = 50 * std.time.ns_per_ms;
+// Match the existing SNES finite AUDSVC budget: healthy SMP4 service latency
+// can exceed 50 ms. The async request retains its storage until retirement;
+// an ambiguous timed-out write is never replayed.
+const audio_service_timeout_ns: u64 = 200 * std.time.ns_per_ms;
 const audio_close_timeout_ns: u64 = 500 * std.time.ns_per_ms;
 const canonical_baseline_path = "C:\\TEMP\\GORILLA.BAS";
 const baseline_report_path = "C:\\TEMP\\R4BASIC.BASELINE";
