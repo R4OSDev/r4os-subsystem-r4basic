@@ -8,3 +8,5 @@ DEVKIT_ROOT=../../../DevKit
 ARTIFACTS_ROOT=../../../Artifacts/Modules/R4Basic
 ZIG_ROOT=Toolchains/Zig
 
+
+LIBRARIES_ROOT=../../Libraries
