@@ -38,6 +38,7 @@ pub const Adapter = struct {
     shell_process: ?r4os.ProcessHandle = null,
     shell_command: [shell_argument_capacity]u8 = undefined,
     shell_command_len: u16 = 0,
+    directory: @import("native_directory.zig").Reader(r4os.Files, r4os.app_storage.DirectoryIterator) = .{},
 
     pub const Stats = struct {
         read_calls: u64 = 0,
@@ -132,8 +133,8 @@ pub const Adapter = struct {
         const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
         const path_slot = self.cachedPath(raw_path) orelse return .{ .failure = .path_error };
         const files = r4os.Files{ .sys = self.resources.sys };
-        return switch (files.info(self.cache_path[path_slot].asZ())) {
-            .value => |info| .{ .info = if (info.is_dir != 0) .directory else .file },
+        return switch (files.metadata(self.cache_path[path_slot].asZ())) {
+            .found => |info| .{ .info = if (info.flags & r4os.abi.file_metadata2_flag_directory != 0) .directory else .file },
             .missing => .missing,
             .failure => |raw| .{ .failure = mapPathFailure(raw) },
         };
@@ -141,6 +142,7 @@ pub const Adapter = struct {
 
     fn pathDelete(context: ?*anyopaque, raw_path: []const u8) vm.PathOperationResult {
         const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
+        self.directory.invalidate();
         const path_slot = self.cachedPath(raw_path) orelse return .{ .failure = .path_error };
         const files = r4os.Files{ .sys = self.resources.sys };
         return mapPathOperation(files.delete(self.cache_path[path_slot].asZ()));
@@ -148,6 +150,7 @@ pub const Adapter = struct {
 
     fn pathRename(context: ?*anyopaque, raw_source: []const u8, raw_target: []const u8) vm.PathOperationResult {
         const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
+        self.directory.invalidate();
         const source_slot = self.cachedPath(raw_source) orelse return .{ .failure = .path_error };
         const source = self.cache_path[source_slot];
         const target_slot = self.cachedPath(raw_target) orelse return .{ .failure = .path_error };
@@ -158,6 +161,7 @@ pub const Adapter = struct {
 
     fn directoryCreate(context: ?*anyopaque, raw_path: []const u8) vm.PathOperationResult {
         const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
+        self.directory.invalidate();
         const path_slot = self.cachedPath(raw_path) orelse return .{ .failure = .path_error };
         const files = r4os.Files{ .sys = self.resources.sys };
         return mapPathOperation(files.createDirectory(self.cache_path[path_slot].asZ()));
@@ -165,6 +169,7 @@ pub const Adapter = struct {
 
     fn directoryDelete(context: ?*anyopaque, raw_path: []const u8) vm.PathOperationResult {
         const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
+        self.directory.invalidate();
         const path_slot = self.cachedPath(raw_path) orelse return .{ .failure = .path_error };
         const files = r4os.Files{ .sys = self.resources.sys };
         return mapPathOperation(files.deleteDirectory(self.cache_path[path_slot].asZ()));
@@ -174,9 +179,7 @@ pub const Adapter = struct {
         const self: *Adapter = @ptrCast(@alignCast(context orelse return .{ .failure = .unavailable }));
         const path_slot = self.cachedPath(raw_path) orelse return .{ .failure = .path_error };
         const files = r4os.Files{ .sys = self.resources.sys };
-        var iterator = files.iterate(self.cache_path[path_slot].asZ());
-        iterator.index = index +| 2;
-        return switch (iterator.next(out)) {
+        return switch (self.directory.read(files, self.cache_path[path_slot].bytes(), index, out)) {
             .entry => |entry| .{ .entry = .{
                 .kind = if (entry.kind == .directory) .directory else .file,
                 .path_length = @intCast(entry.path.len),

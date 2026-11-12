@@ -4,7 +4,18 @@ R4BASIC is the QBasic-compatible subsystem host for R4OS. It is a normal GUI
 R4X module with the subsystem identity `r4os.basic` and the guest format
 `basic.qbasic-source`.
 
-R4BASIC 1.2.47 uses SDK 0.64.116. The shared runtime evaluates absolute
+R4BASIC 1.2.50 uses SDK 0.64.208, App2/R4XStart2 and Query2 platform imports.
+The native host reads exact source snapshots through Metadata2 and the common
+stream facade, rejecting a changed file size before compiler publication.
+BASIC FILES/KILL retain their live ordinal semantics over the native directory
+cursor; expected deletion starts a fresh scan, while an unexpected namespace
+restart remains an error. The BASIC language, saved sources, guest I/O formats,
+R4SUBSYS1 records and VM/audio lifetime rules remain unchanged. Native argument
+switches never tokenize the opaque subsystem record. Clock samples are checked
+with source, generation and frequency. CPU-only /PERFTEST workloads require zero
+text synchronization, matching the retained host oracle.
+
+Historical runtime qualification: R4BASIC 1.2.47 used SDK 0.64.116. The shared runtime evaluates absolute
 guest/audio deadlines after guest, presentation and I/O work, immediately
 before waiting. Newly started retries retain their full interval. Interpreter
 work, PCM generation, pause behavior and owned terminal Close remain unchanged.
@@ -46,7 +57,7 @@ guest time, input, events, or graphics.
 ## Package
 
 - Module: `R4BASIC.R4X`
-- Module version: `1.2.47`
+- Module version: `1.2.50`
 - Subsystem ID: `r4os.basic`
 - Display name: `R4BASIC`
 - Guest format: `basic.qbasic-source`

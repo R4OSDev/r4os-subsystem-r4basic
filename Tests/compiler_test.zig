@@ -1,4 +1,55 @@
 const std = @import("std");
+test "native directory cursor preserves BASIC ordinal and live deletion semantics" {
+    const r = @import("r4os");
+    const Fixture = struct {
+        names: []const []const u8 = &.{ "C:\\DATA\\A.TXT", "C:\\DATA\\B.TXT", "C:\\DATA\\C.TXT" },
+        starts: usize = 0,
+        reads: usize = 0,
+        fail_at: ?usize = null,
+        const Iterator = struct {
+            state: *ThisFixture,
+            index: usize = 0,
+            pub fn next(self: *@This(), out: []u8) r.app_storage.DirectoryNext {
+                self.state.reads += 1;
+                if (self.state.fail_at == self.index) return .{ .failure = r.abi.file_metadata2_error_restart };
+                if (self.index == self.state.names.len) return .end;
+                const name = self.state.names[self.index];
+                if (name.len >= out.len) return .{ .failure = -7 };
+                @memcpy(out[0..name.len], name);
+                out[name.len] = 0;
+                self.index += 1;
+                return .{ .entry = .{ .kind = .file, .path = out[0..name.len] } };
+            }
+        };
+        const ThisFixture = @This();
+        pub fn iterate(self: *@This(), _: r.path.PathZ) Iterator {
+            self.starts += 1;
+            return .{ .state = self };
+        }
+    };
+    var fixture: Fixture = .{};
+    var reader: core.native_directory.Reader(*Fixture, Fixture.Iterator) = .{};
+    var out: [128]u8 = undefined;
+    for (fixture.names, 0..) |expected, index| {
+        const result = reader.read(&fixture, "C:\\DATA", @intCast(index), &out);
+        try std.testing.expectEqualStrings(expected, result.entry.path);
+    }
+    try std.testing.expect(reader.read(&fixture, "C:\\DATA", 3, &out) == .end);
+    try std.testing.expectEqual(@as(usize, 1), fixture.starts);
+    try std.testing.expectEqual(@as(usize, 4), fixture.reads);
+    fixture.names = fixture.names[1..]; // KILL removed A; B now has ordinal0.
+    reader.invalidate();
+    try std.testing.expectEqualStrings("C:\\DATA\\B.TXT", reader.read(&fixture, "C:\\DATA", 0, &out).entry.path);
+    try std.testing.expectEqualStrings("C:\\DATA\\C.TXT", reader.read(&fixture, "C:\\DATA", 1, &out).entry.path);
+    try std.testing.expectEqual(@as(usize, 2), fixture.starts);
+    reader.invalidate();
+    fixture.fail_at = 1;
+    try std.testing.expectEqualStrings("C:\\DATA\\B.TXT", reader.read(&fixture, "C:\\DATA", 0, &out).entry.path);
+    const starts = fixture.starts;
+    try std.testing.expectEqual(r.abi.file_metadata2_error_restart, reader.read(&fixture, "C:\\DATA", 1, &out).failure);
+    try std.testing.expectEqual(starts, fixture.starts);
+    try std.testing.expect(reader.iterator == null);
+}
 const core = @import("core");
 const r4os = @import("r4os");
 
@@ -91,6 +142,43 @@ const GraphSourceReader = struct {
         return null;
     }
 };
+
+test "native source snapshot keeps exact bytes and rejects a changed size before publication" {
+    const State = struct {
+        read_size: usize = 8,
+    };
+    const MockFiles = struct {
+        state: *State,
+        const Metadata = union(enum) { found: r4os.abi.FileMetadata2, missing, failure: i32 };
+        pub fn metadata(_: *const @This(), _: anytype) Metadata {
+            return .{ .found = .{
+                .flags = r4os.abi.file_metadata2_flag_exists |
+                    r4os.abi.file_metadata2_flag_byte_size_valid |
+                    r4os.abi.file_metadata2_flag_backend_node_valid,
+                .byte_size = 8,
+                .backend_node = @as(u64, 1) << 40,
+            } };
+        }
+        pub fn readDocumentPrefix(self: *const @This(), _: anytype, out: []u8, _: r4os.abi.R4Timeout) r4os.app_storage.DocumentPrefix {
+            const text = "PRINT 1\n";
+            const count = @min(out.len, @min(text.len, self.state.read_size));
+            @memcpy(out[0..count], text[0..count]);
+            return .{ .value = .{ .bytes = count, .file_size = self.state.read_size, .truncated = self.state.read_size >= out.len } };
+        }
+    };
+    var state: State = .{};
+    const files = MockFiles{ .state = &state };
+    const reader = core.native_source.Reader(MockFiles){ .files = &files };
+    const exact = try core.source_loader.load(std.testing.allocator, &reader, "C:\\TEMP\\NATIVE.BAS");
+    defer std.testing.allocator.free(exact.bytes);
+    try std.testing.expectEqualStrings("PRINT 1\n", exact.bytes);
+    try std.testing.expectEqual(@as(u32, 1), exact.stats.info_calls);
+    try std.testing.expectEqual(@as(u32, 1), exact.stats.read_calls);
+    for ([_]usize{ 9, 7 }) |size| {
+        state.read_size = size;
+        try std.testing.expectError(error.ReadFailure, core.source_loader.load(std.testing.allocator, &reader, "C:\\TEMP\\NATIVE.BAS"));
+    }
+}
 
 test "source loader performs one exact load across the 128 KiB boundary through 256 KiB" {
     const sizes = [_]usize{
@@ -5375,9 +5463,7 @@ test "all 43 QuickBASIC Appendix-B errors round-trip through ERR ERL and RESUME 
     const numbers = [_]u8{ 2, 3, 4, 5, 6, 7, 9, 10, 11, 13, 14, 16, 19, 20, 24, 25, 27, 39, 40, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 61, 62, 63, 64, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76 };
     for (numbers) |number| {
         var source_storage: [256]u8 = undefined;
-        const source = try std.fmt.bufPrint(&source_storage,
-            "10 ON ERROR GOTO 100\n20 ERROR {d}\n30 Continued! = 1\n40 END\n100 Captured% = ERR\n110 ErrorLine& = ERL\n120 RESUME NEXT\n",
-            .{number});
+        const source = try std.fmt.bufPrint(&source_storage, "10 ON ERROR GOTO 100\n20 ERROR {d}\n30 Continued! = 1\n40 END\n100 Captured% = ERR\n110 ErrorLine& = ERL\n120 RESUME NEXT\n", .{number});
         var program = try core.compiler.compile(std.testing.allocator, "appendix-b-07013.bas", source);
         defer program.deinit();
         try expectProgramOk(&program);

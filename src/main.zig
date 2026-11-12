@@ -36,22 +36,10 @@ const canonical_baseline_sha256 = [_]u8{
     0xA8, 0x35, 0xA7, 0x43, 0xE2, 0x46, 0x99, 0xF7,
 };
 
-const SourceGraphReader = struct {
-    files: *const r4os.Files,
+const SourceGraphReader = @import("native_source.zig").Reader(r4os.Files);
 
-    pub fn info(self: *const SourceGraphReader, path: []const u8) r4os.app_storage.FileInfoResult {
-        var parsed = r4os.AbsoluteFilePath.parse(path) catch return .missing;
-        return self.files.info(parsed.asZ());
-    }
-
-    pub fn readAt(self: *const SourceGraphReader, path: []const u8, offset: u32, out: []u8) r4os.app_storage.Transfer {
-        var parsed = r4os.AbsoluteFilePath.parse(path) catch return .{ .failure = -1 };
-        return self.files.readAt(parsed.asZ(), offset, out);
-    }
-};
-
-pub fn r4_app_main(app: *r4os.App) i32 {
-    if (containsIgnoreCase(app.args(), "/PERFTEST")) return runPerformanceSelfTest(app);
+pub fn r4_app_main(app: *r4os.App2) i32 {
+    if (nativePerformanceSwitch(app.args())) return runPerformanceSelfTest(app);
     if (app.profile != .desktop) return 64;
     const allocator = app.allocator() orelse return r4os.abi.err_no_group;
     const files = app.files() orelse return r4os.abi.err_no_group;
@@ -347,7 +335,7 @@ const RuntimeOutcome = struct {
 };
 
 fn runGuestRuntime(
-    app: *r4os.App,
+    app: *r4os.App2,
     sys: r4os.r4sys.Context,
     files: *const r4os.Files,
     window_host: *host_api.Host,
@@ -524,7 +512,7 @@ const PerformanceResult = struct {
     ok: bool,
 };
 
-fn runPerformanceSelfTest(app: *r4os.App) i32 {
+fn runPerformanceSelfTest(app: *r4os.App2) i32 {
     const allocator = app.allocator() orelse return r4os.abi.err_no_group;
     const sys = app.system();
     var results: [performance_workloads.len]PerformanceResult = undefined;
@@ -586,7 +574,9 @@ fn runPerformanceWorkload(allocator: std.mem.Allocator, sys: *const r4os.r4sys.C
         adapter.performance.maximum_clock_reads <= 20 and ns_per_instruction != 0 and
         stats.cancel_callback_checks != 0 and stats.cancel_callback_checks < instructions and
         stats.instruction_metadata_reads != 0 and stats.instruction_metadata_reads < instructions and
-        stats.text_sync_checks != 0 and stats.text_sync_checks < instructions and
+        // These CPU-only workloads never request a display. The existing
+        // host oracle requires zero text synchronization, not positive work.
+        stats.text_sync_checks == 0 and stats.text_sync_renders == 0 and
         stats.cell_resolve_calls != 0;
     const workload_ok = switch (workload.kind) {
         .numeric => ips >= 52_000 and stats.group(.value) != 0 and stats.group(.arithmetic) != 0 and stats.group(.control) != 0,
@@ -896,8 +886,21 @@ const CompileProgressView = struct {
     }
 };
 
+// Length-delimited R4SUBSYS1 records remain opaque, including guest COMMAND$.
+// The shared token grammar applies only to the separate native diagnostic CLI.
+fn nativePerformanceSwitch(args: []const u8) bool {
+    if (std.mem.startsWith(u8, args, launch_api.magic)) return false;
+    var detail: r4os.arguments.Failure = .{};
+    var cursor = r4os.arguments.ArgCursor.init(args, .{}, &detail) catch return false;
+    while (cursor.next() catch return false) |token| {
+        if (token.switchIs(args, "PERFTEST") catch return false) return true;
+    }
+    return false;
+}
+
 fn monotonicNow(sys: r4os.r4sys.Context) u64 {
-    return sys.monotonicNanoseconds() orelse 0;
+    const sample = sys.base.clockSampleChecked() catch return 0;
+    return sample.instant_ns;
 }
 
 fn canonicalBaselineSource(source: []const u8) bool {
